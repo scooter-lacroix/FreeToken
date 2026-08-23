@@ -56,6 +56,41 @@ For More details:
 - [Supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md)
 - [CLI reference](https://github.com/FlashML-org/FreeToken/blob/main/docs/cli.md)
 
+### AMD GPUs (ROCm/HIP)
+
+FreeToken also runs on AMD GPUs via ROCm. The HIP build path is feature-detected
+(`torch.version.hip`) — no fork of the source is needed:
+
+- the two CppExtensions compile against the HIP runtime through a source-level
+  name shim and link `-lamdhip64` instead of `-lcudart`;
+- the tvm-ffi JIT kernels compile through tvm-ffi's `backend="hip"` (hipcc,
+  `--offload-arch` auto-detected or via `TVM_FFI_ROCM_ARCH_LIST`);
+- the vendored llama.cpp GGUF kernels hipify through torch's in-process
+  hipifier;
+- the engine auto-selects the pure-Triton attention backend on HIP, and the
+  MoE expert slot cache (flashlib's Triton `lru_ensure`) runs as-is.
+
+The NVIDIA-only extras (`freetoken[fi]`, `freetoken[sgl]`, the vLLM Marlin
+NVFP4 path, trtllm-gen attention) have no ROCm equivalent — install without
+them; every path they accelerate has an in-repo Triton fallback. fp8/MXFP4
+checkpoint formats depend on tensor-core features RDNA consumer GPUs lack;
+Q4_K/Q6_K GGUF and bf16 checkpoints work. Tensor-parallel serving via pynccl
+is not yet wired to RCCL on HIP.
+
+Verified on Radeon RX 7900 XTX (gfx1100, ROCm 7.2.4, torch 2.13+rocm7.2):
+extensions build, JIT + GGUF kernels compile and match CUDA-semantics
+references, CUDA-graph capture and the slot cache work end to end.
+
+```bash
+uv venv && source .venv/bin/activate
+uv pip install torch --index-url https://download.pytorch.org/whl/rocm7.2
+uv pip install -e . --no-deps && uv pip install apache-tvm-ffi==0.1.13.post3 flashlib==0.3.0 \
+  "transformers>=5.5,<6" einops fastapi gguf huggingface_hub msgpack modelscope \
+  "numpy>=2.0,<2.5" openai partial-json-parser prompt_toolkit pydantic pyzmq \
+  safetensors tqdm uvicorn ninja "setuptools>=77" wheel
+ft serve --model <checkpoint>
+```
+
 ## Citation
 
 If you use FreeToken for your research, please cite our [paper](https://arxiv.org/abs/2608.16157):
