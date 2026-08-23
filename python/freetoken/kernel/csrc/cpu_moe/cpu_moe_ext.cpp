@@ -29,7 +29,22 @@
 #include <thread>
 #include <vector>
 
+// Host-side CUDA Runtime API only (allocation-free CPU compute + stream host
+// nodes); every runtime call maps 1:1 onto HIP, so an AMD/ROCm build compiles
+// the same body through a name shim.
+#if defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_runtime_api.h>
+#define cudaError_t hipError_t
+#define cudaSuccess hipSuccess
+#define cudaStream_t hipStream_t
+#define cudaLaunchHostFunc hipLaunchHostFunc
+#define cudaStreamSynchronize hipStreamSynchronize
+// CUDA's host-func callback calling-convention macro is empty on Linux CUDA;
+// HIP callbacks are plain functions (hipHostFn_t), so the shim mirrors that.
+#define CUDART_CB
+#else
 #include <cuda_runtime_api.h>
+#endif
 #include <torch/extension.h>
 
 #if defined(__linux__)
@@ -569,10 +584,25 @@ float dot_nvfp4_i8_avx512vnni(const uint8_t* packed, const uint8_t* scale, float
 // vGPU, old drivers) falls back to the cudaLaunchHostFunc path.
 #if defined(_WIN32)
 #include <windows.h>
+#if defined(__HIP_PLATFORM_AMD__)
+static void* cumemop_dlopen() { return (void*)::LoadLibraryA("amdhip64.dll"); }
+#else
 static void* cumemop_dlopen() { return (void*)::LoadLibraryA("nvcuda.dll"); }
+#endif
 static void* cumemop_dlsym(void* h, const char* n) {
   return (void*)::GetProcAddress((HMODULE)h, n);
 }
+#elif defined(__HIP_PLATFORM_AMD__)
+// ROCm: the driver entry points live in libamdhip64 (hipStreamWrite/WaitValue64,
+// present since ROCm 5.x) with the same (stream, ptr, value, flags) shape the
+// dlsym'd CUDA ones have, so the handshake below runs unchanged.
+#include <dlfcn.h>
+static void* cumemop_dlopen() {
+  void* h = dlopen("libamdhip64.so", RTLD_LAZY | RTLD_LOCAL);
+  if (h == nullptr) h = dlopen("libamdhip64.so.1", RTLD_LAZY | RTLD_LOCAL);
+  return h;
+}
+static void* cumemop_dlsym(void* h, const char* n) { return dlsym(h, n); }
 #else
 #include <dlfcn.h>
 static void* cumemop_dlopen() {
@@ -594,6 +624,11 @@ static bool cumemop_resolve() {
   static bool resolved = [] {
     void* h = cumemop_dlopen();
     if (h == nullptr) return false;
+#if defined(__HIP_PLATFORM_AMD__)
+    // ROCm exports single (unversioned) entry points.
+    g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "hipStreamWriteValue64"));
+    g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "hipStreamWaitValue64"));
+#else
     // 11.7+ made the v2 entry points the default; older drivers export only the v1
     // names with the same signature.
     g_cu_write64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWriteValue64_v2"));
@@ -602,6 +637,7 @@ static bool cumemop_resolve() {
     g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWaitValue64_v2"));
     if (g_cu_wait64 == nullptr)
       g_cu_wait64 = reinterpret_cast<cuMemOp64_fn>(cumemop_dlsym(h, "cuStreamWaitValue64"));
+#endif
     return g_cu_write64 != nullptr && g_cu_wait64 != nullptr;
   }();
   return resolved;

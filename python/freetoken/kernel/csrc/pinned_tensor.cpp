@@ -1,5 +1,30 @@
 #include <cstdint>
+// Host-side CUDA Runtime API only; every call below maps 1:1 onto HIP, so an
+// AMD/ROCm build compiles the same body through a name shim (no HIP source
+// fork). __HIP_PLATFORM_AMD__ is defined by hipcc and by the HIP torch build's
+// extension flags.
+#if defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_runtime_api.h>
+#define cudaError_t hipError_t
+#define cudaSuccess hipSuccess
+#define cudaGetErrorString hipGetErrorString
+#define cudaMallocHost hipMallocHost
+#define cudaFreeHost hipFreeHost
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocPortable hipHostMallocPortable
+#define cudaHostAllocMapped hipHostMallocMapped
+#define cudaGetDevice hipGetDevice
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaDevAttrUnifiedAddressing hipDeviceAttributeUnifiedAddressing
+#define cudaDevAttrCanUseHostPointerForRegisteredMem hipDeviceAttributeCanUseHostPointerForRegisteredMem
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
+#define cudaHostRegister hipHostRegister
+#define cudaHostRegisterPortable hipHostRegisterPortable
+#define cudaHostRegisterMapped hipHostRegisterMapped
+#define cudaDriverGetVersion hipDriverGetVersion
+#else
 #include <cuda_runtime_api.h>
+#endif
 #include <torch/extension.h>
 
 namespace {
@@ -78,10 +103,27 @@ bool host_ptr_identity() {
   int device = 0;
   const cudaError_t err = cudaGetDevice(&device);
   TORCH_CHECK(err == cudaSuccess, "cudaGetDevice failed: ", cudaGetErrorString(err));
+#if defined(__HIP_PLATFORM_AMD__)
+  // AMD reports the UVA/host-registered-mem attributes unreliably; probe
+  // functionally instead -- the identity question IS "does the device pointer of
+  // a mapped pinned buffer equal its host pointer".
+  void* host_p = nullptr;
+  const cudaError_t alloc_err = cudaHostAlloc(&host_p, 8, cudaHostAllocMapped);
+  TORCH_CHECK(alloc_err == cudaSuccess, "cudaHostAlloc failed: ",
+              cudaGetErrorString(alloc_err));
+  void* dev_p = nullptr;
+  const cudaError_t ptr_err = cudaHostGetDevicePointer(&dev_p, host_p, 0);
+  cudaFreeHost(host_p);
+  TORCH_CHECK(ptr_err == cudaSuccess,
+              "cudaHostGetDevicePointer failed (host memory must be pinned+mapped): ",
+              cudaGetErrorString(ptr_err));
+  return dev_p == host_p;
+#else
   int uva = 0, reg = 0;
   cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
   cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
   return uva == 1 && reg == 1;
+#endif
 }
 
 int64_t host_device_ptr(int64_t host_ptr) {

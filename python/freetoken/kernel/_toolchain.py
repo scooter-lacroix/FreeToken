@@ -47,12 +47,16 @@ def check_nvcc_matches_torch() -> None:
     """Refuse to nvcc-compile kernels across CUDA majors.
 
     nvcc-built binaries link libcudart.so.<nvcc major>; at runtime only the
-    torch wheel's own CUDA runtime is guaranteed to be loadable.
+    torch wheel's own CUDA runtime is guaranteed to be loadable. HIP (ROCm)
+    torch builds compile through hipcc/tvm-ffi's hip backend and never link
+    libcudart, so the check is a no-op there.
     """
     if os.getenv(ALLOW_MISMATCH_ENV, "").strip().lower() in _TRUE_VALUES:
         return
     torch_major = torch_cuda_major()
     if torch_major is None:
+        # CUDA build without a toolkit probe or, notably, a HIP/ROCm build
+        # (torch.version.cuda is None there): nothing to cross-check.
         return
     nvcc = _nvcc_path()
     if nvcc is None:
