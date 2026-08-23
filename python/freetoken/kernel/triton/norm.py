@@ -142,9 +142,12 @@ def _rmsnorm(input, weight, eps, out, gemma: bool):
     # PDL only on the contiguous (decode-replay) path: on the strided qk-norm's
     # 32k-CTA prefill grids the per-CTA gdc_wait poll costs more than it hides.
     pdl = contig and is_sm90_supported()
+    # launch_pdl is a CUDA-only launch kwarg: pass it only when PDL actually
+    # launches (ROCm's Triton rejects the kwarg even with a False value).
     _rmsnorm_kernel[(A, B)](
         out, input, weight, eps, H, sxa, sxb, soa, sob,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
+        CONTIG=contig, ENABLE_PDL=pdl, GEMMA=gemma,
+        **({"launch_pdl": True} if pdl else {}),
         num_warps=_num_warps(A * B), num_stages=1,
     )
     return out
@@ -172,7 +175,8 @@ def _fused_add_rmsnorm(input, residual, weight, eps, gemma: bool):
     pdl = contig and is_sm90_supported()
     _fused_add_rmsnorm_kernel[(A, B)](
         input, residual, weight, eps, H, sxa, sxb, sra, srb,
-        CONTIG=contig, ENABLE_PDL=pdl, launch_pdl=pdl, GEMMA=gemma,
+        CONTIG=contig, ENABLE_PDL=pdl, GEMMA=gemma,
+        **({"launch_pdl": True} if pdl else {}),
         num_warps=_num_warps(A * B), num_stages=1,
     )
 

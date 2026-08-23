@@ -46,9 +46,22 @@ def _pdl_supported() -> bool:
     return is_sm90_supported()
 
 
+def _is_amd_triton() -> bool:
+    # PTX inline asm is NVIDIA-only; AMD's Triton rejects the 'f' register
+    # constraint outright. The vendored fla uses the same probe.
+    try:
+        backend = triton.runtime.driver.active.get_current_target().backend
+    except Exception:
+        return False
+    return backend == "hip"
+
+
 @triton.jit
-def _fast_tanh(x):
-    # PTX tanh.approx.f32 — single HW op, matches flashinfer math::tanh.
+def _fast_tanh(x, IS_AMD: tl.constexpr):
+    # PTX tanh.approx.f32 — single HW op, matches flashinfer math::tanh. The
+    # libdevice tanh carries no measurable cost where PTX is unavailable.
+    if IS_AMD:
+        return libdevice.tanh(x)
     return tl.inline_asm_elementwise(
         "tanh.approx.f32 $0, $1;", "=f,f", [x],
         dtype=tl.float32, is_pure=True, pack=1,
@@ -56,8 +69,11 @@ def _fast_tanh(x):
 
 
 @triton.jit
-def _fast_ex2(x):
-    # PTX ex2.approx.f32 — matches __expf fast path used by flashinfer silu.
+def _fast_ex2(x, IS_AMD: tl.constexpr):
+    # PTX ex2.approx.f32 — matches __expf fast path used by flashinfer silu;
+    # tl.exp2 lowers to the equivalent AMD fast path on HIP.
+    if IS_AMD:
+        return tl.exp2(x)
     return tl.inline_asm_elementwise(
         "ex2.approx.f32 $0, $1;", "=f,f", [x],
         dtype=tl.float32, is_pure=True, pack=1,
@@ -74,6 +90,7 @@ def _act_and_mul_kernel(
     ACT: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    IS_AMD: tl.constexpr,
 ):
     # One program handles a contiguous BLOCK_D chunk of one output row.
     row = tl.program_id(0).to(tl.int64)
@@ -94,16 +111,16 @@ def _act_and_mul_kernel(
         gdc_launch_dependents()
 
     if ACT == 0:  # SILU: x / (1 + exp(-x)) via ex2.approx
-        act = gate / (1.0 + _fast_ex2(-gate * _LOG2E))
+        act = gate / (1.0 + _fast_ex2(-gate * _LOG2E, IS_AMD))
         y = act * up
     elif ACT == 2:  # GELU_TANH via tanh.approx
         inner = 0.7978845608028654 * (gate + 0.044715 * gate * gate * gate)
-        act = 0.5 * gate * (1.0 + _fast_tanh(inner))
+        act = 0.5 * gate * (1.0 + _fast_tanh(inner, IS_AMD))
         y = act * up
     elif ACT == 3:  # SWIGLUOAI: clamped gate/up, sigmoid(alpha*gate), (up + 1) bias
         gate = tl.minimum(gate, limit)
         up = tl.minimum(tl.maximum(up, -limit), limit)
-        act = gate / (1.0 + _fast_ex2(-gate * alpha * _LOG2E))
+        act = gate / (1.0 + _fast_ex2(-gate * alpha * _LOG2E, IS_AMD))
         y = act * (up + 1.0)
     else:  # GELU (erf)
         act = 0.5 * gate * (1.0 + libdevice.erf(gate * 0.7071067811865476))
@@ -134,8 +151,9 @@ def _act_and_mul(
     block_d = min(triton.next_power_of_2(d), 1024 if M >= 4096 else 512)
     num_stages = 2 if block_d == 1024 else 3
     _act_and_mul_kernel[grid](
-        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl, launch_pdl=pdl,
-        BLOCK_D=block_d, num_warps=4, num_stages=num_stages,
+        o2, x2, d, alpha, limit, ACT=kind, ENABLE_PDL=pdl,
+        **({"launch_pdl": True} if pdl else {}),  # CUDA-only launch kwarg
+        BLOCK_D=block_d, IS_AMD=_is_amd_triton(), num_warps=4, num_stages=num_stages,
     )
     return out
 
