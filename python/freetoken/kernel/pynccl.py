@@ -27,7 +27,11 @@ else:
 
 @functools.cache
 def _load_nccl_module() -> Module:
-    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=["-lnccl"])
+    import torch
+
+    # ROCm ships RCCL (API-compatible, nccl* spellings) instead of NCCL.
+    lib = "-lrccl" if getattr(torch.version, "hip", None) else "-lnccl"
+    return load_aot("pynccl", cuda_files=["pynccl.cu"], extra_ldflags=[lib])
 
 
 @functools.cache

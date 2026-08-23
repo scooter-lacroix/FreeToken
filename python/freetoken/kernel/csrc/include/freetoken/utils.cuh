@@ -17,6 +17,8 @@
 #define cudaFuncSetAttribute hipFuncSetAttribute
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaStream_t hipStream_t
+#define cudaMemcpyAsync hipMemcpyAsync
+#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
 #define cudaLaunchKernelEx hipLaunchKernelEx
 #define cudaLaunchConfig_t hipLaunchConfig_t
 #define cudaLaunchAttribute hipLaunchAttribute

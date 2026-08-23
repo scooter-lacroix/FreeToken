@@ -1,4 +1,12 @@
+// ROCm ships RCCL, a drop-in for the NCCL 2.x API surface used below
+// (unique ids, comms, collectives, error strings); the vendored nccl 2.27
+// header mirrors an NVIDIA-only install.
+#if defined(__HIP_PLATFORM_AMD__)
+#include <hip/hip_runtime_api.h>  // rccl.h does not pull the runtime API
+#include <rccl/rccl.h>
+#else
 #include <freetoken/nccl227.h>
+#endif
 #include <freetoken/tensor.h>
 #include <freetoken/utils.cuh>
 #include <freetoken/utils.h>
@@ -92,8 +100,8 @@ public:
 
   auto all_reduce(tvm::ffi::TensorView t, std::string op) const -> void {
     using namespace host;
-    RuntimeCheck(t.device().device_type == kDLCUDA,
-                 "Tensor must be on CUDA device");
+    RuntimeCheck(t.device().device_type == kDLCUDA || t.device().device_type == kDLROCM,
+                 "Tensor must be on a CUDA/ROCm device");
     RuntimeCheck(t.is_contiguous(), "Tensor must be contiguous");
     const auto size_dim = static_cast<size_t>(t.shape().Product());
     const auto dtype = kNCCLDtypeMap.at(t.dtype());
