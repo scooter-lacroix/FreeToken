@@ -11,12 +11,27 @@
 #endif
 
 // Warp-shuffle wrappers the donor pulls from sgl-kernel's utils.h (CUDA variants).
+// ROCm 7 removed the 32-bit-mask __shfl_*_sync overloads (the mask template
+// parameter must be 64-bit), and gfx RDNA GPUs run 64-wide waves: pass the mask
+// widened and an explicit width=32 so the shuffle segments exactly like the
+// 32-lane warps these kernels are written for.
+#if defined(__HIP_PLATFORM_AMD__)
+#ifndef SGLANG_SHFL_XOR_SYNC
+#define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) \
+  __shfl_xor_sync((unsigned long long)(uint32_t)(mask), (var), (lane_mask), 32)
+#endif
+#ifndef SGLANG_SHFL_XOR_SYNC_WIDTH
+#define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) \
+  __shfl_xor_sync((unsigned long long)(uint32_t)(mask), (var), (lane_mask), (width))
+#endif
+#else
 #ifndef SGLANG_SHFL_XOR_SYNC
 #define SGLANG_SHFL_XOR_SYNC(mask, var, lane_mask) __shfl_xor_sync((mask), (var), (lane_mask))
 #endif
 #ifndef SGLANG_SHFL_XOR_SYNC_WIDTH
 #define SGLANG_SHFL_XOR_SYNC_WIDTH(mask, var, lane_mask, width) \
   __shfl_xor_sync((mask), (var), (lane_mask), (width))
+#endif
 #endif
 
 #define DISPATCH_CASE_FLOAT_TYPES(...)                 \

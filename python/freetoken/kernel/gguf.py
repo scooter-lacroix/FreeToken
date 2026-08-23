@@ -47,9 +47,28 @@ def _c_compiler_for(cxx: str) -> str:
     cc = base.replace("g++", "gcc")
     return shutil.which(cc) or cc
 
+def _is_hip_build() -> bool:
+    import torch
+
+    return bool(getattr(torch.version, "hip", None))
+
+
 @functools.cache
 def _module():
     from torch.utils.cpp_extension import load
+
+    if _is_hip_build():
+        # The vendored llama.cpp kernels carry USE_ROCM paths upstream, and on a
+        # HIP torch build cpp_extension hipifies the .cu source in-process
+        # (pure-python hipifier, no external tool). hipcc's host pass is clang
+        # already, so the -ccbin/host-compiler dance below is nvcc-only.
+        return load(
+            name="freetoken_gguf_kernels",
+            sources=[str(_CSRC / "gguf_kernel.cu")],
+            extra_include_paths=[str(_CSRC)],
+            extra_cuda_cflags=["-O3"],
+            verbose=True,
+        )
 
     extra_cuda_cflags = ["-O3", "--expt-relaxed-constexpr"]
     host_cxx = _host_compiler()
