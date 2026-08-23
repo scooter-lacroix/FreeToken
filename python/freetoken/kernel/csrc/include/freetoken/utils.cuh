@@ -20,6 +20,15 @@
 #define cudaLaunchKernelEx hipLaunchKernelEx
 #define cudaLaunchConfig_t hipLaunchConfig_t
 #define cudaLaunchAttribute hipLaunchAttribute
+#define cudaGetDevice hipGetDevice
+#define cudaDeviceGetAttribute hipDeviceGetAttribute
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
+#define cudaDevAttrUnifiedAddressing hipDeviceAttributeUnifiedAddressing
+#define cudaDevAttrCanUseHostPointerForRegisteredMem hipDeviceAttributeCanUseHostPointerForRegisteredMem
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocPortable hipHostMallocPortable
+#define cudaHostAllocMapped hipHostMallocMapped
+#define cudaFreeHost hipFreeHost
 // nvcc kernel-parameter annotation; HIP's clang does not know it and it is a
 // copy-elimination hint only (parameters are passed by value regardless).
 #define __grid_constant__

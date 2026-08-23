@@ -33,41 +33,69 @@ inline constexpr auto get_mem_package() {
     }
 }
 
+// ld.global.L1::no_allocate is PTX-only; HIP's global loads already bypass
+// L1 caching semantics differently (and the compiler sinks these to plain
+// wide loads), so fall back to __ldg-style plain loads there.
 __always_inline __device__ auto load_nc(const uint1* __restrict__ src) -> uint1 {
+#if defined(__HIP_PLATFORM_AMD__)
+    return *src;  // HIP's __ldg lacks the uint1 overload
+#else
     uint32_t tmp;
     asm volatile("ld.global.L1::no_allocate.b32 %0,[%1];" : "=r"(tmp) : "l"(src));
     return uint1{tmp};
+#endif
 }
 
 __always_inline __device__ auto load_nc(const uint2* __restrict__ src) -> uint2 {
+#if defined(__HIP_PLATFORM_AMD__)
+    return __ldg(src);
+#else
     uint32_t tmp0, tmp1;
     asm volatile("ld.global.L1::no_allocate.v2.b32 {%0,%1},[%2];" : "=r"(tmp0), "=r"(tmp1) : "l"(src));
     return uint2{tmp0, tmp1};
+#endif
 }
 
 __always_inline __device__ auto load_nc(const uint4* __restrict__ src) -> uint4 {
+#if defined(__HIP_PLATFORM_AMD__)
+    return __ldg(src);
+#else
     uint32_t tmp0, tmp1, tmp2, tmp3;
     asm volatile("ld.global.L1::no_allocate.v4.b32 {%0,%1,%2,%3},[%4];" : "=r"(tmp0), "=r"(tmp1), "=r"(tmp2), "=r"(tmp3) : "l"(src));
     return uint4{tmp0, tmp1, tmp2, tmp3};
+#endif
 }
 
+// st.global.wt (write-through) is PTX-only; plain volatile-free stores on HIP.
 __always_inline __device__ void store_nc(uint1* __restrict__ dst, const uint1& value) {
+#if defined(__HIP_PLATFORM_AMD__)
+    *dst = value;
+#else
     uint32_t tmp = value.x;
     asm volatile("st.global.wt.b32 [%0],%1;" ::"l"(dst), "r"(tmp));
+#endif
 }
 
 __always_inline __device__ void store_nc(uint2* __restrict__ dst, const uint2& value) {
+#if defined(__HIP_PLATFORM_AMD__)
+    *dst = value;
+#else
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
     asm volatile("st.global.wt.v2.b32 [%0],{%1,%2};" ::"l"(dst), "r"(tmp0), "r"(tmp1));
+#endif
 }
 
 __always_inline __device__ void store_nc(uint4* __restrict__ dst, const uint4& value) {
+#if defined(__HIP_PLATFORM_AMD__)
+    *dst = value;
+#else
     uint32_t tmp0 = value.x;
     uint32_t tmp1 = value.y;
     uint32_t tmp2 = value.z;
     uint32_t tmp3 = value.w;
     asm volatile("st.global.wt.v4.b32 [%0],{%1,%2,%3,%4};" ::"l"(dst), "r"(tmp0), "r"(tmp1), "r"(tmp2), "r"(tmp3));
+#endif
 }
 
 __always_inline __device__ void wait_flag_clear(const int32_t* __restrict__ flag_ptr) {
@@ -138,10 +166,21 @@ inline bool host_ptr_identity() {
         if (cudaGetDevice(&device) != cudaSuccess) {
             return false;  // fail closed: translate (and surface errors), don't assume identity
         }
+#if defined(__HIP_PLATFORM_AMD__)
+        // AMD reports the UVA/host-register attributes unreliably; probe
+        // functionally (does a mapped pinned buffer alias its host address?).
+        void* host_p = nullptr;
+        if (cudaHostAlloc(&host_p, 8, cudaHostAllocMapped) != cudaSuccess) return false;
+        void* dev_p = nullptr;
+        const bool ok = cudaHostGetDevicePointer(&dev_p, host_p, 0) == cudaSuccess;
+        cudaFreeHost(host_p);
+        return ok && dev_p == host_p;
+#else
         int uva = 0, reg = 0;
         cudaDeviceGetAttribute(&uva, cudaDevAttrUnifiedAddressing, device);
         cudaDeviceGetAttribute(&reg, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
         return uva == 1 && reg == 1;
+#endif
     }();
     return identity;
 }

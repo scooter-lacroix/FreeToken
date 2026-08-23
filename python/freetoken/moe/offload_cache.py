@@ -45,6 +45,9 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF Q4_0 experts: packed block bytes per output row, dequantized inside
     # the borrowed ggml MoE kernels. gate_up [L*E, 2I, H//32*18], down [L*E, H, I//32*18].
     "q4_0": ("gate_up", "down"),
+    # native GGUF k-quants (Q4_K/Q6_K mix): same two banks, ggml quant type per
+    # layer carried separately (OffloadMoeCache.ggml_quant_types)
+    "ggml": ("gate_up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -103,6 +106,8 @@ class OffloadMoeCache:
     # prefill). The format names its bank layout (_BANK_SCHEMAS) and which kernels
     # may read the banks; the cache machinery itself is layout-agnostic.
     quant_format: str = "bf16"
+    # "ggml" banks only: (gate_up type, down type) per layer (ggml enum ints)
+    ggml_quant_types: list | None = None
     # Decode mode + bank layout; per-layer CPU routing is cpu_layer_ids. "gpu":
     # GPU-tiled banks, all decode on GPU (stream misses over PCIe into the slot
     # cache, GEMM on GPU). "cpu": native (CPU-readable) banks + a CPU executor;

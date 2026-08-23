@@ -43,6 +43,8 @@ class ExpertBanks:
     # Per-layer HostResidency values; None -> all pinned (the only class
     # served; policies that assign other classes are not implemented).
     layer_residency: list[str] | None = field(default=None)
+    # "ggml" format only: (gate_up type, down type) ggml enum pair per layer.
+    ggml_quant_types: list | None = field(default=None)
     # True iff the ``layer_sink`` passed to the loader was actually engaged (each layer
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
@@ -250,6 +252,22 @@ def _q4_0_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+def _ggml_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    # Native GGUF k-quant (Q4_K/Q6_K mix) routed experts: packed block bytes
+    # streamed to the ggml MoE kernels, quant type carried per layer.
+    from freetoken.models.weight import load_ggml_moe_expert_sources
+
+    sink = None if dummy else layer_sink
+    sources = load_ggml_moe_expert_sources(model_path, model_config, dummy=dummy, layer_sink=sink)
+    quant_types = sources.pop("quant_types")
+    return ExpertBanks(
+        "ggml",
+        {name: sources[name] for name in _BANK_SCHEMAS["ggml"]},
+        ggml_quant_types=quant_types,
+        streamed=sink is not None,
+    )
+
+
 def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
@@ -299,6 +317,7 @@ _PROVIDERS = {
     "nvfp4": _nvfp4_banks,
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
+    "ggml": _ggml_banks,
 }
 
 

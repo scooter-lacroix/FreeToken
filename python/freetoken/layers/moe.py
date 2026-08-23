@@ -531,6 +531,16 @@ class OffloadMoELayer(MoELayer):
             return fused_experts_gguf_q4_0(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation
             )
+        if fmt == "ggml":
+            # Native GGUF k-quants (Q4_K/Q6_K mix): same MMVQ path, ggml type per
+            # layer from the cache (gate_up and down can differ on -M mixes).
+            from freetoken.moe.fused_q4_0 import fused_experts_ggml_mixed
+
+            gate_up, down = views
+            qt_pair = cache.ggml_quant_types[self.layer_id]
+            return fused_experts_ggml_mixed(
+                hidden_states, gate_up, down, topk_weights, topk_ids, self.activation, qt_pair
+            )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV
             # decode + grouped `_t` prefill. The swiglu scalars live on the layer
