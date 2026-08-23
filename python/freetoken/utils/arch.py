@@ -5,10 +5,28 @@ from typing import Tuple
 
 
 @functools.cache
+def is_hip() -> bool:
+    """True when running on a HIP (ROCm) torch build. AMD reports gfx
+    major.minor through the same capability API, but the NVIDIA feature gates
+    below (sm-family cubins, PDL) have no HIP equivalent, so they key off the
+    CUDA build instead."""
+    import torch
+    import torch.version
+
+    return bool(getattr(torch.version, "hip", None))
+
+
+@functools.cache
 def _get_torch_cuda_version() -> Tuple[int, int] | None:
     import torch
     import torch.version
 
+    if is_hip():
+        # The gates fed by this probe select NVIDIA-only kernel families
+        # (sm_90a FA3, sm_100a trtllm-gen, PDL PTX). gfx major/minor is a
+        # different numbering and none of those apply, so report "no NVIDIA
+        # arch" rather than a capability that might satisfy a >= gate.
+        return None
     if not torch.cuda.is_available() or not torch.version.cuda:
         return None
     return torch.cuda.get_device_capability()
