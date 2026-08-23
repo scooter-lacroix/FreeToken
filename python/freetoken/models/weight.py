@@ -342,6 +342,24 @@ def load_q4_0_moe_expert_sources(
     return loader(model_path, model_config, layer_sink=layer_sink)
 
 
+def load_ggml_moe_expert_sources(
+    model_path: str,
+    model_config,
+    *,
+    dummy: bool = False,
+    layer_sink=None,
+) -> dict:
+    """Load (or fabricate) native-GGML k-quant expert banks (Q4_K/Q6_K mix),
+    with the per-layer ggml type pairs attached under ``quant_types``."""
+    _config, spec = _spec_for_model_path(model_path)
+    if dummy:
+        builder = _model_override(spec, "dummy_ggml_expert_sources")
+        assert builder is not None, "model defines no dummy_ggml_expert_sources"
+        return builder(model_config)
+    loader = _load_attr(spec.module, "load_ggml_expert_sources")
+    return loader(model_path, model_config, layer_sink=layer_sink)
+
+
 def _num_moe_layers(config) -> int:
     value = getattr(config, "num_moe_layers", None)
     if value is not None:
