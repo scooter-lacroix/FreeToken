@@ -2,6 +2,29 @@
 
 #include <freetoken/utils.h>
 
+#if defined(__HIP_PLATFORM_AMD__)
+// HIP parity shim: the host-side error/func-attr/launch API used below maps
+// 1:1 onto HIP (same field layout for the launch config). Device intrinsics
+// (__shfl_*, __ldg, ...) need no shim -- HIP provides the CUDA spellings in
+// device code. PDL (programmatic stream serialization) has no public ROCm
+// launch attribute, so with_attr() degrades to a no-op; kernels are
+// instantiated with use_pdl=false on HIP builds (see freetoken.utils.arch).
+#include <hip/hip_runtime.h>
+#define cudaError_t hipError_t
+#define cudaSuccess hipSuccess
+#define cudaGetErrorString hipGetErrorString
+#define cudaGetLastError hipGetLastError
+#define cudaFuncSetAttribute hipFuncSetAttribute
+#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#define cudaStream_t hipStream_t
+#define cudaLaunchKernelEx hipLaunchKernelEx
+#define cudaLaunchConfig_t hipLaunchConfig_t
+#define cudaLaunchAttribute hipLaunchAttribute
+// nvcc kernel-parameter annotation; HIP's clang does not know it and it is a
+// copy-elimination hint only (parameters are passed by value regardless).
+#define __grid_constant__
+#endif
+
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
@@ -115,6 +138,10 @@ public:
   }
 
   auto with_attr(bool use_pdl) -> LaunchKernel & {
+#if defined(__HIP_PLATFORM_AMD__)
+    (void)use_pdl;  // no public ROCm PDL launch attribute; launch unattributed
+    m_config.numAttrs = 0;
+#else
     if (use_pdl) {
       m_attr_cache.id = ::cudaLaunchAttributeProgrammaticStreamSerialization;
       m_attr_cache.val.programmaticStreamSerializationAllowed = 1;
@@ -123,6 +150,7 @@ public:
     } else {
       m_config.numAttrs = 0;
     }
+#endif
     return *this;
   }
 
