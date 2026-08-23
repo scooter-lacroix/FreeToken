@@ -8,6 +8,8 @@ from .weight import (
     setup_offload_expert_banks,
 )
 
+from .gguf import parse_gguf_config, iter_gguf_weights, load_ggml_expert_sources, dummy_ggml_expert_sources
+
 __all__ = [
     "Qwen3_5MoEForCausalLM",
     "parse_config",
@@ -16,4 +18,8 @@ __all__ = [
     "load_nvfp4_expert_sources",
     "load_nvfp4_expert_sources_parallel",
     "setup_offload_expert_banks",
+    "parse_gguf_config",
+    "iter_gguf_weights",
+    "load_ggml_expert_sources",
+    "dummy_ggml_expert_sources",
 ]
