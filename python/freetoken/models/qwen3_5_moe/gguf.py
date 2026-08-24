@@ -116,7 +116,10 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         # GGUF checkpoints store token_embd/output.weight as k-quants: serve the
         # packed bytes natively (packed embedding gather + ggml GEMV head) unless
         # disabled. The bf16 dequant of the 248k-vocab table was ~2 ms/token and
-        # ~970 MiB resident on gfx1100 (profiler-attributed).
+        # ~970 MiB resident on gfx1100 (profiler-attributed). The same flag moves
+        # every dense projection (qkv/o/in_proj/shared-expert) onto the ggml
+        # k-quant kernels.
+        dense_quant=_gguf_dense_quant_flag(),
         lm_head_quant=_gguf_dense_quant_flag(),
         attention_groups=(
             FullAttentionGroupConfig(
@@ -220,6 +223,7 @@ def iter_gguf_weights(
     assert include_non_moe
 
     config = parse_gguf_config(cached_load_hf_config(model_path))
+    dense_q = config.lm_head_quant == "ggml_kquant"
     linear_ids = set(config.linear_attention_group().layer_ids)
     num_layers = config.num_layers
     lg = config.linear_attention_group()
@@ -229,35 +233,68 @@ def iter_gguf_weights(
     }
 
     # Per-layer fusion buffers: GGUF parts arrive in tensor-table order; fuse as
-    # soon as every part of a merged projection is present.
+    # soon as every part of a merged projection is present. With the dense
+    # k-quant path enabled the parts are (packed_bytes, ggml_type) tuples and
+    # the fusion is a packed-row concat (each row's quant blocks are
+    # K-local, so concatenating rows is layout-exact).
     qkv_buf: dict[int, dict[str, torch.Tensor]] = {}
     in_proj_buf: dict[int, dict[str, torch.Tensor]] = {}
     shexp_buf: dict[int, dict[str, torch.Tensor]] = {}
 
+    def _qt_scalar(qt: int):
+        return torch.tensor(qt, dtype=torch.int32)
+
     def flush_qkv(layer: int):
         parts = qkv_buf.pop(layer)
-        fused = torch.cat([parts["q"], parts["k"], parts["v"]], dim=0)
-        yield f"model.layers.{layer}.self_attn.qkv_proj.weight", fused
+        p = f"model.layers.{layer}.self_attn"
+        if dense_q:
+            # llama.cpp mixes k-quant types across q/k/v (Q4_K_M: q Q4_K, v Q6_K),
+            # so the fused qkv splits into per-type modules.
+            for part, mod in (("q", "q_proj"), ("k", "k_proj"), ("v", "v_proj")):
+                pk, qt = parts[part]
+                yield f"{p}.{mod}.packed", pk
+                yield f"{p}.{mod}.quant_type", _qt_scalar(qt)
+        else:
+            fused = torch.cat([parts["q"], parts["k"], parts["v"]], dim=0)
+            yield f"{p}.qkv_proj.weight", fused
 
     def flush_in_proj(layer: int):
         parts = in_proj_buf.pop(layer)
         # [conv_dim(q|k|v) | z | b | a] -- the GDN module's merged split order.
-        fused = torch.cat(
-            [parts["qkv"], parts["z"], parts["b"], parts["a"]], dim=0
-        )
-        yield f"model.layers.{layer}.linear_attn.in_proj.weight", fused
+        p = f"model.layers.{layer}.linear_attn"
+        if dense_q:
+            # per-type modules: qkv / z singly, b|a together (both Q4_K here).
+            qkv, z, b, a = parts["qkv"], parts["z"], parts["b"], parts["a"]
+            assert b[1] == a[1], "mixed k-quant types in in_proj_ba"
+            yield f"{p}.in_proj_qkv.packed", qkv[0]
+            yield f"{p}.in_proj_qkv.quant_type", _qt_scalar(qkv[1])
+            yield f"{p}.in_proj_z.packed", z[0]
+            yield f"{p}.in_proj_z.quant_type", _qt_scalar(z[1])
+            yield f"{p}.in_proj_ba.packed", torch.cat([b[0], a[0]], dim=0)
+            yield f"{p}.in_proj_ba.quant_type", _qt_scalar(b[1])
+        else:
+            fused = torch.cat(
+                [parts["qkv"], parts["z"], parts["b"], parts["a"]], dim=0
+            )
+            yield f"{p}.in_proj.weight", fused
 
     def flush_shexp(layer: int):
         parts = shexp_buf.pop(layer)
-        fused = torch.cat([parts["gate"], parts["up"]], dim=0)
-        yield f"model.layers.{layer}.mlp.shared_expert.gate_up_proj.weight", fused
+        p = f"model.layers.{layer}.mlp.shared_expert.gate_up_proj"
+        if dense_q:
+            g, u = parts["gate"], parts["up"]
+            assert g[1] == u[1], "mixed k-quant types in shared expert gate_up"
+            yield f"{p}.packed", torch.cat([g[0], u[0]], dim=0)
+            yield f"{p}.quant_type", _qt_scalar(g[1])
+        else:
+            fused = torch.cat([parts["gate"], parts["up"]], dim=0)
+            yield f"{p}.weight", fused
 
     for t in iter_gguf_tensors(model_path):
         name = t.name
         if ".nextn." in name:
             continue  # MTP layer extras: served text-only, dropped
         if not name.startswith("blk."):
-            dense_q = config.lm_head_quant == "ggml_kquant"
             if name == "token_embd.weight":
                 if dense_q:
                     # native k-quant path: packed block bytes + type scalar; the
@@ -300,28 +337,51 @@ def iter_gguf_weights(
         elif suffix == "attn_k_norm.weight":
             yield f"{p}.self_attn.k_norm.weight", _norm_plus_one(t)
         elif suffix == "attn_output.weight":
-            yield f"{p}.self_attn.o_proj.weight", _to_bf16(t)
+            if dense_q:
+                yield f"{p}.self_attn.o_proj.packed", t.packed()
+                yield f"{p}.self_attn.o_proj.quant_type", _qt_scalar(t.ggml_type)
+            else:
+                yield f"{p}.self_attn.o_proj.weight", _to_bf16(t)
         elif suffix in ("ffn_gate_inp.weight",):
             yield f"{p}.mlp.gate.weight", _to_bf16(t)
         elif suffix in ("ffn_gate_inp_shexp.weight",):
             yield f"{p}.mlp.shared_expert_gate.weight", _to_bf16(t).reshape(1, -1)
         elif suffix == "ffn_down_shexp.weight":
-            yield f"{p}.mlp.shared_expert.down_proj.weight", _to_bf16(t)
+            if dense_q:
+                yield f"{p}.mlp.shared_expert.down_proj.packed", t.packed()
+                yield f"{p}.mlp.shared_expert.down_proj.quant_type", _qt_scalar(t.ggml_type)
+            else:
+                yield f"{p}.mlp.shared_expert.down_proj.weight", _to_bf16(t)
         elif layer in linear_ids:
             # GDN layer tensors. The GGUF's value-head blocks are de-interleaved
             # ([even | odd]); every v-head-dim tensor is regrouped to plain order
-            # (see _vhead_src_index). Q/K rows are not permuted.
+            # (see _vhead_src_index). Q/K rows are not permuted. All regroupings
+            # are ROW permutations, so they apply identically to packed bytes.
             cfg_l = cfg_linear_dims[layer]
             if suffix == "attn_qkv.weight":
-                w = _to_bf16(t)
-                w = _reinterleave_vheads_rows(w, cfg_l["nv"], cfg_l["vd"], v_offset=2 * cfg_l["k_dim"])
+                if dense_q:
+                    w = (_reinterleave_vheads_rows(
+                        t.packed(), cfg_l["nv"], cfg_l["vd"], v_offset=2 * cfg_l["k_dim"]
+                    ), t.ggml_type)
+                else:
+                    w = _reinterleave_vheads_rows(_to_bf16(t), cfg_l["nv"], cfg_l["vd"], v_offset=2 * cfg_l["k_dim"])
                 in_proj_buf.setdefault(layer, {})["qkv"] = w
             elif suffix == "attn_gate.weight":
-                in_proj_buf.setdefault(layer, {})["z"] = _reinterleave_vheads_rows(_to_bf16(t), cfg_l["nv"], cfg_l["vd"])
+                if dense_q:
+                    w = (_reinterleave_vheads_rows(t.packed(), cfg_l["nv"], cfg_l["vd"]), t.ggml_type)
+                else:
+                    w = _reinterleave_vheads_rows(_to_bf16(t), cfg_l["nv"], cfg_l["vd"])
+                in_proj_buf.setdefault(layer, {})["z"] = w
             elif suffix == "ssm_beta.weight":
-                in_proj_buf.setdefault(layer, {})["b"] = _to_bf16(t)[_vhead_perm_tensor(cfg_l["nv"])]
+                perm = _vhead_perm_tensor(cfg_l["nv"])
+                in_proj_buf.setdefault(layer, {})["b"] = (
+                    (t.packed()[perm], t.ggml_type) if dense_q else _to_bf16(t)[perm]
+                )
             elif suffix == "ssm_alpha.weight":
-                in_proj_buf.setdefault(layer, {})["a"] = _to_bf16(t)[_vhead_perm_tensor(cfg_l["nv"])]
+                perm = _vhead_perm_tensor(cfg_l["nv"])
+                in_proj_buf.setdefault(layer, {})["a"] = (
+                    (t.packed()[perm], t.ggml_type) if dense_q else _to_bf16(t)[perm]
+                )
             elif suffix == "ssm_a":
                 # llama.cpp stores A pre-negated (-exp(A_log)) in its head order;
                 # FreeToken keeps A_log and negates at use.
@@ -342,15 +402,25 @@ def iter_gguf_weights(
                 yield f"{p}.linear_attn.out_proj.weight", _reinterleave_vheads_cols(w, cfg_l["nv"], cfg_l["vd"])
             # ffn_*_exps / ffn_*_shexp handled below (shared with attention layers)
         if suffix == "attn_q.weight":
-            qkv_buf.setdefault(layer, {})["q"] = _to_bf16(t)
+            qkv_buf.setdefault(layer, {})["q"] = (
+                (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+            )
         elif suffix == "attn_k.weight":
-            qkv_buf.setdefault(layer, {})["k"] = _to_bf16(t)
+            qkv_buf.setdefault(layer, {})["k"] = (
+                (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+            )
         elif suffix == "attn_v.weight":
-            qkv_buf.setdefault(layer, {})["v"] = _to_bf16(t)
+            qkv_buf.setdefault(layer, {})["v"] = (
+                (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+            )
         elif suffix == "ffn_gate_shexp.weight":
-            shexp_buf.setdefault(layer, {})["gate"] = _to_bf16(t)
+            shexp_buf.setdefault(layer, {})["gate"] = (
+                (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+            )
         elif suffix == "ffn_up_shexp.weight":
-            shexp_buf.setdefault(layer, {})["up"] = _to_bf16(t)
+            shexp_buf.setdefault(layer, {})["up"] = (
+                (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+            )
         # ffn_*_exps.weight -> offload banks (never here)
 
         if layer in qkv_buf and len(qkv_buf[layer]) == 3:

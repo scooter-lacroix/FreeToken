@@ -53,7 +53,7 @@ class Qwen3_5GatedDeltaNet(BaseOP):
     def __init__(
         self, hidden_size, num_k_heads, num_v_heads, head_k_dim, head_v_dim,
         conv_kernel_size, rms_norm_eps, layer_id, expert_quant: str = "none",
-        attn_quant: str = "none",
+        attn_quant: str = "none", dense_quant: str = "none",
     ):
         self.layer_id = layer_id
         # The fla chunk/decode kernels read+write the recurrent state and the per-chunk h as
@@ -89,7 +89,20 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             )
         else:
             # Fused input projection (one GEMM instead of four): qkv | z | b | a.
-            self.in_proj = LinearColParallelMerged(hidden_size, self._in_proj_split, has_bias=False)
+            if dense_quant == "ggml_kquant":
+                # GGUF: native k-quant blocks in per-type modules (qkv / z / b|a --
+                # llama.cpp mixes Q4_K and Q6_K within the four-way fusion). The
+                # v-head regroupings are row permutations, so they apply to the
+                # packed bytes unchanged.
+                from .ggml_dense import QuantGgmlLinear
+
+                self._in_proj_kquant = True
+                self.in_proj_qkv = QuantGgmlLinear(self.conv_dim, hidden_size)
+                self.in_proj_z = QuantGgmlLinear(self.value_dim, hidden_size)
+                self.in_proj_ba = QuantGgmlLinear(2 * num_v_heads, hidden_size)
+            else:
+                self._in_proj_kquant = False
+                self.in_proj = LinearColParallelMerged(hidden_size, self._in_proj_split, has_bias=False)
         self.conv1d = _DepthwiseConv1d(self.conv_dim, conv_kernel_size)
         # Recurrence-gating params kept in fp32 (exp/softplus is precision-sensitive,
         # and the fla kernel reads them as fp32) -- matches HF/sglang, and avoids a
@@ -164,6 +177,11 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         if self._fp8:
             qkvz = self.in_proj_qkvz.forward(hidden_states)
             conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
+            ba = self.in_proj_ba.forward(hidden_states)
+            b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
+        elif getattr(self, "_in_proj_kquant", False):
+            conv_in = self.in_proj_qkv.forward(hidden_states)
+            z = self.in_proj_z.forward(hidden_states)
             ba = self.in_proj_ba.forward(hidden_states)
             b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
         else:

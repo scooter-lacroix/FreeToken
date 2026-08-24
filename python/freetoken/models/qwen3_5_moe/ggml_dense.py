@@ -83,4 +83,42 @@ class GgufKQuantLMHead(BaseOP):
         return fn(self.packed, x, self.quant_type, self.num_embeddings)
 
 
-__all__ = ["GgufKQuantLMHead", "QuantGGMLEmbedding"]
+class QuantGgmlLinear(BaseOP):
+    """Dense projection over native GGML block bytes (W8A8 k-quant GEMV/GEMM).
+
+    Same fused-matrix layout as ``LinearColParallelMerged`` (consumers split the
+    merged output rows exactly as before); the weight stays in the checkpoint's
+    k-quant blocks and the borrowed ggml kernels dequantize in-loop. The bf16
+    dequant of these projections dominated gfx1100 decode (~16 ms/token at
+    ~200 GB/s effective over hipBLASLt GEMV).
+    """
+
+    def __init__(self, out_features: int, in_features: int):
+        self.out_features = out_features
+        self.in_features = in_features
+        self.packed = torch.empty(0, 0, dtype=torch.uint8)
+        self.quant_type = 12
+
+    def load_state_dict(self, state_dict, *, prefix: str = "", _internal: bool = False) -> None:
+        w = state_dict.pop(_concat_prefix(prefix, "packed"))
+        qt = state_dict.pop(_concat_prefix(prefix, "quant_type")).item()
+        from freetoken.models.gguf.dequant import row_bytes
+
+        assert w.dtype == torch.uint8, w.dtype
+        assert w.shape == (self.out_features, row_bytes(self.in_features, int(qt))), (
+            w.shape, self.out_features, self.in_features, qt
+        )
+        self.packed = w
+        self.quant_type = int(qt)
+        if not _internal and state_dict:
+            raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        from freetoken.kernel.gguf import ggml_mul_mat_a8, ggml_mul_mat_vec_a8
+
+        if x.shape[0] <= 8:
+            return ggml_mul_mat_vec_a8(self.packed, x, self.quant_type, self.out_features)
+        return ggml_mul_mat_a8(self.packed, x, self.quant_type, self.out_features)
+
+
+__all__ = ["GgufKQuantLMHead", "QuantGGMLEmbedding", "QuantGgmlLinear"]

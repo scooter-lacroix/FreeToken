@@ -42,7 +42,19 @@ class Qwen3_5Attention(BaseOP):
         # Block-fp8 (Fp8BlockColMerged) when the checkpoint is quantized, else bf16
         # LinearColParallelMerged. q/k/v out dims are all /128, so the merged fp8 weight +
         # weight_scale_inv concatenate cleanly along the output dim.
-        self.qkv_proj = make_col_merged(config, config.hidden_size, self._qkv_split, has_bias=False)
+        if getattr(config, "dense_quant", "none") == "ggml_kquant":
+            # GGUF: native k-quant blocks, one module per part (llama.cpp mixes
+            # types: Q4_K_M has q Q4_K but k/v Q6_K); the fused layout is rebuilt
+            # by concatenating the parts' outputs before the existing split.
+            from .ggml_dense import QuantGgmlLinear
+
+            self.q_proj = QuantGgmlLinear(self._qkv_split[0], config.hidden_size)
+            self.k_proj = QuantGgmlLinear(self._qkv_split[1], config.hidden_size)
+            self.v_proj = QuantGgmlLinear(self._qkv_split[2], config.hidden_size)
+            self._qkv_kquant = True
+        else:
+            self.qkv_proj = make_col_merged(config, config.hidden_size, self._qkv_split, has_bias=False)
+            self._qkv_kquant = False
         # Qwen3.5 uses Gemma-style (1+weight) RMSNorm; the weight loader bakes the +1
         # into the stored weight (GemmaRMSNorm scales by the raw weight).
         self.q_norm = GemmaRMSNorm(head_dim, eps=config.rms_norm_eps)
@@ -58,13 +70,28 @@ class Qwen3_5Attention(BaseOP):
                 else None
             ),
         )
-        self.o_proj = make_replicated(config, self.qo_attn_dim, config.hidden_size, has_bias=False)
+        if getattr(config, "dense_quant", "none") == "ggml_kquant":
+            from .ggml_dense import QuantGgmlLinear
+
+            self.o_proj = QuantGgmlLinear(config.hidden_size, self.qo_attn_dim)
+        else:
+            self.o_proj = make_replicated(config, self.qo_attn_dim, config.hidden_size, has_bias=False)
 
     def _project(self, x: torch.Tensor):
         """Returns (q, k, v, gate): q [N, num_q, head_dim] post qk-norm+rope,
         k [N, num_kv*head_dim] post norm+rope, v [N, num_kv*head_dim], gate [N, num_q*head_dim]."""
         positions = get_global_ctx().batch.positions
-        qkv = self.qkv_proj.forward(x)
+        if self._qkv_kquant:
+            qkv = torch.cat(
+                [
+                    self.q_proj.forward(x),
+                    self.k_proj.forward(x),
+                    self.v_proj.forward(x),
+                ],
+                dim=-1,
+            )
+        else:
+            qkv = self.qkv_proj.forward(x)
         qg, k, v = torch.split(qkv, self._qkv_split, dim=-1)
         qg = qg.view(-1, self.num_q, self.head_dim * 2)
         q = qg[..., : self.head_dim].contiguous()  # [N, num_q, head_dim]

@@ -35,6 +35,13 @@ class _SharedExpert(BaseOP):
                 hidden_size, [intermediate_size, intermediate_size], has_bias=False
             )
             self.down_proj = Nvfp4DenseLinear(intermediate_size, hidden_size, has_bias=False)
+        elif getattr(config, "dense_quant", "none") == "ggml_kquant":
+            # GGUF: native k-quant blocks through the ggml GEMV kernels (the
+            # gate|up packed-row concat mirrors the routed-expert banks).
+            from .ggml_dense import QuantGgmlLinear
+
+            self.gate_up_proj = QuantGgmlLinear(2 * intermediate_size, hidden_size)
+            self.down_proj = QuantGgmlLinear(hidden_size, intermediate_size)
         else:
             self.gate_up_proj = LinearColParallelMerged(
                 hidden_size, [intermediate_size, intermediate_size], has_bias=False
