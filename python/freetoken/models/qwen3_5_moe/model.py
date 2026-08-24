@@ -92,8 +92,12 @@ class Qwen3_5Model(BaseOP):
         residual: torch.Tensor | None = None
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
-        x, _ = self.norm.forward_add_residual(x, residual)
-        return x
+        xn, rn = self.norm.forward_add_residual(x, residual)
+        # pre-final-norm trunk residual stream: what the MTP head consumes
+        # (HF Qwen3-Next MTP feeds hnorm(this), not the post-norm hidden).
+        # Fixed address; the graph rewrites contents each replay.
+        get_global_ctx().trunk_hidden_prenorm = rn
+        return xn
 
 
 class Qwen3_5MoEForCausalLM(BaseLLMModel):
@@ -132,6 +136,9 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)
+        # Trunk hidden (pre-head) for the MTP draft: assigned during capture,
+        # the graph rewrites the tensor's contents on every replay.
+        get_global_ctx().trunk_hidden = output
         return self.lm_head.forward(output)
 
 

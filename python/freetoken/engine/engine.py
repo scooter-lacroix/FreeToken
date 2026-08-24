@@ -387,6 +387,19 @@ class Engine:
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
+        # MTP acceptance probe (FREETOKEN_MTP=1 FREETOKEN_MTP_PROBE=1): runs the
+        # loaded draft head eagerly beside decode and reports k=1 acceptance.
+        self.mtp_probe = None
+        if os.environ.get("FREETOKEN_MTP_PROBE", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        } and getattr(self.model, "draft", None) is not None:
+            from freetoken.models.qwen3_5_moe.mtp_probe import MTPProbe
+
+            self.mtp_probe = MTPProbe(self.model, config.model_config)
+            import atexit
+
+            atexit.register(self.mtp_probe.report)
+            logger.info_rank0("MTP probe active (eager k=1 draft acceptance scoring)")
 
         post_free_memory = self._sync_get_memory()[0]
         logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
@@ -552,10 +565,17 @@ class Engine:
                     f"num_pages={pages} (prefill_overlap={overlap})"
                 )
             _require_offload_cache_size(config.moe_cache_size, config.model_config.num_experts)
+            # The MTP draft layer rides the same cache when active: its experts
+            # live at trunk layer index num_moe_layers (banks carry packed_layers
+            # = num_moe_layers + 1 in that mode).
+            _draft_active = (
+                banks.quant_format in ("ggml", "ggml_file")
+                and len(banks.ggml_quant_types or ()) > config.model_config.num_moe_layers
+            )
             cache = OffloadMoeCache(
                 # Models with leading dense layers (GLM-4) only have experts on the MoE
                 # layers; num_moe_layers == num_layers when first_k_dense_replace == 0.
-                num_layers=config.model_config.num_moe_layers,
+                num_layers=config.model_config.num_moe_layers + (1 if _draft_active else 0),
                 num_experts=config.model_config.num_experts,
                 cache_size=config.moe_cache_size,
                 device=self.device,
@@ -568,7 +588,7 @@ class Engine:
             )
             cache.set_bank_sources(banks.sources, layer_residency=banks.layer_residency)
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
-            if banks.quant_format == "ggml":
+            if banks.quant_format in ("ggml", "ggml_file"):
                 cache.ggml_quant_types = banks.ggml_quant_types
             if banks.quant_format == "ggml_file" and banks.pack_path:
                 cache.ggml_pack_path = banks.pack_path
@@ -585,7 +605,7 @@ class Engine:
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
-        assert len(layers) == config.model_config.num_moe_layers
+        assert len(layers) == config.model_config.num_moe_layers + (1 if _draft_active else 0)
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache

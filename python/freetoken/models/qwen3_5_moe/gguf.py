@@ -645,8 +645,10 @@ def load_ggml_expert_sources_file(model_path: str, config: ModelConfig) -> dict:
         n = E * rows_per_expert * rb
         return torch.from_numpy(mm[off : off + n]).reshape(E, rows_per_expert, rb)
 
-    banks = {"gate": [None] * L, "up": [None] * L, "down": [None] * L}
-    for layer in range(L):
+    PL = len(header["offsets"])  # trunk layers + draft when packed with MTP
+    banks = {"gate": [None] * PL, "up": [None] * PL, "down": [None] * PL}
+    for layer in range(PL):
+
         banks["gate"][layer] = view(header["offsets"][layer]["gate"], I, rb_gu)
         banks["up"][layer] = view(header["offsets"][layer]["up"], I, rb_gu)
         banks["down"][layer] = view(header["offsets"][layer]["down"], H, rb_dn)
@@ -654,7 +656,7 @@ def load_ggml_expert_sources_file(model_path: str, config: ModelConfig) -> dict:
         "gate": banks["gate"],
         "up": banks["up"],
         "down": banks["down"],
-        "quant_types": [(qt_gu, qt_dn)] * L,
+        "quant_types": [(qt_gu, qt_dn)] * PL,
         "pack_path": pack_path,
     }
 
@@ -686,10 +688,12 @@ def _read_bank_pack_header(pack_path: str):
 
 
 def _bank_pack_matches(header, model_path, L, E, H, I) -> bool:
+    PL = L + 1 if _mtp_enabled() else L
     return (
         header.get("version") == 1
         and header.get("model_path") == os.path.abspath(model_path)
         and header.get("num_layers") == L
+        and header.get("packed_layers", L) == PL
         and header.get("num_experts") == E
         and header.get("hidden_size") == H
         and header.get("moe_intermediate_size") == I
@@ -720,6 +724,8 @@ def pack_ggml_banks(model_path: str, config: ModelConfig, pack_path: str) -> Non
 
     L, E = config.num_layers, config.num_experts
     H, I = config.hidden_size, config.moe_intermediate_size
+    # the draft (nextn) layer rides the same pack when MTP is on
+    PL = L + 1 if _mtp_enabled() else L
 
     types = {"gate": {}, "up": {}, "down": {}}
     offsets = {"gate": {}, "up": {}, "down": {}}
@@ -727,14 +733,14 @@ def pack_ggml_banks(model_path: str, config: ModelConfig, pack_path: str) -> Non
         if not t.name.startswith("blk.") or ".nextn." in t.name:
             continue
         layer = int(t.name.split(".")[1])
-        if layer >= L:
+        if layer >= PL:
             continue
         for part in ("gate", "up", "down"):
             if t.name.endswith(f"ffn_{part}_exps.weight"):
                 types[part][layer] = t.ggml_type
                 offsets[part][layer] = t
     for part in ("gate", "up", "down"):
-        assert len(types[part]) == L, f"missing {part} expert tensors"
+        assert len(types[part]) == PL, f"missing {part} expert tensors"
 
     qt_gu = types["gate"][0]
     assert all(v == qt_gu for v in types["gate"].values()) and all(
@@ -749,9 +755,9 @@ def pack_ggml_banks(model_path: str, config: ModelConfig, pack_path: str) -> Non
     n_dn = E * H * rb_dn
 
     # layer-major layout: [gate L0 | up L0 | down L0 | gate L1 | ...]
-    region = [0] * L
+    region = [0] * PL
     off = 0
-    for layer in range(L):
+    for layer in range(PL):
         region[layer] = {
             "gate": off, "up": off + n_gu, "down": off + 2 * n_gu,
         }
@@ -775,7 +781,7 @@ def pack_ggml_banks(model_path: str, config: ModelConfig, pack_path: str) -> Non
                 out = requantize_q4_k(dense).numpy()
             r = region[layer][part]
             pack_mm[r : r + len(out)] = out
-        if (layer + 1) % 8 == 0 or layer == L - 1:
+        if (layer + 1) % 8 == 0 or layer == PL - 1:
             pack_mm.flush()
             print(f"[bank-pack] layer {layer + 1}/{L} ({time.time() - t0:.0f}s)")
     pack_mm.flush()
@@ -787,6 +793,7 @@ def pack_ggml_banks(model_path: str, config: ModelConfig, pack_path: str) -> Non
         "pack_path": os.path.abspath(pack_path),
         "pack_bytes": total,
         "num_layers": L,
+        "packed_layers": PL,
         "num_experts": E,
         "hidden_size": H,
         "moe_intermediate_size": I,

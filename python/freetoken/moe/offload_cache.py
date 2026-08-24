@@ -1019,13 +1019,15 @@ class OffloadMoeCache:
 
         with open(profile_path) as f:
             prof = json.load(f)
-        assert prof.get("num_layers") == self.num_layers and prof.get("num_experts") == self.num_experts
+        # the MTP draft adds one cache layer the trunk-only profile cannot
+        # cover (its rows simply stay cold); tolerate the shorter profile
+        assert prof.get("num_layers") <= self.num_layers and prof.get("num_experts") == self.num_experts
         if per_layer is None:
             per_layer = max(1, self.cache_size // self.num_layers)
         self._prewarm_fadvise(prof, per_layer)
         admitted = 0
         for layer in range(self.num_layers):
-            ids = prof["ranked"][str(layer)][: min(per_layer, self.num_experts)]
+            ids = prof["ranked"].get(str(layer), [])[: min(per_layer, self.num_experts)]
             if not ids:
                 continue
             t = torch.tensor(ids, dtype=torch.int32, device=self.device)
@@ -1057,7 +1059,7 @@ class OffloadMoeCache:
             return
         try:
             for layer in range(self.num_layers):
-                ids = prof["ranked"][str(layer)][:per_layer]
+                ids = prof["ranked"].get(str(layer), [])[:per_layer]
                 if not ids:
                     continue
                 for name in ("gate", "up", "down"):
@@ -1095,7 +1097,7 @@ class OffloadMoeCache:
 
         stage_h, stage_d = self._idx_stage_host, self._idx_stage_dev
         cur = torch.cuda.current_stream(self.device)
-        stage_d[0].copy_(self.num_indices, non_blocking=True)
+        stage_d[0:1].copy_(self.num_indices, non_blocking=True)
         E = self.num_experts
         stage_d[1 : 1 + E].copy_(self.evict_slots, non_blocking=True)
         stage_d[1 + E :].copy_(self.src_indices, non_blocking=True)
@@ -1105,7 +1107,8 @@ class OffloadMoeCache:
         arr = stage_h.numpy()
         n = int(arr[0])
         n = min(n, E)
-        return n, arr[1 : 1 + n], arr[1 + E : 1 + E + n]
+        # (n, source rows, evict slots) -- callers unpack src first
+        return n, arr[1 + E : 1 + E + n], arr[1 : 1 + n]
 
     def copy_missing_staged(self, layer_id: int) -> None:
         """Runner-driven miss copy for piecewise replay (explicit layer id).

@@ -75,8 +75,9 @@ class GgufKQuantLMHead(BaseOP):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         from freetoken.kernel.gguf import ggml_mul_mat_a8, ggml_mul_mat_vec_a8
 
-        batch = get_global_ctx().batch
-        if batch.is_prefill:
+        # tolerate contexts without an active batch (the eager MTP probe)
+        batch = getattr(get_global_ctx(), "_batch", None)
+        if batch is not None and batch.is_prefill:
             indices = batch.attn_metadata.get_last_indices(batch.size)
             x = x[indices].contiguous()
         fn = ggml_mul_mat_vec_a8 if x.shape[0] <= 8 else ggml_mul_mat_a8

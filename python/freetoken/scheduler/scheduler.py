@@ -334,6 +334,20 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
+                mtp_probe = getattr(self.engine, "mtp_probe", None)
+                if mtp_probe is not None and not batch.is_prefill:
+                    # k=1 acceptance probe: draft predicts from (h, token);
+                    # the NEXT committed token settles it. Trunk hidden rides
+                    # ctx (graph-rewritten tensor), row i is this request's.
+                    from freetoken.core import get_global_ctx
+
+                    h = getattr(get_global_ctx(), "trunk_hidden_prenorm", None)
+                    mtp_probe.step(
+                        id(req),
+                        int(batch.positions[i].item()) if batch.positions is not None else 0,
+                        next_token,
+                        h[i] if h is not None else None,
+                    )
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
                 hit_length = not req.can_decode

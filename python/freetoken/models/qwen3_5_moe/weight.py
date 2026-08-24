@@ -851,6 +851,18 @@ def setup_offload_expert_banks(
     ``decode_target`` is forwarded so the cpu backend gets CPU-readable (native, non-
     GPU-tiled) bank layouts -- e.g. native ``nvfp4`` rows rather than marlin/b12x."""
     eq = getattr(model_config, "expert_quant", "none")
+    if eq == "ggml" and os.environ.get(
+        "FREETOKEN_EXPERT_BANK_STORAGE", "ram"
+    ).strip().lower() == "file":
+        # the SSD tier: honor the storage env here too (the generic dispatcher
+        # remaps ggml->ggml_file, but this override intercepts first)
+        from freetoken.moe.expert_banks import _PROVIDERS as _P
+
+        return _P["ggml_file"](
+            model_path, model_config, device, dtype, dummy,
+            parallel=False, workers=workers, chunk=chunk,
+            decode_target=decode_target, layer_sink=layer_sink,
+        )
     if eq != "fp8_block":
         from freetoken.moe.expert_banks import _PROVIDERS  # nvfp4 -> _nvfp4_banks, none -> _bf16_banks
 
