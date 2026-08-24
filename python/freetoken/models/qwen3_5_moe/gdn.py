@@ -114,9 +114,22 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # out_proj follows the checkpoint quant: block-fp8 / per-tensor-fp8 / compressed-tensors
         # NVFP4 (W4A16) / bf16. in_proj_* stay bf16 in every mode (above), so a compressed-tensors
         # NVFP4 checkpoint (attn_quant=="nvfp4") only makes out_proj native FP4.
-        self.out_proj = make_replicated_quant(
-            expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
-        )
+        if dense_quant == "ggml_kquant":
+            # NOTE: ssm_out stays bf16. Packing it requires moving the input-side
+            # v-head regroup onto the activation; two gather-direction attempts
+            # produced corrupted outputs (needs offline numeric debugging vs the
+            # bf16 reference before it can ship).
+            self._out_col_perm = None
+            self._out_nv_vd = None
+            self.out_proj = make_replicated_quant(
+                expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
+            )
+        else:
+            self._out_col_perm = None
+            self._out_nv_vd = None
+            self.out_proj = make_replicated_quant(
+                expert_quant, attn_quant, self.value_dim, hidden_size, has_bias=False
+            )
 
     def _gate_params(self, a: torch.Tensor, b: torch.Tensor):
         beta = b.sigmoid()
@@ -236,6 +249,19 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         core_out = core_out.reshape(-1, self.head_v_dim)
         z = z.reshape(-1, self.head_v_dim)
         out = self.norm.forward(core_out, z).reshape(total, -1)
+        if self._out_col_perm is not None:
+            out = out[:, self._out_col_perm]
+        elif getattr(self, "_out_nv_vd", None) is not None:
+            # stored column group s holds plain head p(s) (evens first, then odds):
+            # A_stored[:, s] = A_plain[:, p(s)]
+            nv, vd = self._out_nv_vd
+            h = nv // 2
+            head_p = [2 * s if s < h else 2 * (s - h) + 1 for s in range(nv)]
+            idx = torch.repeat_interleave(
+                torch.tensor(head_p, dtype=torch.int64), vd
+            )
+            self._out_col_perm = idx.to(out.device)
+            out = out[:, self._out_col_perm]
         return self.out_proj.forward(out)
 
 
