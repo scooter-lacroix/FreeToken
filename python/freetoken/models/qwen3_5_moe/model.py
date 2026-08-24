@@ -70,10 +70,17 @@ class Qwen3_5DecoderLayer(BaseOP):
 
 class Qwen3_5Model(BaseOP):
     def __init__(self, config: ModelConfig):
-        self.embed_tokens = VocabParallelEmbedding(
-            num_embeddings=config.vocab_size,
-            embedding_dim=config.hidden_size,
-        )
+        if getattr(config, "lm_head_quant", "none") == "ggml_kquant":
+            # GGUF: the (tied) embedding table stays in its native k-quant bytes;
+            # rows dequantize on gather instead of a resident bf16 copy.
+            from .ggml_dense import QuantGGMLEmbedding
+
+            self.embed_tokens = QuantGGMLEmbedding(config.vocab_size, config.hidden_size)
+        else:
+            self.embed_tokens = VocabParallelEmbedding(
+                num_embeddings=config.vocab_size,
+                embedding_dim=config.hidden_size,
+            )
         self.layers = OPList(
             [Qwen3_5DecoderLayer(config, layer_id) for layer_id in range(config.num_layers)]
         )
@@ -91,7 +98,8 @@ class Qwen3_5Model(BaseOP):
 class Qwen3_5MoEForCausalLM(BaseLLMModel):
     def __init__(self, config: ModelConfig):
         self.model = Qwen3_5Model(config)
-        if getattr(config, "lm_head_quant", "none") == "nvfp4":
+        lm_q = getattr(config, "lm_head_quant", "none")
+        if lm_q == "nvfp4":
             # checkpoint stores the (untied) lm_head as NVFP4: keep it native (W4A16) -- the
             # bf16 dequant of this ~1 GB matrix was the single largest decode kernel.
             from freetoken.kernel.triton.nvfp4_linear import Nvfp4LMHead
@@ -100,6 +108,10 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             self.lm_head = Nvfp4LMHead(
                 num_embeddings=config.vocab_size, embedding_dim=config.hidden_size
             )
+        elif lm_q == "ggml_kquant":
+            from .ggml_dense import GgufKQuantLMHead
+
+            self.lm_head = GgufKQuantLMHead(config.vocab_size, config.hidden_size)
         else:
             self.lm_head = ParallelLMHead(
                 num_embeddings=config.vocab_size,

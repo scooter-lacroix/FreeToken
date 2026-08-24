@@ -11,6 +11,7 @@ from freetoken.utils import div_ceil, init_logger
 logger = init_logger(__name__)
 
 _warned_torch_topk = False
+_router_topk_ok: bool | None = None
 
 
 def _torch_fused_topk(
@@ -50,6 +51,29 @@ def fused_topk(
     # of the six ops the in-repo triton kernels cover -- so this router needs its own fallback.
     if not is_triton_kernels_installed():
         global _warned_torch_topk
+        if gating_output.is_cuda:
+            # In-repo single-launch Triton router: profiling showed the pure-torch
+            # chain (softmax + sort-based topk + renorm) cost ~1.8 ms/token at 40x8
+            # routing on gfx1100; this kernel does the whole thing in one launch.
+            global _router_topk_ok
+            if _router_topk_ok is None:
+                try:
+                    from freetoken.kernel.triton.router_topk import router_topk
+
+                    router_topk(gating_output[:1], min(topk, 8), renormalize)
+                    _router_topk_ok = True
+                except Exception:  # noqa: BLE001 -- any compile gap => torch path
+                    _router_topk_ok = False
+            if _router_topk_ok:
+                from freetoken.kernel.triton.router_topk import router_topk
+
+                topk_weights, topk_ids = router_topk(gating_output, topk, renormalize)
+                if num_token_non_padded is not None:
+                    indices = torch.arange(
+                        0, topk_ids.shape[0], device=topk_ids.device
+                    )
+                    topk_ids[indices >= num_token_non_padded, :] = -1
+                return topk_weights, topk_ids
         if not _warned_torch_topk:
             _warned_torch_topk = True
             # Once, not per call: this runs every MoE forward. On Linux a missing

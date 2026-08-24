@@ -40,6 +40,18 @@ if TYPE_CHECKING:
     from freetoken.models.gguf.config import GgufConfigShim
 
 
+def _gguf_dense_quant_flag() -> str:
+    """``"ggml_kquant"`` when the packed dense head/embedding path is enabled."""
+    if os.environ.get("FREETOKEN_GGUF_DENSE_QUANT", "1").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }:
+        return "none"
+    return "ggml_kquant"
+
+
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     m = shim.metadata
 
@@ -101,6 +113,11 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
         expert_quant="ggml",
         moe_weight_format="ggml",
         use_qk_norm=True,
+        # GGUF checkpoints store token_embd/output.weight as k-quants: serve the
+        # packed bytes natively (packed embedding gather + ggml GEMV head) unless
+        # disabled. The bf16 dequant of the 248k-vocab table was ~2 ms/token and
+        # ~970 MiB resident on gfx1100 (profiler-attributed).
+        lm_head_quant=_gguf_dense_quant_flag(),
         attention_groups=(
             FullAttentionGroupConfig(
                 name="full",
@@ -240,12 +257,32 @@ def iter_gguf_weights(
         if ".nextn." in name:
             continue  # MTP layer extras: served text-only, dropped
         if not name.startswith("blk."):
+            dense_q = config.lm_head_quant == "ggml_kquant"
             if name == "token_embd.weight":
-                yield "model.embed_tokens.weight", _to_bf16(t)
+                if dense_q:
+                    # native k-quant path: packed block bytes + type scalar; the
+                    # tied case shares THIS storage with the lm head (one copy)
+                    pk = t.packed()
+                    qt = torch.tensor(t.ggml_type, dtype=torch.int32)
+                    yield "model.embed_tokens.packed", pk
+                    yield "model.embed_tokens.quant_type", qt
+                    if config.tie_word_embeddings:
+                        # root-level module: the walker keeps the "lm_head."
+                        # prefix on custom load_state_dict calls
+                        yield "lm_head.packed", pk
+                        yield "lm_head.quant_type", qt
+                else:
+                    yield "model.embed_tokens.weight", _to_bf16(t)
             elif name == "output_norm.weight":
                 yield "model.norm.weight", _norm_plus_one(t)
             elif name == "output.weight":
-                yield "lm_head.weight", _to_bf16(t)
+                if dense_q:
+                    yield "lm_head.packed", t.packed()
+                    yield "lm_head.quant_type", torch.tensor(
+                        t.ggml_type, dtype=torch.int32
+                    )
+                else:
+                    yield "lm_head.weight", _to_bf16(t)
             continue
 
         layer = int(name.split(".")[1])
