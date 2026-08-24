@@ -25,7 +25,7 @@ logger = init_logger(__name__)
 class MTPProbe:
     """Eager k=1 draft probe. Enable: FREETOKEN_MTP=1 FREETOKEN_MTP_PROBE=1."""
 
-    def __init__(self, model, config):
+    def __init__(self, model, config, model_path=None):
         self.model = model
         self.config = config
         self.draft = model.draft
@@ -44,6 +44,52 @@ class MTPProbe:
         self.total = 0
         self.last_h_std = -1.0
         self.last_hp_std = -1.0
+        self._attach_private_expert_cache(model_path)
+
+    def _attach_private_expert_cache(self, model_path):
+        """Give the draft layer its OWN OffloadMoeCache for the file tier.
+
+        The probe runs eagerly on the scheduler-drain thread while the trunk's
+        next graph replay mutates the ENGINE cache's LRU tables and slot cache
+        on the forward stream -- sharing them evicts the probe's slots before
+        its GEMM reads them (uncorrelated routed outputs, measured cos ~= 0).
+        A private cache (512 slots ~= 370 MB for the whole draft layer) keeps
+        both sides race-free; the mmap file sources cost nothing to attach.
+        """
+        experts = getattr(self.draft.layer.mlp, "experts", None)
+        cache = getattr(experts, "offload_cache", None) if experts is not None else None
+        if (
+            model_path is None
+            or experts is None
+            or cache is None
+            or cache.quant_format != "ggml_file"
+        ):
+            return
+        try:
+            from freetoken.moe.offload_cache import OffloadMoeCache
+            from freetoken.models.gguf.reader import iter_gguf_tensors  # noqa: F401
+            from .gguf import load_ggml_expert_sources_file, parse_gguf_config
+            from freetoken.utils import cached_load_hf_config
+
+            cfg = parse_gguf_config(cached_load_hf_config(model_path))
+            srcs = load_ggml_expert_sources_file(model_path, cfg)
+            PL = len(srcs["gate"])
+            priv = OffloadMoeCache(
+                num_layers=PL,
+                num_experts=cfg.num_experts,
+                cache_size=2 * cfg.num_experts,
+                device=self.device,
+                quant_format="ggml_file",
+            )
+            priv.set_bank_sources({k: srcs[k] for k in ("gate", "up", "down")})
+            priv.ggml_quant_types = srcs["quant_types"]
+            experts.offload_cache = priv
+            logger.info(
+                "[mtp-probe] private expert cache attached "
+                f"({PL} layers x {cfg.num_experts} experts, file tier)"
+            )
+        except Exception as e:  # shared cache fallback: measurement may race
+            logger.warning(f"[mtp-probe] private expert cache failed: {e!r}")
 
     def _score_step(self, req_id, actual_token: int):
         if self.pending is not None and self.pending[0] == req_id:
@@ -130,16 +176,30 @@ class MTPProbe:
         shared = mlp.shared_expert.forward(x)
         shared = shared * torch.sigmoid(mlp.shared_expert_gate.forward(x))
         routed = mlp.experts.decode_forward(x, router_logits)
-        h2 = routed + shared
+        # llama.cpp qwen35moe_mtp: h2 = ffn_residual + moe_out + shared --
+        # dropping the residual stream (routed + shared alone) decimates the
+        # head input (measured: acceptance 6.6% vs 40%+ with it).
+        h2 = residual + routed + shared
 
         logits = self.model.lm_head.forward(d.head_norm.forward(h2))
         pred = int(logits[0].argmax())
         self.pending = (req_id, pred)
-        self._trace(h, hp, token, pos, logits)
+        self._trace(
+            h, hp, token, pos, logits,
+            mid=dict(
+                x0=x0.detach().clone(),
+                attn=o.detach().clone(),
+                x=x.detach().clone(),
+                router=router_logits.detach().clone(),
+                routed=routed.detach().clone(),
+                shared=shared.detach().clone(),
+                h2=h2.detach().clone(),
+            ),
+        )
 
     _TRACE_N = 0
 
-    def _trace(self, h, hp, token, pos, logits):
+    def _trace(self, h, hp, token, pos, logits, mid=None):
         """FREETOKEN_MTP_TRACE=<dir>: dump inputs/outputs for offline debugging."""
         import os
 
@@ -149,18 +209,21 @@ class MTPProbe:
         MTPProbe._TRACE_N += 1
         import torch as _t
 
-        _t.save(
-            {
-                "h": h.detach().float().cpu(),
-                "h_post": hp.detach().float().cpu() if hp is not None else None,
-                "token": int(token),
-                "pos": int(pos),
-                "logits": logits.detach().float().cpu(),
-                "pred": int(logits[0].argmax()),
-                "fill": self.fill.get(self.pending[0], 0) if self.pending else 0,
-            },
-            os.path.join(d, f"step_{MTPProbe._TRACE_N:03d}.pt"),
-        )
+        payload = {
+            "h": h.detach().float().cpu(),
+            "h_post": hp.detach().float().cpu() if hp is not None else None,
+            "token": int(token),
+            "pos": int(pos),
+            "logits": logits.detach().float().cpu(),
+            "pred": int(logits[0].argmax()),
+            "fill": self.fill.get(self.pending[0], 0) if self.pending else 0,
+        }
+        if mid is not None:
+            payload["mid"] = {
+                k: (v.detach().float().cpu() if torch.is_tensor(v) else v)
+                for k, v in mid.items()
+            }
+        _t.save(payload, os.path.join(d, f"step_{MTPProbe._TRACE_N:03d}.pt"))
 
     def reset_req(self, req_id):
         self.fill.pop(req_id, None)

@@ -395,7 +395,7 @@ class Engine:
         } and getattr(self.model, "draft", None) is not None:
             from freetoken.models.qwen3_5_moe.mtp_probe import MTPProbe
 
-            self.mtp_probe = MTPProbe(self.model, config.model_config)
+            self.mtp_probe = MTPProbe(self.model, config.model_config, config.model_path)
             import atexit
 
             atexit.register(self.mtp_probe.report)
