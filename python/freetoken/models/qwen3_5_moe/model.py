@@ -121,6 +121,14 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 tied_embedding=self.model.embed_tokens if config.tie_word_embeddings else None,
             )
         super().__init__()
+        if __import__("os").environ.get("FREETOKEN_MTP", "0").strip().lower() in {
+            "1", "true", "yes", "on"
+        }:
+            # nextn (MTP) draft head; weights arrive under draft.* when the
+            # GGUF loader runs with the same env (see gguf.iter_gguf_weights)
+            from .mtp import Qwen35MTPDraft
+
+            self.draft = Qwen35MTPDraft(config)
 
     def forward(self) -> torch.Tensor:
         output = self.model.forward(get_global_ctx().batch.input_ids)

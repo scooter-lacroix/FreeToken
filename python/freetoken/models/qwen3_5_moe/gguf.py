@@ -198,6 +198,10 @@ def _norm_plus_one(t) -> torch.Tensor:
     return _to_bf16(t)
 
 
+def _mtp_enabled() -> bool:
+    return os.environ.get("FREETOKEN_MTP", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def iter_gguf_weights(
     model_path: str,
     device,
@@ -210,8 +214,10 @@ def iter_gguf_weights(
     Dense projections dequantize to bf16 (attention 2x-q|gate half, GDN in_proj
     [qkv|z|b|a] fusion, shared expert gate_up fusion); norms bake the Gemma +1
     (except ``linear_attn.norm``, a standard weight*x norm). The MTP (nextn)
-    layer and its tensors are dropped (served text-only, like the HF loader).
-    Routed experts stream from the offload cache (``load_ggml_expert_sources``).
+    layer and its tensors are dropped (served text-only, like the HF loader)
+    unless FREETOKEN_MTP=1, in which case they arrive under ``draft.*`` names
+    (see models/qwen3_5_moe/mtp.py). Routed experts stream from the offload
+    cache (``load_ggml_expert_sources``).
     """
     from freetoken.models.gguf.reader import iter_gguf_tensors
     from freetoken.utils import cached_load_hf_config
@@ -222,10 +228,25 @@ def iter_gguf_weights(
     )
     assert include_non_moe
 
+    if _mtp_enabled():
+        yield from _iter_gguf_weights_impl(
+            model_path, device, include_moe_experts, include_non_moe, draft=True
+        )
+    yield from _iter_gguf_weights_impl(
+        model_path, device, include_moe_experts, include_non_moe, draft=False
+    )
+
+
+def _iter_gguf_weights_impl(
+    model_path, device, include_moe_experts, include_non_moe, *, draft: bool
+):
+    from freetoken.models.gguf.reader import iter_gguf_tensors
+    from freetoken.utils import cached_load_hf_config
+
     config = parse_gguf_config(cached_load_hf_config(model_path))
     dense_q = config.lm_head_quant == "ggml_kquant"
-    linear_ids = set(config.linear_attention_group().layer_ids)
     num_layers = config.num_layers
+    linear_ids = set(config.linear_attention_group().layer_ids)
     lg = config.linear_attention_group()
     cfg_linear_dims = {
         lid: {"nv": lg.num_value_heads, "vd": lg.value_head_dim, "k_dim": lg.num_key_heads * lg.key_head_dim}
@@ -246,7 +267,7 @@ def iter_gguf_weights(
 
     def flush_qkv(layer: int):
         parts = qkv_buf.pop(layer)
-        p = f"model.layers.{layer}.self_attn"
+        p = f"draft.layer.self_attn" if draft else f"model.layers.{layer}.self_attn"
         if dense_q:
             # llama.cpp mixes k-quant types across q/k/v (Q4_K_M: q Q4_K, v Q6_K),
             # so the fused qkv splits into per-type modules.
@@ -261,7 +282,7 @@ def iter_gguf_weights(
     def flush_in_proj(layer: int):
         parts = in_proj_buf.pop(layer)
         # [conv_dim(q|k|v) | z | b | a] -- the GDN module's merged split order.
-        p = f"model.layers.{layer}.linear_attn"
+        p = f"draft.layer.linear_attn" if draft else f"model.layers.{layer}.linear_attn"
         if dense_q:
             # per-type modules: qkv / z singly, b|a together (both Q4_K here).
             qkv, z, b, a = parts["qkv"], parts["z"], parts["b"], parts["a"]
@@ -280,7 +301,8 @@ def iter_gguf_weights(
 
     def flush_shexp(layer: int):
         parts = shexp_buf.pop(layer)
-        p = f"model.layers.{layer}.mlp.shared_expert.gate_up_proj"
+        p = (f"draft.layer.mlp.shared_expert.gate_up_proj" if draft else
+             f"model.layers.{layer}.mlp.shared_expert.gate_up_proj")
         if dense_q:
             g, u = parts["gate"], parts["up"]
             assert g[1] == u[1], "mixed k-quant types in shared expert gate_up"
@@ -293,7 +315,23 @@ def iter_gguf_weights(
     for t in iter_gguf_tensors(model_path):
         name = t.name
         if ".nextn." in name:
-            continue  # MTP layer extras: served text-only, dropped
+            if not draft:
+                continue  # MTP layer extras: served text-only, dropped
+            # DeepSeek-V3-style MTP head pieces, mapped to the draft module
+            # (models/qwen3_5_moe/mtp.py)
+            if name.endswith("eh_proj.weight"):
+                if dense_q:
+                    yield "draft.eh_proj.packed", t.packed()
+                    yield "draft.eh_proj.quant_type", _qt_scalar(t.ggml_type)
+                else:
+                    yield "draft.eh_proj.weight", _to_bf16(t)
+            elif name.endswith("enorm.weight"):
+                yield "draft.enorm.weight", _norm_plus_one(t)
+            elif name.endswith("hnorm.weight"):
+                yield "draft.hnorm.weight", _norm_plus_one(t)
+            elif name.endswith("shared_head_norm.weight"):
+                yield "draft.head_norm.weight", _norm_plus_one(t)
+            continue
         if not name.startswith("blk."):
             if name == "token_embd.weight":
                 if dense_q:
@@ -323,10 +361,13 @@ def iter_gguf_weights(
             continue
 
         layer = int(name.split(".")[1])
-        if layer >= num_layers:
+        if draft:
+            if layer != num_layers:
+                continue  # draft pass: only the trailing MTP block
+        elif layer >= num_layers:
             continue  # the trailing MTP block (block_count includes it)
         suffix = name.split(".", 2)[2]
-        p = f"model.layers.{layer}"
+        p = "draft.layer" if draft else f"model.layers.{layer}"
 
         if suffix == "attn_norm.weight":
             yield f"{p}.input_layernorm.weight", _norm_plus_one(t)
