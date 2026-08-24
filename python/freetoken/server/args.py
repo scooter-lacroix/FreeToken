@@ -616,6 +616,15 @@ def parse_args(
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 
+    # SSD-tier expert banks (FREETOKEN_EXPERT_BANK_STORAGE=file): the miss path
+    # stages through pageable H2D copies with a host-side index read, which is
+    # not graph-capturable; disable CUDA graphs for this storage mode.
+    if (
+        os.environ.get("FREETOKEN_EXPERT_BANK_STORAGE", "ram").strip().lower() == "file"
+        and not kwargs.get("cuda_graph_max_bs")
+    ):
+        kwargs["cuda_graph_max_bs"] = 0
+
     if kwargs["model_path"].startswith("~"):
         kwargs["model_path"] = os.path.expanduser(kwargs["model_path"])
 

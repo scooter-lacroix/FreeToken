@@ -268,6 +268,27 @@ def _ggml_banks(model_path, model_config, device, dtype, dummy, parallel=False, 
     )
 
 
+def _ggml_file_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
+    # SSD tier (FREETOKEN_EXPERT_BANK_STORAGE=file): zero-copy page-cache views
+    # of the checkpoint -- the kernel manages the RAM/disk tiering. Never
+    # pinned, never streamed through the sink; dummy fabricates nothing (the
+    # banks are the file).
+    import os
+
+    assert not dummy, "file-tier banks come from the checkpoint file (no dummy mode)"
+    assert layer_sink is None, "file-tier banks are not convertible/streamable"
+    from freetoken.models.weight import load_ggml_file_expert_sources
+
+    sources = load_ggml_file_expert_sources(model_path, model_config)
+    quant_types = sources.pop("quant_types")
+    return ExpertBanks(
+        "ggml_file",
+        {name: sources[name] for name in _BANK_SCHEMAS["ggml_file"]},
+        ggml_quant_types=quant_types,
+        streamed=False,
+    )
+
+
 def _dsfp4_banks(model_path, model_config, device, dtype, dummy, parallel=False, workers=8, chunk=_PARALLEL_CHUNK, decode_target="gpu", layer_sink=None) -> ExpertBanks:
     args = model_config.dsv4_args
     assert args is not None, "ds_fp4 expert banks require dsv4_args on the model config"
@@ -318,6 +339,7 @@ _PROVIDERS = {
     "ds_fp4": _dsfp4_banks,
     "q4_0": _q4_0_banks,
     "ggml": _ggml_banks,
+    "ggml_file": _ggml_file_banks,
 }
 
 
@@ -355,6 +377,13 @@ def _build_expert_banks(model_path, model_config, device, dtype, dummy, parallel
             f"no expert-bank provider for expert_quant={expert_quant!r} "
             f"(known: {sorted(_PROVIDERS)})"
         )
+    import os
+
+    if (
+        expert_quant == "ggml"
+        and os.environ.get("FREETOKEN_EXPERT_BANK_STORAGE", "ram").strip().lower() == "file"
+    ):
+        expert_quant = "ggml_file"
     return _PROVIDERS[expert_quant](
         model_path, model_config, device, dtype, dummy,
         parallel=parallel, workers=workers, chunk=chunk, decode_target=decode_target,

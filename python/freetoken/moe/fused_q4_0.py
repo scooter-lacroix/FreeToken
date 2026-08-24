@@ -84,7 +84,39 @@ def fused_experts_ggml_mixed(
     return out.sum(dim=1)
 
 
+def fused_experts_ggml_split(
+    hidden_states: torch.Tensor,
+    gate_q: torch.Tensor,   # [slots, I, row_bytes(H)]
+    up_q: torch.Tensor,     # [slots, I, row_bytes(H)]
+    down_q: torch.Tensor,   # [slots, H, row_bytes(I)]
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+    quant_types: tuple[int, int],
+) -> torch.Tensor:
+    """SSD-tier variant over the unfused gate/up/down banks (file-backed views
+    stream into the slot caches; same math as the fused path, three MMVQ
+    calls)."""
+    from freetoken.kernel.gguf import ggml_moe_a8_vec
+
+    act_fn = _ACT[activation]
+    qt_gu, qt_dn = int(quant_types[0]), int(quant_types[1])
+    num_tokens = hidden_states.shape[0]
+    i_size = gate_q.shape[1]
+    h = down_q.shape[1]
+    top_k = topk_ids.shape[1]
+
+    g = ggml_moe_a8_vec(hidden_states, gate_q, topk_ids, top_k, qt_gu, i_size, num_tokens)
+    u = ggml_moe_a8_vec(hidden_states, up_q, topk_ids, top_k, qt_gu, i_size, num_tokens)
+    inter = act_fn(torch.cat([g, u], dim=-1))
+    out = ggml_moe_a8_vec(inter, down_q, topk_ids, 1, qt_dn, h, num_tokens * top_k)
+    out = out.reshape(num_tokens, top_k, h) * topk_weights.reshape(num_tokens, top_k, 1).to(
+        out.dtype
+    )
+    return out.sum(dim=1)
+
+
 # Back-compat alias for the Q4_0 path.
 fused_experts_gguf_q4_0 = fused_experts_ggml
 
-__all__ = ["fused_experts_ggml", "fused_experts_ggml_mixed", "fused_experts_gguf_q4_0"]
+__all__ = ["fused_experts_ggml", "fused_experts_ggml_mixed", "fused_experts_ggml_split", "fused_experts_gguf_q4_0"]

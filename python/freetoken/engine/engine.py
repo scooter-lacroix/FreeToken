@@ -588,7 +588,37 @@ class Engine:
             self._init_cpu_moe_executor(config, cache, layers)
         self.ctx.moe_offload_cache = cache
         self.moe_offload_cache = cache
+        self._setup_expert_profile(cache)
         return cache
+
+    def _setup_expert_profile(self, cache) -> None:
+        """Routing-profile capture + the profile-driven startup pre-warm.
+
+        FREETOKEN_EXPERT_PROFILE_OUT=<path>: accumulate decode routing picks
+        into a per-layer counter; ranked lists written at exit. 500+ tokens of
+        generation (code + chat merged) is plenty -- the useful set is
+        moment-local recency, not global popularity.
+
+        FREETOKEN_EXPERT_PROFILE=<path>: admit the profile's top experts into
+        the slot cache BEFORE serving (through the normal ensure/copy path, so
+        every LRU invariant holds). Decode then starts warm: hits compute on
+        GPU, misses stream from the pack, and the cold-start never faults.
+        """
+        import atexit
+        import os
+
+        profile_out = os.environ.get("FREETOKEN_EXPERT_PROFILE_OUT")
+        if profile_out:
+            cache.init_profile(profile_out)
+            atexit.register(cache.flush_profile)
+
+        profile_in = os.environ.get("FREETOKEN_EXPERT_PROFILE")
+        if profile_in and os.path.exists(profile_in):
+            admitted = cache.prewarm_from_profile(profile_in)
+            logger = init_logger(__name__)
+            logger.info(
+                f"Expert cache pre-warmed with {admitted} experts from {profile_in}"
+            )
 
     def _resolve_hybrid_fetch(self, config: EngineConfig, cache) -> None:
         """Resolve --moe-hybrid-max-fetch -1 (auto) into a bandwidth-matched fetch fraction.

@@ -171,6 +171,57 @@ def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
         )
 
 
+@dataclass(frozen=True)
+class GgufFileTensor:
+    """A GGUF tensor's placement in the file (no data touched)."""
+    name: str
+    ggml_type: int
+    rows: int          # blocks-major rows (product of non-fastest ggml dims)
+    row_bytes: int     # packed bytes per row
+    file_offset: int   # absolute byte offset of the tensor data
+
+
+def iter_gguf_file_tensors(model_path: str) -> Iterator[GgufFileTensor]:
+    """Yield per-tensor (type, shape, absolute file offset) without reading data.
+
+    The SSD-tier bank loader maps expert tensors straight off the checkpoint
+    file; this is the placement table for those mappings."""
+    import gguf
+
+    reader = _reader(model_path)
+    for t in reader.tensors:
+        ne = [int(v) for v in t.shape]
+        block, type_size = gguf.GGML_QUANT_SIZES[t.tensor_type]
+        n_fast = ne[0]
+        row_bytes = n_fast // block * type_size
+        rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
+        # t.field.offset is the offset of the tensor INFO record (its name);
+        # the DATA offset is the byte distance of t.data's buffer from the
+        # whole-file memmap base. (A pack built from field offsets reads
+        # name-table bytes -- self-consistent garbage.)
+        data_off = int(t.data.ctypes.data - reader.data.ctypes.data)
+        assert data_off > 0, f"{t.name}: bad data offset {data_off}"
+        yield GgufFileTensor(
+            name=t.name,
+            ggml_type=int(t.tensor_type),
+            rows=rows,
+            row_bytes=row_bytes,
+            file_offset=data_off,
+        )
+
+
+def open_gguf_memmap(model_path: str, writable: bool = False) -> np.memmap:
+    """A shared read-only memmap of the whole GGUF file (the bank views slice it)."""
+    import gguf as _gguf
+
+    reader = _reader(model_path)
+    data = reader.data if isinstance(reader.data, np.memmap) else None
+    if data is not None:
+        return data
+    # extremely defensive: gguf-py always builds a memmap today
+    return np.memmap(model_path, dtype=np.uint8, mode="r+" if writable else "r")
+
+
 def gguf_tensor_names(model_path: str) -> set[str]:
     return {t.name for t in _reader(model_path).tensors}
 

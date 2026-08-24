@@ -17,6 +17,7 @@ partial rope 64/256 @ 1e7, 256 experts of 512, shared expert 512.
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Iterator
 
 import torch
@@ -437,6 +438,199 @@ def load_ggml_expert_sources(model_path: str, config: ModelConfig, *, layer_sink
         "down": banks["down"],
         "quant_types": [(qt, qt)] * L,
     }
+
+
+def load_ggml_expert_sources_file(model_path: str, config: ModelConfig) -> dict:
+    """SSD-tier banks: zero-copy mmap views of a packed bank file on NVMe.
+
+    The pack (see :func:`pack_ggml_banks`) holds every layer's gate/up/down
+    expert rows in the engine's uniform layout (mixed quant types requantized
+    once at pack time). Serving mmaps the pack; the kernel page cache becomes
+    an automatic RAM/disk tier -- hot experts stay resident, cold ones evict,
+    and a miss faults in over NVMe during the PCIe gather staging. Banks are
+    page-cache-backed and never pinned.
+
+    Built automatically on first use (one-time read of the source checkpoint;
+    the checkpoint itself can live on slow storage forever).
+    """
+    import numpy as np
+    from freetoken.models.gguf.dequant import row_bytes as ggml_row_bytes
+
+    L, E = config.num_layers, config.num_experts
+    H, I = config.hidden_size, config.moe_intermediate_size
+
+    pack_path = ggml_bank_pack_path(model_path)
+    header = _read_bank_pack_header(pack_path) if os.path.exists(pack_path) else None
+    if header is None or not _bank_pack_matches(header, model_path, L, E, H, I):
+        pack_ggml_banks(model_path, config, pack_path)
+        header = _read_bank_pack_header(pack_path)
+        assert header is not None, f"bank pack {pack_path} missing after build"
+
+    qt_gu = header["quant_types"]["gate"]
+    qt_dn = header["quant_types"]["down"]
+    rb_gu = ggml_row_bytes(H, qt_gu)
+    rb_dn = ggml_row_bytes(I, qt_dn)
+
+    mm = np.memmap(pack_path, dtype=np.uint8, mode="r")
+
+    def view(off, rows_per_expert, rb):
+        n = E * rows_per_expert * rb
+        return torch.from_numpy(mm[off : off + n]).reshape(E, rows_per_expert, rb)
+
+    banks = {"gate": [None] * L, "up": [None] * L, "down": [None] * L}
+    for layer in range(L):
+        banks["gate"][layer] = view(header["offsets"][layer]["gate"], I, rb_gu)
+        banks["up"][layer] = view(header["offsets"][layer]["up"], I, rb_gu)
+        banks["down"][layer] = view(header["offsets"][layer]["down"], H, rb_dn)
+    return {
+        "gate": banks["gate"],
+        "up": banks["up"],
+        "down": banks["down"],
+        "quant_types": [(qt_gu, qt_dn)] * L,
+        "pack_path": pack_path,
+    }
+
+
+def ggml_bank_pack_path(model_path: str) -> str:
+    """Pack location: $FREETOKEN_BANK_CACHE_DIR (an NVMe mount) or
+    ~/.mlstack/banks, named after the checkpoint."""
+    import hashlib
+
+    cache_dir = os.environ.get("FREETOKEN_BANK_CACHE_DIR") or os.path.expanduser(
+        "~/.mlstack/banks"
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    stem = os.path.splitext(os.path.basename(model_path))[0]
+    digest = hashlib.sha256(os.path.abspath(model_path).encode()).hexdigest()[:12]
+    return os.path.join(cache_dir, f"{stem}.{digest}.ftbanks")
+
+
+def _read_bank_pack_header(pack_path: str):
+    import json
+
+    idx_path = pack_path + ".idx"
+    if not os.path.exists(idx_path):
+        return None
+    try:
+        return json.load(open(idx_path))
+    except (ValueError, OSError):
+        return None
+
+
+def _bank_pack_matches(header, model_path, L, E, H, I) -> bool:
+    return (
+        header.get("version") == 1
+        and header.get("model_path") == os.path.abspath(model_path)
+        and header.get("num_layers") == L
+        and header.get("num_experts") == E
+        and header.get("hidden_size") == H
+        and header.get("moe_intermediate_size") == I
+        and os.path.exists(header.get("pack_path", ""))
+        and os.path.getsize(header["pack_path"]) == header.get("pack_bytes", -1)
+    )
+
+
+def pack_ggml_banks(model_path: str, config: ModelConfig, pack_path: str) -> None:
+    """One-time pack of the routed-expert banks into the engine's uniform
+    layout: per layer [gate | up | down] regions of packed k-quant rows.
+
+    Mixed-quant checkpoints (Q4_K_M's Q6_K down projections) are requantized
+    to the uniform pool type here, ONCE, so every layer shares one pool shape
+    and serving never pays a copy or a requant. Reads the source checkpoint
+    sequentially (slow spinning-rust sources are fine); writes to the pack.
+    """
+    import json
+    import time
+
+    import numpy as np
+    from freetoken.models.gguf.dequant import (
+        dequantize,
+        requantize_q4_k,
+        row_bytes as ggml_row_bytes,
+    )
+    from freetoken.models.gguf.reader import iter_gguf_file_tensors
+
+    L, E = config.num_layers, config.num_experts
+    H, I = config.hidden_size, config.moe_intermediate_size
+
+    types = {"gate": {}, "up": {}, "down": {}}
+    offsets = {"gate": {}, "up": {}, "down": {}}
+    for t in iter_gguf_file_tensors(model_path):
+        if not t.name.startswith("blk.") or ".nextn." in t.name:
+            continue
+        layer = int(t.name.split(".")[1])
+        if layer >= L:
+            continue
+        for part in ("gate", "up", "down"):
+            if t.name.endswith(f"ffn_{part}_exps.weight"):
+                types[part][layer] = t.ggml_type
+                offsets[part][layer] = t
+    for part in ("gate", "up", "down"):
+        assert len(types[part]) == L, f"missing {part} expert tensors"
+
+    qt_gu = types["gate"][0]
+    assert all(v == qt_gu for v in types["gate"].values()) and all(
+        v == qt_gu for v in types["up"].values()
+    ), "gate/up ggml types vary across layers"
+    assert qt_gu == GGML_Q4_K, f"bank pack implemented for Q4_K gate/up, got {qt_gu}"
+    qt_dn = GGML_Q4_K  # uniform pool type (same choice as the RAM path)
+
+    rb_gu = ggml_row_bytes(H, qt_gu)
+    rb_dn = ggml_row_bytes(I, qt_dn)
+    n_gu = E * I * rb_gu
+    n_dn = E * H * rb_dn
+
+    # layer-major layout: [gate L0 | up L0 | down L0 | gate L1 | ...]
+    region = [0] * L
+    off = 0
+    for layer in range(L):
+        region[layer] = {
+            "gate": off, "up": off + n_gu, "down": off + 2 * n_gu,
+        }
+        off += n_gu + n_gu + n_dn
+    total = off
+
+    src = np.memmap(model_path, dtype=np.uint8, mode="r")
+    t0 = time.time()
+    print(f"[bank-pack] writing {total / 2**30:.1f} GiB to {pack_path}")
+    pack_mm = np.memmap(pack_path, dtype=np.uint8, mode="w+", shape=(total,))
+    for layer in range(L):
+        for part in ("gate", "up", "down"):
+            t = offsets[part][layer]
+            rows = I if part in ("gate", "up") else H
+            n = E * rows * t.row_bytes
+            raw = torch.from_numpy(src[t.file_offset : t.file_offset + n])
+            if t.ggml_type == (qt_gu if part != "down" else qt_dn):
+                out = raw.reshape(-1).numpy()
+            else:
+                dense = dequantize(raw.reshape(-1), t.ggml_type, torch.float32)
+                out = requantize_q4_k(dense).numpy()
+            r = region[layer][part]
+            pack_mm[r : r + len(out)] = out
+        if (layer + 1) % 8 == 0 or layer == L - 1:
+            pack_mm.flush()
+            print(f"[bank-pack] layer {layer + 1}/{L} ({time.time() - t0:.0f}s)")
+    pack_mm.flush()
+    del pack_mm
+
+    header = {
+        "version": 1,
+        "model_path": os.path.abspath(model_path),
+        "pack_path": os.path.abspath(pack_path),
+        "pack_bytes": total,
+        "num_layers": L,
+        "num_experts": E,
+        "hidden_size": H,
+        "moe_intermediate_size": I,
+        "quant_types": {"gate": qt_gu, "down": qt_dn},
+        "offsets": region,
+        "region_bytes": {"gate_up": n_gu, "down": n_dn},
+    }
+    tmp = pack_path + ".idx.tmp"
+    with open(tmp, "w") as f:
+        json.dump(header, f)
+    os.replace(tmp, pack_path + ".idx")
+    print(f"[bank-pack] done in {time.time() - t0:.0f}s")
 
 
 def dummy_ggml_expert_sources(config: ModelConfig) -> dict:

@@ -291,6 +291,17 @@ class OffloadMoELayer(MoELayer):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
+        cache = self.offload_cache
+        if cache is not None and hasattr(cache, "profile_counts"):
+            cache.step_profile(self.layer_id, topk_ids)  # routing trace (pre-rewrite ids)
+        return self._decode_routed_impl(hidden_states, topk_weights, topk_ids)
+
+    def _decode_routed_impl(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
         """On-demand load: ``ensure_experts`` rewrites ``topk_ids`` into cache slot
         ids in place (loading missing experts), then the GEMM reads the full slot
         cache. All device-side with fixed shapes, so the decode call is CUDA-graph
@@ -540,6 +551,15 @@ class OffloadMoELayer(MoELayer):
             qt_pair = cache.ggml_quant_types[self.layer_id]
             return fused_experts_ggml_mixed(
                 hidden_states, gate_up, down, topk_weights, topk_ids, self.activation, qt_pair
+            )
+        if fmt == "ggml_file":
+            # SSD tier: unfused gate/up/down slot pools, pageable-staged copies.
+            from freetoken.moe.fused_q4_0 import fused_experts_ggml_split
+
+            gate, up, down = views
+            qt_pair = cache.ggml_quant_types[self.layer_id]
+            return fused_experts_ggml_split(
+                hidden_states, gate, up, down, topk_weights, topk_ids, self.activation, qt_pair
             )
         if fmt == "mxfp4_triton":
             # gpt-oss MXFP4 experts (biased, clamped swiglu): transposed split-K GEMV

@@ -360,6 +360,14 @@ def load_ggml_moe_expert_sources(
     return loader(model_path, model_config, layer_sink=layer_sink)
 
 
+def load_ggml_file_expert_sources(model_path: str, model_config) -> dict:
+    """SSD-tier expert banks: zero-copy file views (see the qwen3_5_moe GGUF
+    adapter's load_ggml_expert_sources_file)."""
+    _config, spec = _spec_for_model_path(model_path)
+    loader = _load_attr(spec.module, "load_ggml_expert_sources_file")
+    return loader(model_path, model_config)
+
+
 def _num_moe_layers(config) -> int:
     value = getattr(config, "num_moe_layers", None)
     if value is not None:

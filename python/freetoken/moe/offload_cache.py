@@ -48,6 +48,10 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # native GGUF k-quants (Q4_K/Q6_K mix): same two banks, ggml quant type per
     # layer carried separately (OffloadMoeCache.ggml_quant_types)
     "ggml": ("gate_up", "down"),
+    # SSD tier: zero-copy file-backed (page-cache) expert views, unfused
+    # gate/up/down; copies stage through pageable H2D instead of the pinned
+    # GPU-side gather, and CUDA graphs are disabled for this storage mode.
+    "ggml_file": ("gate", "up", "down"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
     # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
@@ -928,10 +932,108 @@ class OffloadMoeCache:
             "norm_entropy": norm_ent,
         }
 
+    # ------------------------------------------------------------------
+    # Expert routing profile (SSD tier / pre-warm): decode-step expert picks
+    # accumulate into a per-layer counter; the ranked list drives the startup
+    # pre-warm. See docs: recency beats global popularity (a moment-local hot
+    # set exists even when the long-run distribution is flat).
+    # ------------------------------------------------------------------
+    def init_profile(self, out_path: str) -> None:
+        self._profile_out = out_path
+        self._profile_steps = 0
+        self.profile_counts = torch.zeros(
+            (self.num_layers, self.num_experts), dtype=torch.int64, device=self.device
+        )
+
+    def step_profile(self, layer_id: int, topk_ids: torch.Tensor) -> None:
+        """Accumulate one decode step's routed experts (device-side, one op)."""
+        counts = self.profile_counts[layer_id]
+        counts.scatter_add_(
+            0, topk_ids.reshape(-1).long(), torch.ones_like(topk_ids.reshape(-1), dtype=torch.int64)
+        )
+        # Periodic flush: SIGKILL'd workers never run atexit, and 500+ tokens
+        # of trace is already plenty for the pre-warm ranking.
+        self._profile_steps += 1
+        if self._profile_steps % 512 == 0:
+            self.flush_profile()
+
+    def flush_profile(self) -> None:
+        """Write the ranked per-layer expert lists (the pre-warm input)."""
+        import json
+        import os
+
+        out = getattr(self, "_profile_out", None)
+        if not out or not hasattr(self, "profile_counts"):
+            return
+        counts = self.profile_counts.cpu()
+        ranked = {
+            str(layer): counts[layer].argsort(descending=True).tolist()
+            for layer in range(self.num_layers)
+        }
+        os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+        tmp = out + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(
+                {
+                    "version": 1,
+                    "num_layers": self.num_layers,
+                    "num_experts": self.num_experts,
+                    "ranked": ranked,
+                },
+                f,
+            )
+        os.replace(tmp, out)
+
+    def prewarm_from_profile(self, profile_path: str, per_layer: int | None = None) -> int:
+        """Admit the profile's top experts into the slot cache at startup.
+
+        The video-validated static set: chosen once from a routing profile
+        (recent-recency ranked), uploaded before serving, then FreeToken's
+        dynamic LRU continues to adapt -- misses during decode stream over
+        PCIe from the (NVMe) pack instead of faulting cold. Admission goes
+        through the normal ensure/copy path, so every bookkeeping invariant
+        holds.
+        """
+        import json
+
+        with open(profile_path) as f:
+            prof = json.load(f)
+        assert prof.get("num_layers") == self.num_layers and prof.get("num_experts") == self.num_experts
+        n = per_layer or self.cache_size
+        admitted = 0
+        for layer in range(self.num_layers):
+            ids = prof["ranked"][str(layer)][: min(n, self.num_experts)]
+            if not ids:
+                continue
+            t = torch.tensor(ids, dtype=torch.int32, device=self.device)
+            self.ensure_experts(layer, t)
+            self.copy_missing()
+            admitted += len(ids)
+        return admitted
+
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
+        if self.quant_format == "ggml_file":
+            # SSD tier: banks are page-cache (unpinned) file views -- the GPU
+            # gather kernel cannot dereference them, so stage each miss with a
+            # pageable H2D copy (the driver bounces through a pinned buffer and
+            # faults the pages in from disk when cold). One index D2H sync per
+            # layer-step; CUDA graphs are disabled in this mode.
+            n = int(self.num_indices.item())
+            if n == 0:
+                return
+            evict = self.evict_slots[:n].tolist()
+            src = self.src_indices[:n].tolist()
+            for name in self.bank_schema:
+                cache_pool = self.bank_caches[name]
+                bank = self.bank_sources[name][layer_id]
+                for slot_idx in range(n):
+                    cache_pool[evict[slot_idx]].copy_(
+                        bank[src[slot_idx]], non_blocking=False
+                    )
+            return
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
 
