@@ -16,7 +16,53 @@ import torch
 from freetoken.layers.activation import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 from freetoken.models.gguf.dequant import GGML_Q4_0
 
-_ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_tanh_and_mul}
+_ACT = {"silu": silu_and_mul, "gelu": gelu_and_mul, "gelu_tanh": gelu_and_mul}
+
+
+def _triton_moe_ok(quant_types: tuple[int, int]) -> bool:
+    """Parked (default OFF): the byte-space kernels are ~36 us each, but the
+    ggml MMVQ path already serves a layer in ~52 us in-graph; the fragmented
+    per-expert row counts (512-2048) starve this variant where the dense form
+    wins. The routed-expert lever belongs to a Rusty-Llama-style kernel port
+    (async dequant / rocWMMA over the vendored ggml sources). Enable with
+    FREETOKEN_TRITON_MOE=1 for A/B."""
+    import os
+
+    return (
+        quant_types == (12, 12)
+        and os.environ.get("FREETOKEN_TRITON_MOE", "0").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+
+
+def fused_experts_ggml_triton(
+    hidden_states: torch.Tensor,
+    gate_q: torch.Tensor,   # [slots, I, row_bytes(H)]
+    up_q: torch.Tensor,     # [slots, I, row_bytes(H)]
+    down_q: torch.Tensor,   # [slots, H, row_bytes(I)]
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+) -> torch.Tensor:
+    """Byte-space Triton variant of :func:`fused_experts_ggml_split`.
+
+    The uniform-Q4_K SSD-tier pack makes every bank Q4_K, so the dense kquant
+    GEMV's per-expert form serves all three projections with no q8 pre-pass:
+    measured ~534 GB/s effective vs the ggml MMVQ's ~180 in-profile (which
+    also pays a quantize_row_q8_1 launch per call).
+    """
+    import torch.nn.functional as F
+
+    from freetoken.kernel.triton.kquant_linear import kq_moe_gemv
+
+    assert activation == "silu", "Triton MoE path currently covers silu"
+    g = kq_moe_gemv(gate_q, topk_ids, hidden_states)   # [T, K_top, I]
+    u = kq_moe_gemv(up_q, topk_ids, hidden_states)
+    inter = (F.silu(g.float()) * u.float()).to(torch.bfloat16).contiguous()
+    d = kq_moe_gemv(down_q, topk_ids, inter)            # [T, K_top, H]
+    return (d.float() * topk_weights.unsqueeze(-1)).sum(dim=1).to(
+        hidden_states.dtype
+    )
 
 
 def fused_experts_ggml(

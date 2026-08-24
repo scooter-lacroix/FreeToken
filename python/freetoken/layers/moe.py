@@ -569,10 +569,21 @@ class OffloadMoELayer(MoELayer):
             )
         if fmt == "ggml_file":
             # SSD tier: unfused gate/up/down slot pools, pageable-staged copies.
-            from freetoken.moe.fused_q4_0 import fused_experts_ggml_split
-
             gate, up, down = views
             qt_pair = cache.ggml_quant_types[self.layer_id]
+            if not is_prefill and hidden_states.shape[0] <= 8:
+                from freetoken.moe.fused_q4_0 import (
+                    _triton_moe_ok,
+                    fused_experts_ggml_triton,
+                )
+
+                if _triton_moe_ok(qt_pair):
+                    return fused_experts_ggml_triton(
+                        hidden_states, gate, up, down, topk_weights, topk_ids,
+                        self.activation,
+                    )
+            from freetoken.moe.fused_q4_0 import fused_experts_ggml_split
+
             return fused_experts_ggml_split(
                 hidden_states, gate, up, down, topk_weights, topk_ids, self.activation, qt_pair
             )
