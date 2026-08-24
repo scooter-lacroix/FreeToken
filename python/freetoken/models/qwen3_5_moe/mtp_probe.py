@@ -44,7 +44,62 @@ class MTPProbe:
         self.total = 0
         self.last_h_std = -1.0
         self.last_hp_std = -1.0
-        self._attach_private_expert_cache(model_path)
+        self._latch = None
+        self.engine = self._maybe_attach_bf16_engine(model_path)
+        if self.engine is not None:
+            # Two-hop xfer buffer: a direct cuda:0 -> cuda:1 .to() does a
+            # cross-device staged copy that forces device-wide syncs every
+            # step (measured 45 -> 17 tok/s). Pinned host staging keeps each
+            # hop a plain stream-ordered copy. Everything also runs on PRIVATE
+            # streams: the legacy null stream synchronizes across devices on
+            # ROCm, which serialized the drain with in-flight replays (~30ms
+            # per step measured on the null streams).
+            self._pin_h = torch.empty(
+                1, self.config.hidden_size, dtype=torch.bfloat16, pin_memory=True
+            )
+            self._pin_ev = torch.cuda.Event()
+            self._s0 = torch.cuda.Stream()
+            self._s1 = torch.cuda.Stream(device=self.engine.device)
+            self._eng_ms = 0.0
+            self._xfer_ms = 0.0
+            # one-step latch: (event, logits, req_id) resolved at the NEXT
+            # step's entry (GPU 1 is long idle by then -> free sync)
+            self._latch = None
+        else:
+            self._attach_private_expert_cache(model_path)
+
+    def _maybe_attach_bf16_engine(self, model_path):
+        """Dual-GPU mode: the draft head on the second GPU, dequantized bf16.
+
+        The trunk keeps GPU 0 (and its graphs) to itself; the draft gets the
+        idle device with full-precision weights (no Q4_K compute noise) and
+        its own KV. Per-step cross-GPU traffic: one [H] hidden vector over,
+        one token id back. FREETOKEN_MTP_DRAFT_GPU=0 forces the in-process
+        quantized path (single-GPU portability); "1"/"auto" (default) use
+        cuda:1 when a second device exists.
+        """
+        import os
+
+        sel = os.environ.get("FREETOKEN_MTP_DRAFT_GPU", "auto").strip().lower()
+        if sel in {"0", "off", "false", "no"} or model_path is None:
+            return None
+        idx = 1 if sel in {"auto", "1", "on", "true", "yes"} else int(sel)
+        if torch.cuda.device_count() <= idx:
+            if sel == "auto":
+                return None
+            logger.warning(f"[mtp-probe] FREETOKEN_MTP_DRAFT_GPU={idx} but only "
+                           f"{torch.cuda.device_count()} devices; falling back")
+            return None
+        try:
+            from .mtp_draft import Bf16DraftEngine
+
+            eng = Bf16DraftEngine(model_path, self.config, f"cuda:{idx}")
+            logger.info(f"[mtp-probe] draft engine on cuda:{idx} (trunk keeps cuda:0)")
+            return eng
+        except Exception as e:
+            logger.warning(f"[mtp-probe] bf16 draft engine failed: {e!r}; "
+                           "falling back to the in-process quantized path")
+            return None
 
     def _attach_private_expert_cache(self, model_path):
         """Give the draft layer its OWN OffloadMoeCache for the file tier.
@@ -97,10 +152,16 @@ class MTPProbe:
             if self.pending[1] == int(actual_token):
                 self.hits += 1
             if self.total % 200 == 0:
+                eng = (
+                    f" eng={self._eng_ms / 200:.2f}ms xfer={self._xfer_ms / 200:.2f}ms"
+                    if self.engine is not None else ""
+                )
+                self._eng_ms = 0.0
+                self._xfer_ms = 0.0
                 logger.info(
                     f"[mtp-probe] acceptance {self.hits}/{self.total} = "
                     f"{self.hits / self.total:.3f} | h_std={getattr(self, 'last_h_std', -1):.4f}"
-                    f" post_std={getattr(self, 'last_hp_std', -1):.4f}"
+                    f" post_std={getattr(self, 'last_hp_std', -1):.4f}{eng}"
                 )
         self.pending = None
 
@@ -109,6 +170,13 @@ class MTPProbe:
         """Called after a decode step committed ``token`` at ``pos``."""
         d = self.draft
         at = d.layer.self_attn
+        if self.engine is not None and self._latch is not None:
+            # resolve the previous step's async draft (predicts THIS step's
+            # token) before scoring -- pending is then (req, pred) vs token.
+            ev, lg, rid = self._latch
+            ev.synchronize()
+            self.pending = (rid, int(lg.argmax().item()))
+            self._latch = None
         if trunk_hidden is None:
             self._score_step(req_id, token)
             return
@@ -126,6 +194,33 @@ class MTPProbe:
 
         n = self.fill.get(req_id, 0)
         if n >= self.max_pos - 1 or pos >= self.max_pos:
+            return
+
+        if self.engine is not None:
+            # Dual-GPU: hand the snapshot to the bf16 engine via pinned host
+            # staging on private streams (see __init__); the whole forward is
+            # ENQUEUED async and the argmax resolves at the next entry (GPU 1
+            # finishes long before the next decode step commits).
+            import time as _time
+
+            t0 = _time.perf_counter()
+            s0, s1 = self._s0, self._s1
+            with torch.cuda.stream(s0):
+                self._pin_h.copy_(h, non_blocking=True)
+                self._pin_ev.record(s0)
+            self._pin_ev.synchronize()
+            t1 = _time.perf_counter()
+            with torch.cuda.stream(s1):
+                h1 = self._pin_h.to(self.engine.device, non_blocking=True)
+                logits = self.engine.step_async(h1[0], token, pos, n)
+                ev = torch.cuda.Event()
+                ev.record(s1)
+            self._latch = (ev, logits, req_id)
+            self.fill[req_id] = n + 1
+            t2 = _time.perf_counter()
+            self._xfer_ms += (t1 - t0) * 1e3
+            self._eng_ms += (t2 - t1) * 1e3
+            self._trace(h, hp, token, pos, None, mid=None)
             return
 
         # --- eh_proj combine (llama.cpp qwen35moe_mtp: concat(e_norm, h_norm)) ---
@@ -199,7 +294,7 @@ class MTPProbe:
 
     _TRACE_N = 0
 
-    def _trace(self, h, hp, token, pos, logits, mid=None):
+    def _trace(self, h, hp, token, pos, logits, mid=None, engine_top5=None):
         """FREETOKEN_MTP_TRACE=<dir>: dump inputs/outputs for offline debugging."""
         import os
 
@@ -214,8 +309,8 @@ class MTPProbe:
             "h_post": hp.detach().float().cpu() if hp is not None else None,
             "token": int(token),
             "pos": int(pos),
-            "logits": logits.detach().float().cpu(),
-            "pred": int(logits[0].argmax()),
+            "logits": logits.detach().float().cpu() if logits is not None else None,
+            "pred": int(logits[0].argmax()) if logits is not None else (self.pending[1] if self.pending else -1),
             "fill": self.fill.get(self.pending[0], 0) if self.pending else 0,
         }
         if mid is not None:
@@ -223,12 +318,18 @@ class MTPProbe:
                 k: (v.detach().float().cpu() if torch.is_tensor(v) else v)
                 for k, v in mid.items()
             }
+        if engine_top5 is not None:
+            t5i, t5v = engine_top5
+            payload["top5_idx"] = t5i.detach().cpu().tolist()
+            payload["top5_val"] = t5v.detach().float().cpu().tolist()
         _t.save(payload, os.path.join(d, f"step_{MTPProbe._TRACE_N:03d}.pt"))
 
     def reset_req(self, req_id):
         self.fill.pop(req_id, None)
         if self.pending and self.pending[0] == req_id:
             self.pending = None
+        if self._latch is not None and self._latch[2] == req_id:
+            self._latch = None
 
     def report(self):
         if self.total:
