@@ -268,6 +268,15 @@ class OffloadMoeCache:
         self._batch_memcpy = None
         self.prefill_hit_rows = 0
         self.prefill_total_rows = 0
+        # SSD tier (ggml_file): pinned single-read staging for the per-layer-step
+        # (num_indices, evict_slots, src_indices) D2H -- three device reads become
+        # one copy + one host sync. Allocated lazily with the FileBankStager.
+        # suppress_inline_copy is set by the piecewise graph runner around capture
+        # walks and segment replays: the layer skips its inline copy_missing and the
+        # runner drives the staged copies between graph segments instead.
+        self.suppress_inline_copy = False
+        self.ggml_pack_path: str | None = None
+        self._file_stager_instance = None
 
     def set_bank_sources(
         self,
@@ -611,7 +620,17 @@ class OffloadMoeCache:
         def copy() -> None:
             self._invalidate_prefill_buffer(buffer_id)
             for (per_layer, _), buffer in zip(self.banks, self.prefill_bank_buffers):
-                buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
+                if self.quant_format == "ggml_file":
+                    # Page-cache banks: chunk the whole-layer H2D through the pinned
+                    # ring instead of one driver-staged pageable copy.
+                    stager = self.file_stager()
+                    src = per_layer[layer_id]
+                    stager.linear(
+                        buffer[buffer_id].view(-1),
+                        src.view(-1),
+                    )
+                else:
+                    buffer[buffer_id].copy_(per_layer[layer_id], non_blocking=True)
 
         if self._prefill_hit_d2d_active:
             self._prefetch_split(layer_id, buffer_id)
@@ -992,17 +1011,21 @@ class OffloadMoeCache:
         dynamic LRU continues to adapt -- misses during decode stream over
         PCIe from the (NVMe) pack instead of faulting cold. Admission goes
         through the normal ensure/copy path, so every bookkeeping invariant
-        holds.
+        holds. ``per_layer`` defaults to ``cache_size // num_layers``: the
+        static hot set is exactly what the cache can hold per layer, not the
+        full expert population.
         """
         import json
 
         with open(profile_path) as f:
             prof = json.load(f)
         assert prof.get("num_layers") == self.num_layers and prof.get("num_experts") == self.num_experts
-        n = per_layer or self.cache_size
+        if per_layer is None:
+            per_layer = max(1, self.cache_size // self.num_layers)
+        self._prewarm_fadvise(prof, per_layer)
         admitted = 0
         for layer in range(self.num_layers):
-            ids = prof["ranked"][str(layer)][: min(n, self.num_experts)]
+            ids = prof["ranked"][str(layer)][: min(per_layer, self.num_experts)]
             if not ids:
                 continue
             t = torch.tensor(ids, dtype=torch.int32, device=self.device)
@@ -1011,28 +1034,126 @@ class OffloadMoeCache:
             admitted += len(ids)
         return admitted
 
+    def _prewarm_fadvise(self, prof: dict, per_layer: int) -> None:
+        """NVMe readahead for the pre-warm set (file tier only).
+
+        Issues POSIX_FADV_WILLNEED for each admitted expert's byte range so the
+        kernel starts pulling the pack pages while admission copies run, instead
+        of every gather stalling on a cold page fault.
+        """
+        import os
+
+        pack = getattr(self, "ggml_pack_path", None)
+        if not pack or not os.path.exists(pack) or self.quant_format != "ggml_file":
+            return
+        try:
+            from freetoken.models.qwen3_5_moe.gguf import _read_bank_pack_header
+
+            header = _read_bank_pack_header(pack)
+            if header is None:
+                return
+            fd = os.open(pack, os.O_RDONLY)
+        except (OSError, ImportError):
+            return
+        try:
+            for layer in range(self.num_layers):
+                ids = prof["ranked"][str(layer)][:per_layer]
+                if not ids:
+                    continue
+                for name in ("gate", "up", "down"):
+                    bank = self.bank_sources[name][layer]
+                    stride = bank.shape[1] * bank.shape[2] * bank.element_size()
+                    base = header["offsets"][layer][name]
+                    for e in ids:
+                        os.posix_fadvise(
+                            fd, base + e * stride, stride, os.POSIX_FADV_WILLNEED
+                        )
+        finally:
+            os.close(fd)
+
+    def file_stager(self):
+        """Lazily built pinned-staging copier for the file tier."""
+        if self._file_stager_instance is None:
+            from freetoken.moe.file_staging import FileBankStager
+
+            self._file_stager_instance = FileBankStager(self.device)
+            if self.device.type == "cuda":
+                E = self.num_experts
+                # [0]=num_indices, [1:1+E]=evict slots, [1+E:]=source rows.
+                self._idx_stage_host = torch.zeros(
+                    1 + 2 * E, dtype=torch.int32, pin_memory=True
+                )
+                self._idx_stage_dev = torch.zeros(
+                    1 + 2 * E, dtype=torch.int32, device=self.device
+                )
+                self._idx_event = torch.cuda.Event()
+        return self._file_stager_instance
+
+    def _read_pending_indices(self) -> tuple[int, "np.ndarray", "np.ndarray"]:
+        """One-sync D2H of (miss count, evict slots, source rows) via pinned staging."""
+        import numpy as np
+
+        stage_h, stage_d = self._idx_stage_host, self._idx_stage_dev
+        cur = torch.cuda.current_stream(self.device)
+        stage_d[0].copy_(self.num_indices, non_blocking=True)
+        E = self.num_experts
+        stage_d[1 : 1 + E].copy_(self.evict_slots, non_blocking=True)
+        stage_d[1 + E :].copy_(self.src_indices, non_blocking=True)
+        stage_h.copy_(stage_d, non_blocking=True)
+        self._idx_event.record(cur)
+        self._idx_event.synchronize()
+        arr = stage_h.numpy()
+        n = int(arr[0])
+        n = min(n, E)
+        return n, arr[1 : 1 + n], arr[1 + E : 1 + E + n]
+
+    def copy_missing_staged(self, layer_id: int) -> None:
+        """Runner-driven miss copy for piecewise replay (explicit layer id).
+
+        During graph replays ``_pending_src_layer`` is stale (it was set at
+        capture time), so the piecewise runner names the layer directly.
+        """
+        self._pending_src_layer = layer_id
+        self.copy_missing()
+
     def copy_missing(self) -> None:
         assert self.banks, "set_bank_sources must register the banks first"
         layer_id = self._pending_src_layer
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
         if self.quant_format == "ggml_file":
-            # SSD tier: banks are page-cache (unpinned) file views -- the GPU
-            # gather kernel cannot dereference them, so stage each miss with a
-            # pageable H2D copy (the driver bounces through a pinned buffer and
-            # faults the pages in from disk when cold). One index D2H sync per
-            # layer-step; CUDA graphs are disabled in this mode.
-            n = int(self.num_indices.item())
+            # SSD tier: banks are page-cache (unpinned) file views -- the GPU gather
+            # kernel cannot dereference them. Stage each miss through the pinned ring:
+            # rows pack host-side (page-cache reads), cross as chunked async H2D, and
+            # scatter device-side into the slot cache. One index D2H sync per layer-step.
+            stager = self.file_stager()
+            if stager.device.type != "cuda":
+                n = int(self.num_indices.item())
+                if n == 0:
+                    return
+                evict = self.evict_slots[:n].tolist()
+                src = self.src_indices[:n].tolist()
+                for name in self.bank_schema:
+                    cache_pool = self.bank_caches[name]
+                    bank = self.bank_sources[name][layer_id]
+                    for slot_idx in range(n):
+                        cache_pool[evict[slot_idx]].copy_(
+                            bank[src[slot_idx]], non_blocking=False
+                        )
+                return
+            n, src_rows, _ = self._read_pending_indices()
             if n == 0:
                 return
-            evict = self.evict_slots[:n].tolist()
-            src = self.src_indices[:n].tolist()
+            slots = self.evict_slots
             for name in self.bank_schema:
                 cache_pool = self.bank_caches[name]
                 bank = self.bank_sources[name][layer_id]
-                for slot_idx in range(n):
-                    cache_pool[evict[slot_idx]].copy_(
-                        bank[src[slot_idx]], non_blocking=False
-                    )
+                stager.gather_rows(
+                    bank.view(bank.shape[0], -1),
+                    src_rows,
+                    cache_pool.view(cache_pool.shape[0], -1),
+                    slots,
+                    n,
+                )
             return
         if self._copy_fused_ok:
             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit

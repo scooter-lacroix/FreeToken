@@ -118,6 +118,16 @@ class GraphRunner:
         self.moe_offload_cache = moe_offload_cache
         self.stream = stream
         self.device = device
+        # Piecewise mode (SSD expert tier): capture segments that end at each
+        # MoE layer's ensure/copy seam instead of one monolithic graph, so the
+        # host-driven miss copies can run between replays (see engine/piecewise).
+        self.piecewise = bool(
+            self.max_graph_bs > 0
+            and moe_offload_cache is not None
+            and getattr(moe_offload_cache, "quant_format", "") == "ggml_file"
+        )
+        self.pw_map: Dict[int, List[torch.cuda.CUDAGraph]] = {}
+        self.pw_seams: List[int] = []
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -159,7 +169,7 @@ class GraphRunner:
             free_memory = get_free_memory(self.device)
             pbar.desc = f"Capturing graphs: bs = {bs:<3} | avail_mem = {mem_GB(free_memory)}"
             pbar.refresh()
-            graph = torch.cuda.CUDAGraph()
+            graph = None
             batch = Batch(reqs=[self.dummy_req] * bs, phase="decode")
             batch.padded_reqs = batch.reqs
             self.attn_backend.prepare_for_capture(batch)
@@ -175,12 +185,42 @@ class GraphRunner:
                 self.buffer.logits[:bs] = model.forward()
                 # Keep the offload cache warmed for capture. Resetting here forces
                 # CUDA graph capture to replay cold-cache expert copies.
-                with torch.cuda.graph(graph, pool=pool, stream=self.stream):
-                    self.buffer.logits[:bs] = model.forward()
+                if self.piecewise:
+                    from freetoken.engine.piecewise import PiecewiseCapture
+
+                    cache = self.moe_offload_cache
+                    assert cache is not None and cache.quant_format == "ggml_file"
+                    cache.suppress_inline_copy = True
+                    try:
+                        cap = PiecewiseCapture(self.stream, pool=pool)
+                        cap.capture(
+                            lambda: self.buffer.logits.__setitem__(
+                                slice(0, bs), model.forward()
+                            )
+                        )
+                        if pool is None:
+                            pool = cap.pool
+                        if not self.pw_seams:
+                            self.pw_seams = list(cap.seams)
+                        else:
+                            assert self.pw_seams == cap.seams, (
+                                "piecewise segment layout changed between batch sizes"
+                            )
+                        assert len(cap.graphs) == len(self.pw_seams) + 1, (
+                            len(cap.graphs), len(self.pw_seams)
+                        )
+                        self.pw_map[bs] = cap.graphs
+                    finally:
+                        cache.suppress_inline_copy = False
+                else:
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, pool=pool, stream=self.stream):
+                        self.buffer.logits[:bs] = model.forward()
                 self._reset_moe_offload_cache()
             if pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
-            self.graph_map[bs] = graph
+            if graph is not None:
+                self.graph_map[bs] = graph
 
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
@@ -192,9 +232,23 @@ class GraphRunner:
     def replay(self, batch: Batch) -> torch.Tensor:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
-        g = self.graph_map[batch.padded_size]
         self.attn_backend.prepare_for_replay(batch)
-        g.replay()
+        if self.piecewise:
+            cache = self.moe_offload_cache
+            segments = self.pw_map[batch.padded_size]
+            cache.suppress_inline_copy = True
+            try:
+                segments[0].replay()
+                for i, layer_id in enumerate(self.pw_seams):
+                    # Host-driven miss fetch for this layer (staged through the
+                    # pinned ring), then the segment holding its expert GEMM.
+                    cache.copy_missing_staged(layer_id)
+                    segments[i + 1].replay()
+            finally:
+                cache.suppress_inline_copy = False
+        else:
+            g = self.graph_map[batch.padded_size]
+            g.replay()
         return self.buffer.logits[: batch.size]
 
     def pad_batch(self, batch: Batch) -> None:
@@ -213,5 +267,6 @@ class GraphRunner:
         # free-before-alloc cannot reclaim this GPU memory. empty_cache() is left to the
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
+        self.pw_map = {}
         self.buffer = None
         gc.collect()

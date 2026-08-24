@@ -321,7 +321,22 @@ class OffloadMoELayer(MoELayer):
         if cache.decode_target == "hybrid":
             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
         cache.ensure_experts(self.layer_id, topk_ids)
-        cache.copy_missing()
+        if getattr(cache, "suppress_inline_copy", False):
+            # Piecewise graph mode: the runner drives the staged miss copies
+            # between graph segments; here we only cut the capture (or, at
+            # replay time, do nothing -- the segment boundary is already cut).
+            from freetoken.engine.piecewise import capture_seam
+
+            capture_seam(
+                self.layer_id,
+                tensors=(
+                    hidden_states,
+                    topk_weights,
+                    topk_ids,
+                ),
+            )
+        else:
+            cache.copy_missing()
         return self._expert_gemm(
             cache,
             hidden_states,

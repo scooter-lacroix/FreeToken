@@ -570,6 +570,8 @@ class Engine:
             cache.set_alphas(banks.gate_up_alpha, banks.down_alpha)
             if banks.quant_format == "ggml":
                 cache.ggml_quant_types = banks.ggml_quant_types
+            if banks.quant_format == "ggml_file" and banks.pack_path:
+                cache.ggml_pack_path = banks.pack_path
         else:
             cache = cache_factory(config, self.device)
             cache.decode_target = decode_target

@@ -45,6 +45,8 @@ class ExpertBanks:
     layer_residency: list[str] | None = field(default=None)
     # "ggml" format only: (gate_up type, down type) ggml enum pair per layer.
     ggml_quant_types: list | None = field(default=None)
+    # "ggml_file" only: the NVMe pack backing the banks (fadvise-driven pre-warm).
+    pack_path: str | None = field(default=None)
     # True iff the ``layer_sink`` passed to the loader was actually engaged (each layer
     # streamed straight to its sink instead of staying materialized here) -- set by
     # convert.py's per-format streaming gate; ``sources`` may hold released tensors.
@@ -281,10 +283,12 @@ def _ggml_file_banks(model_path, model_config, device, dtype, dummy, parallel=Fa
 
     sources = load_ggml_file_expert_sources(model_path, model_config)
     quant_types = sources.pop("quant_types")
+    pack_path = sources.pop("pack_path", None)
     return ExpertBanks(
         "ggml_file",
         {name: sources[name] for name in _BANK_SCHEMAS["ggml_file"]},
         ggml_quant_types=quant_types,
+        pack_path=pack_path,
         streamed=False,
     )
 

@@ -616,11 +616,14 @@ def parse_args(
         kwargs["max_running_req"] = 1
         kwargs["silent_output"] = True
 
-    # SSD-tier expert banks (FREETOKEN_EXPERT_BANK_STORAGE=file): the miss path
-    # stages through pageable H2D copies with a host-side index read, which is
-    # not graph-capturable; disable CUDA graphs for this storage mode.
+    # SSD-tier expert banks (FREETOKEN_EXPERT_BANK_STORAGE=file): the miss path is
+    # host-driven, so decode runs through PIECEWISE graphs (engine/piecewise.py) --
+    # segments end at each layer's LRU-ensure seam and the staged miss copies run
+    # between replays. FREETOKEN_FILE_PIECEWISE=0 falls back to fully eager decode.
     if (
         os.environ.get("FREETOKEN_EXPERT_BANK_STORAGE", "ram").strip().lower() == "file"
+        and os.environ.get("FREETOKEN_FILE_PIECEWISE", "1").strip().lower()
+        in {"0", "false", "no", "off"}
         and not kwargs.get("cuda_graph_max_bs")
     ):
         kwargs["cuda_graph_max_bs"] = 0
