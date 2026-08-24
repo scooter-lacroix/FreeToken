@@ -83,6 +83,33 @@ class GgufKQuantLMHead(BaseOP):
         return fn(self.packed, x, self.quant_type, self.num_embeddings)
 
 
+def _kq_gemv(w, x, quant_type: int, out_features: int):
+    """Triton k-quant GEMV when profitable (large-N Q4_K); ggml otherwise.
+
+    Measured on gfx1100: the Triton byte-space kernel beats the ggml vec
+    kernel ~8-16% from N~2k upward (534 vs 462 GB/s at [8192,2048]) and loses
+    below ~1k rows (launch-bound), so small matrices and other quant types
+    stay on the ggml path.
+    """
+    import os
+
+    if (
+        quant_type == 12
+        and x.shape[0] <= 8
+        and out_features >= 2048
+        and os.environ.get("FREETOKEN_TRITON_KQ", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    ):
+        from freetoken.kernel.triton.kquant_linear import kq_gemv
+
+        return kq_gemv(w, x, quant_type)
+    from freetoken.kernel.gguf import ggml_mul_mat_a8, ggml_mul_mat_vec_a8
+
+    if x.shape[0] <= 8:
+        return ggml_mul_mat_vec_a8(w, x, quant_type, out_features)
+    return ggml_mul_mat_a8(w, x, quant_type, out_features)
+
+
 class QuantGgmlLinear(BaseOP):
     """Dense projection over native GGML block bytes (W8A8 k-quant GEMV/GEMM).
 
@@ -114,11 +141,7 @@ class QuantGgmlLinear(BaseOP):
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from freetoken.kernel.gguf import ggml_mul_mat_a8, ggml_mul_mat_vec_a8
-
-        if x.shape[0] <= 8:
-            return ggml_mul_mat_vec_a8(self.packed, x, self.quant_type, self.out_features)
-        return ggml_mul_mat_a8(self.packed, x, self.quant_type, self.out_features)
+        return _kq_gemv(self.packed, x, self.quant_type, self.out_features)
 
 
 __all__ = ["GgufKQuantLMHead", "QuantGGMLEmbedding", "QuantGgmlLinear"]

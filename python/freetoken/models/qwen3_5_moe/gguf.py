@@ -398,8 +398,28 @@ def iter_gguf_weights(
             elif suffix == "ssm_norm.weight":
                 yield f"{p}.linear_attn.norm.weight", _to_bf16(t)
             elif suffix == "ssm_out.weight":
-                w = _to_bf16(t)
-                yield f"{p}.linear_attn.out_proj.weight", _reinterleave_vheads_cols(w, cfg_l["nv"], cfg_l["vd"])
+                if dense_q:
+                    # Requantize the (column-regrouped, plain-order) bf16 matrix to
+                    # Q4_K once at load, then serve it through the Triton k-quant
+                    # GEMV: 4.7 MB instead of 8 MB per token and ~534 GB/s vs the
+                    # ~140 GB/s the bf16 hipBLASLt GEMV was achieving in-profile.
+                    from freetoken.models.gguf.dequant import requantize_q4_k
+
+                    w = _reinterleave_vheads_cols(
+                        _to_bf16(t), cfg_l["nv"], cfg_l["vd"]
+                    )
+                    rows_n = w.shape[0]
+                    pk = (
+                        requantize_q4_k(w.cuda().reshape(-1).float())
+                        .reshape(rows_n, -1)
+                        .to(torch.uint8)
+                        .cpu()
+                    )
+                    yield f"{p}.linear_attn.out_proj.packed", pk
+                    yield f"{p}.linear_attn.out_proj.quant_type", _qt_scalar(12)
+                else:
+                    w = _to_bf16(t)
+                    yield f"{p}.linear_attn.out_proj.weight", _reinterleave_vheads_cols(w, cfg_l["nv"], cfg_l["vd"])
             # ffn_*_exps / ffn_*_shexp handled below (shared with attention layers)
         if suffix == "attn_q.weight":
             qkv_buf.setdefault(layer, {})["q"] = (
