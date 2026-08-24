@@ -120,7 +120,33 @@ class MTPProbe:
         h2 = routed + shared
 
         logits = self.model.lm_head.forward(d.head_norm.forward(h2))
-        self.pending = (req_id, int(logits[0].argmax()))
+        pred = int(logits[0].argmax())
+        self.pending = (req_id, pred)
+        self._trace(h, token, pos, logits)
+
+    _TRACE_N = 0
+
+    def _trace(self, h, token, pos, logits):
+        """FREETOKEN_MTP_TRACE=<dir>: dump inputs/outputs for offline debugging."""
+        import os
+
+        d = os.environ.get("FREETOKEN_MTP_TRACE")
+        if not d or MTPProbe._TRACE_N >= 64:
+            return
+        MTPProbe._TRACE_N += 1
+        import torch as _t
+
+        _t.save(
+            {
+                "h": h.detach().float().cpu(),
+                "token": int(token),
+                "pos": int(pos),
+                "logits": logits.detach().float().cpu(),
+                "pred": int(logits[0].argmax()),
+                "fill": self.fill.get(self.pending[0], 0) if self.pending else 0,
+            },
+            os.path.join(d, f"step_{MTPProbe._TRACE_N:03d}.pt"),
+        )
 
     def reset_req(self, req_id):
         self.fill.pop(req_id, None)

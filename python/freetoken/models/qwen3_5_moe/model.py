@@ -93,10 +93,17 @@ class Qwen3_5Model(BaseOP):
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
         xn, rn = self.norm.forward_add_residual(x, residual)
-        # pre-final-norm trunk residual stream: what the MTP head consumes
-        # (HF Qwen3-Next MTP feeds hnorm(this), not the post-norm hidden).
-        # Fixed address; the graph rewrites contents each replay.
-        get_global_ctx().trunk_hidden_prenorm = rn
+        # pre-final-norm trunk residual stream for the MTP head (HF Qwen3-Next
+        # MTP consumes this, not the post-norm hidden). rn is dead to the graph
+        # past this point, so its pool buffer gets recycled -- copy it into a
+        # persistent module-held buffer; the copy_ kernel is captured and
+        # rewrites the stable address on every replay.
+        buf = getattr(self, "_trunk_prenorm_buf", None)
+        if buf is None or buf.shape != rn.shape:
+            self._trunk_prenorm_buf = rn.clone()
+        else:
+            self._trunk_prenorm_buf.copy_(rn)
+        get_global_ctx().trunk_hidden_prenorm = self._trunk_prenorm_buf
         return xn
 
 
