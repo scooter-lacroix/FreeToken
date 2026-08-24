@@ -337,16 +337,20 @@ class Scheduler(SchedulerIOMixin):
                 mtp_probe = getattr(self.engine, "mtp_probe", None)
                 if mtp_probe is not None and not batch.is_prefill:
                     # k=1 acceptance probe: draft predicts from (h, token);
-                    # the NEXT committed token settles it. Trunk hidden rides
-                    # ctx (graph-rewritten tensor), row i is this request's.
+                    # the NEXT committed token settles it. Both trunk channels
+                    # ride ctx as stable graph-rewritten buffers; row i is
+                    # this request's.
                     from freetoken.core import get_global_ctx
 
-                    h = getattr(get_global_ctx(), "trunk_hidden_prenorm", None)
+                    gctx = get_global_ctx()
+                    h = getattr(gctx, "trunk_hidden_prenorm", None)
+                    hp = getattr(gctx, "trunk_hidden", None)
                     mtp_probe.step(
                         id(req),
                         int(batch.positions[i].item()) if batch.positions is not None else 0,
                         next_token,
                         h[i] if h is not None else None,
+                        hp[i] if hp is not None else None,
                     )
                 # EOS / stop-string -> "stop", output budget exhausted -> "length";
                 # EOS and stop strings win over length.
@@ -618,6 +622,11 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
         self.table_manager.free(req.table_idx)
         req.table_idx = -1
+        # Drop the MTP probe's eager KV rows for this request before its id()
+        # can be recycled by a later request.
+        mtp_probe = getattr(self.engine, "mtp_probe", None)
+        if mtp_probe is not None:
+            mtp_probe.reset_req(id(req))
 
     def _reply_rebuild(self, request_id: str, status: str, error: str | None = None) -> None:
         # Single source of truth with the rollback snapshot (_current_cache_geometry): mamba is

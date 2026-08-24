@@ -42,6 +42,8 @@ class MTPProbe:
         self.pending = None
         self.hits = 0
         self.total = 0
+        self.last_h_std = -1.0
+        self.last_hp_std = -1.0
 
     def _score_step(self, req_id, actual_token: int):
         if self.pending is not None and self.pending[0] == req_id:
@@ -51,30 +53,41 @@ class MTPProbe:
             if self.total % 200 == 0:
                 logger.info(
                     f"[mtp-probe] acceptance {self.hits}/{self.total} = "
-                    f"{self.hits / self.total:.3f}"
+                    f"{self.hits / self.total:.3f} | h_std={getattr(self, 'last_h_std', -1):.4f}"
+                    f" post_std={getattr(self, 'last_hp_std', -1):.4f}"
                 )
         self.pending = None
 
     @torch.no_grad()
-    def step(self, req_id, pos: int, token: int, trunk_hidden):
+    def step(self, req_id, pos: int, token: int, trunk_hidden, trunk_hidden_post=None):
         """Called after a decode step committed ``token`` at ``pos``."""
         d = self.draft
         at = d.layer.self_attn
-        self._score_step(req_id, token)
         if trunk_hidden is None:
+            self._score_step(req_id, token)
             return
+        # Snapshot immediately: the shared trunk buffers are rewritten by the
+        # NEXT decode replay (forward stream) while this drain thread works.
+        h = trunk_hidden.detach().reshape(1, -1).clone().to(torch.bfloat16)
+        hp = (
+            trunk_hidden_post.detach().reshape(1, -1).clone().to(torch.bfloat16)
+            if trunk_hidden_post is not None
+            else None
+        )
+        self.last_h_std = float(h.float().std().item())
+        self.last_hp_std = float(hp.float().std().item()) if hp is not None else -1.0
+        self._score_step(req_id, token)
 
         n = self.fill.get(req_id, 0)
         if n >= self.max_pos - 1 or pos >= self.max_pos:
             return
 
-        # --- eh_proj combine, exactly the milestone-1 forward ---
-        h = trunk_hidden.reshape(1, -1).to(torch.bfloat16)
+        # --- eh_proj combine (llama.cpp qwen35moe_mtp: concat(e_norm, h_norm)) ---
         emb = self.model.model.embed_tokens.forward(
             torch.tensor([token], dtype=torch.int64, device=self.device)
         ).reshape(1, -1)
         x0 = d.eh_proj.forward(
-            torch.cat([d.hnorm.forward(h), d.enorm.forward(emb)], dim=-1)
+            torch.cat([d.enorm.forward(emb), d.hnorm.forward(h)], dim=-1)
         )
 
         # --- the draft layer, eager, mirroring Qwen3_5DecoderLayer/_project ---
@@ -122,11 +135,11 @@ class MTPProbe:
         logits = self.model.lm_head.forward(d.head_norm.forward(h2))
         pred = int(logits[0].argmax())
         self.pending = (req_id, pred)
-        self._trace(h, token, pos, logits)
+        self._trace(h, hp, token, pos, logits)
 
     _TRACE_N = 0
 
-    def _trace(self, h, token, pos, logits):
+    def _trace(self, h, hp, token, pos, logits):
         """FREETOKEN_MTP_TRACE=<dir>: dump inputs/outputs for offline debugging."""
         import os
 
@@ -139,6 +152,7 @@ class MTPProbe:
         _t.save(
             {
                 "h": h.detach().float().cpu(),
+                "h_post": hp.detach().float().cpu() if hp is not None else None,
                 "token": int(token),
                 "pos": int(pos),
                 "logits": logits.detach().float().cpu(),

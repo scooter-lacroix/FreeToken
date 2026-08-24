@@ -768,7 +768,9 @@ def pack_ggml_banks(model_path: str, config: ModelConfig, pack_path: str) -> Non
     t0 = time.time()
     print(f"[bank-pack] writing {total / 2**30:.1f} GiB to {pack_path}")
     pack_mm = np.memmap(pack_path, dtype=np.uint8, mode="w+", shape=(total,))
-    for layer in range(L):
+    # range(PL): the draft (nextn) layer's experts ride the pack too -- a
+    # range(L) here leaves the last region zeroed (silently dead draft MoE).
+    for layer in range(PL):
         for part in ("gate", "up", "down"):
             t = offsets[part][layer]
             rows = I if part in ("gate", "up") else H

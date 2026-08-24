@@ -93,17 +93,27 @@ class Qwen3_5Model(BaseOP):
         for layer in self.layers.op_list:
             x, residual = layer.forward(x, residual)
         xn, rn = self.norm.forward_add_residual(x, residual)
-        # pre-final-norm trunk residual stream for the MTP head (HF Qwen3-Next
-        # MTP consumes this, not the post-norm hidden). rn is dead to the graph
-        # past this point, so its pool buffer gets recycled -- copy it into a
-        # persistent module-held buffer; the copy_ kernel is captured and
-        # rewrites the stable address on every replay.
-        buf = getattr(self, "_trunk_prenorm_buf", None)
-        if buf is None or buf.shape != rn.shape:
-            self._trunk_prenorm_buf = rn.clone()
-        else:
-            self._trunk_prenorm_buf.copy_(rn)
-        get_global_ctx().trunk_hidden_prenorm = self._trunk_prenorm_buf
+        # Pre-final-norm trunk residual for the MTP head (llama.cpp feeds the
+        # trunk's final residual to nextn hnorm). ONE stable buffer written by
+        # slice: graph capture walks the batch-size list largest -> smallest
+        # with an eager warmup forward before each level, so a per-shape
+        # buffer would rebind at every level and ctx would end up pointing at
+        # whichever level was captured LAST -- frozen for every other replay
+        # width. Decode-only: prefill must NOT touch the channel (decode
+        # replays never re-run Python, so a prefill clobber persists for the
+        # whole request) and prefill widths could exceed the buffer, forcing a
+        # rebind that orphans the captured copy_ targets.
+        ctx = get_global_ctx()
+        if not getattr(ctx.batch, "is_prefill", False):
+            buf = getattr(self, "_trunk_prenorm_buf", None)
+            if buf is None:
+                self._trunk_prenorm_buf = rn.new_empty(rn.shape)
+                buf = self._trunk_prenorm_buf
+            if rn.shape[0] <= buf.shape[0]:
+                buf[: rn.shape[0]].copy_(rn)
+                ctx.trunk_hidden_prenorm = buf
+            else:
+                ctx.trunk_hidden_prenorm = rn  # oversized eager decode
         return xn
 
 
@@ -142,10 +152,23 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             self.draft = Qwen35MTPDraft(config)
 
     def forward(self) -> torch.Tensor:
-        output = self.model.forward(get_global_ctx().batch.input_ids)
-        # Trunk hidden (pre-head) for the MTP draft: assigned during capture,
-        # the graph rewrites the tensor's contents on every replay.
-        get_global_ctx().trunk_hidden = output
+        ctx = get_global_ctx()
+        output = self.model.forward(ctx.batch.input_ids)
+        # Post-norm trunk hidden (MTP diagnostics; lm_head consumes `output`,
+        # so it is live every replay). `output` itself is a per-capture-level
+        # pool tensor -- publish it through the same stable slice-written
+        # buffer pattern as the pre-norm channel. Decode-only, like the
+        # pre-norm channel (a prefill clobber would persist across replays).
+        if not getattr(ctx.batch, "is_prefill", False):
+            buf = getattr(self, "_trunk_post_buf", None)
+            if buf is None:
+                self._trunk_post_buf = output.new_empty(output.shape)
+                buf = self._trunk_post_buf
+            if output.shape[0] <= buf.shape[0]:
+                buf[: output.shape[0]].copy_(output)
+                ctx.trunk_hidden = buf
+            else:
+                ctx.trunk_hidden = output  # oversized eager decode
         return self.lm_head.forward(output)
 
 

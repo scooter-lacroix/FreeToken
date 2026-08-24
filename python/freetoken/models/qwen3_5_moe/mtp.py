@@ -4,7 +4,7 @@ DeepSeek-V3-style multi-token-prediction head, served from the checkpoint's
 own ``blk.<L>.nextn.*`` tensors (dropped by the text-only loader unless
 ``FREETOKEN_MTP=1``):
 
-    x      = eh_proj( concat( hnorm(h_trunk), enorm(embed(token)) ) )
+    x      = eh_proj( concat( enorm(embed(token)), hnorm(h_trunk) ) )
     h'     = decoder_layer_L(x)          # a GDN layer, its own state
     logits = lm_head( head_norm(h') )    # the shared (quantized) head
 
@@ -50,8 +50,10 @@ class Qwen35MTPDraft(BaseOP):
 
     def forward(self, h_trunk: torch.Tensor, token_emb: torch.Tensor, lm_head):
         """One draft step: trunk hidden + current token embedding -> logits."""
+        # llama.cpp qwen35moe_mtp reference: ggml_concat(e_norm, h_norm) --
+        # the EMBEDDING half first; eh_proj's column blocks are not symmetric.
         x = self.eh_proj.forward(
-            torch.cat([self.hnorm.forward(h_trunk), self.enorm.forward(token_emb)], dim=-1)
+            torch.cat([self.enorm.forward(token_emb), self.hnorm.forward(h_trunk)], dim=-1)
         )
         h, _ = self.layer.forward(x, None)
         return lm_head.forward(self.head_norm.forward(h))
