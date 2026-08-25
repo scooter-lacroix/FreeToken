@@ -152,3 +152,19 @@ stacked causes, all fixed:
 Measured after fixes (warm triton disk cache): FIRST short request 0.8 s,
 sampled mid-length 7.3 s, tools+system 3.9 s. On a fresh triton cache the
 compiles move to startup (~1-2 + ~10 min one-time).
+
+## Harness reality check (2026-08-25, maestro-terminal)
+
+- **The no-output cause**: the harness's initial prompt is **23,346 tokens**
+  vs the single-XTX test cap of 4,096. The scheduler drops it with an
+  ErrorReplyMsg ("prompt is too long: N tokens > M") -- the harness client
+  swallowed the error. Real agent contexts are ~24k+; the <64k testing
+  target needs ~2.2 GiB of KV, which with 22.9 GiB of dense weights does
+  not fit one 24 GB card. **S2b (dual-GPU layer split) is the critical
+  path.**
+- **Prefill throughput measured**: ~100 tok/s warm (308 tokens in ~3 s),
+  spiky GPU utilization 16-20% floor with 85-100% bursts -- the eager
+  host-bound chunked-prefill path (kernel bursts, Python gaps between
+  layers/chunks). A 23k prompt would take ~4 min even with capacity. Fix
+  direction: chunked prefill runs at a FIXED chunk size (constant shapes)
+  -> prefill chunks are graph-capturable; schedule with S2b.
