@@ -1,0 +1,104 @@
+# Qwen3.8-27B (Fable) + DFlash2 bring-up — verified facts and plan
+
+Everything below was read from the local checkpoints' GGUF headers, the
+z-lab/dflash source (cloned to /tmp/dflash during research), and Rusty
+Llama's `src/models/qwen35.cpp` / `qwen35moe_mtp.cpp` references. No
+guesswork. User constraints for testing: **KV cache q8, flash attention on,
+context < 64k** — see "gaps" for what FreeToken supports today.
+
+## Checkpoints (verified on disk)
+
+- Target: `/mnt/HDD-2/Models/TeichAI/Qwen3.8-27B-Fable-Distill-GGUF/Qwen3.8-27B-Fable-Distill-Q6_K.gguf`
+  — 22.9 GiB, arch `qwen35` (DENSE hybrid, no experts), 65 blocks, H=5120,
+  FFN 17408, vocab 248320, untied output (Q6_K).
+- Draft: `/mnt/HDD-2/Models/incoai/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q8_0.gguf`
+  — 2.06 GiB, arch `dflash`, 5 blocks, H=5120 (matches target), 32q/8kv × 128,
+  causal=False, sliding_window 2048, enc.* tensor prefix.
+
+## Target structure (from GGUF tensors + qwen35.cpp)
+
+- Layers idx%4==3 are FULL ATTENTION (17 of 65): attn_q [5120→12288]
+  (per-head q|gate interleaved, 24 heads × 256), k/v [5120→1024] (4 kv),
+  attn_output [6144→5120], q/k norms [256]. Partial NeoX rope: 64 of 256
+  dims, base 1e7 (text path ignores mrope sections — same as Ornith).
+- Other 48 layers are GDN: attn_qkv [5120→10240] with layout
+  [q 2048 | k 2048 | v 6144] = key_dim(16×128)×2 + value_dim(48×128);
+  attn_gate [5120→6144] = the output gate (FreeToken's in_proj_z);
+  ssm_beta|alpha [5120→48] = in_proj_ba [b|a]; ssm_a [48] = A_log;
+  ssm_dt.bias [48]; ssm_norm [128]; ssm_conv1d [4, 10240]; ssm_out
+  [6144→5120]. FreeToken's GDN module split
+  ([key,key,value] + z + b|a) matches this EXACTLY — parameterize
+  num_key_heads=16, num_value_heads=48, key/value_head_dim=128, conv 4.
+- Dense FFN every layer: gate/up [5120→17408], down [17408→5120] →
+  Qwen3_5DenseMLP + the existing ggml kquant dense path (dense_quant on).
+- Norms pre-baked (1+w) by the converter, same as qwen35moe.
+- `nextn_predict_layers=1` exists in the file — IGNORE (user direction:
+  DFlash2, not the built-in MTP).
+
+Adapter estimate: config parser for the `qwen35` arch keys + a weight-name
+mapping onto the existing Qwen3_5 decoder-layer modules (dense-MoE-off path
+already exists via `moe_enabled=False`). No new kernels needed for inference.
+
+## DFlash2 semantics (from /tmp/dflash/dflash/model.py + GGUF metadata)
+
+- Draft config: block_size=8, target_layers=[6,20,34,48,62] (trunk hidden
+  at these depths), conv_kernel=2, conv_group=16, selector_rank=256,
+  selector_top_k=16, mask_token_id=248070, vocab 248320.
+- Draft inputs per cycle: (a) context feature = concat of the trunk's
+  hidden states at the 5 target layers for the newly produced rows →
+  fc [25600→5120] + enc.output_norm; (b) noise embedding = the TARGET's
+  token-embedding rows of [anchor token, MASK×(k−1)].
+- 5 non-causal layers (Q from block, K/V = cat(context, block), sliding
+  window 2048 on context); DFlash2 adds grouped dynamic causal convs on
+  hidden (attn_conv + ffn_conv per layer: base [2,2,5120] + proj
+  [2,2,320,5120]) and a CandidateSelector (unary logits + bigram codebooks:
+  selector_predecessor/successor [vocab,256], hidden_projection
+  [256,5120], top-16 chained per position).
+- Verify loop (reference greedy): feed the target the block
+  [anchor y_n, c1..ck]; trunk logits row j accepts c_{j+1} iff argmax_j
+  matches; commit longest prefix + one BONUS token (the trunk argmax at the
+  first mismatch). Crop the target KV to the committed length (dense KV —
+  no GDN-state rollback issue on the verify path itself, but the TARGET has
+  GDN layers: their state advanced over the speculative tokens — snapshot
+  per-request GDN state before verify, restore on partial accept, exactly
+  the pattern documented for M2d).
+- Economics (z-lab published + video math): draft read 1.14 GiB @ 4-bit
+  (ours is Q8_0, 2.06 GiB), target read 13.9 GiB; ceiling 5.05×, realized
+  3.43× arithmetic / 2.67× conversation at bs=1; degrades to ~1.0 under
+  concurrent load. block_size 5 recommended with quantized drafts
+  (--draft-bits 4); our target is Q6_K → start k=5, sweep k∈{4,5,8}.
+
+## Placement (dual-GPU, verified fits)
+
+22.9 GiB dense weights do not fit one card with KV. Split layers across
+GPU0 (XTX, ~layers 0-32) and GPU1 (7800 XT, ~33-64 + the 2 GiB DFlash
+engine); hidden crosses at the boundary (10 KB/step). KV: only full-attn
+layers carry paged KV (17 layers × 4 kv × 256): ~70 KB/token bf16 → 64k
+context ≈ 4.4 GiB split by layer ownership. GDN state ~30 MB/request.
+The draft's context features come from trunk layers 6,20 (GPU0) and
+34,48,62 (GPU1) — gather at the boundary (~30 KB/row).
+Reuse the piecewise-graph philosophy for cross-device seams; the MTP
+engine's private-stream + pinned-staging exchange pattern applies verbatim.
+
+## Gaps vs user constraints (honest)
+
+- **FreeToken has no quantized KV cache today** (bf16 paged KV only). With
+  <64k context the budget fits in bf16 (4.4 GiB), so bring-up proceeds
+  without it; q8 KV becomes a capacity feature later if wanted.
+- Flash attention: FreeToken's ROCm attention backend is the Triton
+  flash-style path already (auto-resolves on HIP) — nothing to toggle.
+- FreeToken has no layer-split-across-GPUs infra yet (TP=1 only for GGUF);
+  the boundary seam is the new machinery (small, reuses piecewise seams).
+
+## Build order
+
+1. `qwen35` dense GGUF adapter (config + weight mapping; reference-check
+   logits against Rusty Llama running the same GGUF).
+2. Layer-split placement + serve the Fable target on both GPUs (<64k ctx).
+3. DFlash2 draft engine from the incoai GGUF on GPU1 (non-causal forward +
+   candidate selector; standalone-testable against the z-lab reference).
+4. Block-verify loop in the scheduler (k=5): trunk forward over
+   [anchor + drafts] with the 5-layer hidden tap for the draft context,
+   GDN-state snapshot/restore, greedy longest-prefix accept + bonus token.
+5. Sweep k, measure tok/s + acceptance; compare against the video's
+   3.43×/2.67× reference points.
