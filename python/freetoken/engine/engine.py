@@ -322,14 +322,17 @@ class Engine:
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
         from freetoken.engine.layer_split import (
-            convert_far_linears, split_enabled, redevice_rotaries,
+            convert_far_head, convert_far_linears, split_enabled,
+            redevice_rotaries,
         )
 
         if split_enabled():
             redevice_rotaries(self.model)
             n = convert_far_linears(self.model)
+            head_far = convert_far_head(self.model)
             logger.info_rank0(f"layer split: converted {n} far-side projections "
-                              "(Q4_K Triton decode + bf16 prefill)")
+                              f"(Q4_K Triton decode + bf16 prefill); "
+                              f"head on far side: {head_far}")
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -566,11 +569,15 @@ class Engine:
 
         if split_enabled():
             # move the far side's weights to cuda:1 (they streamed in on
-            # cuda:0; peak near-side usage stays one tensor)
+            # cuda:0; peak near-side usage stays one tensor), then release
+            # the cached near-side blocks the streaming allocator still holds
+            # (the KV budget and warmup allocate against real free memory)
             for k, v in list(state.items()):
                 d = weight_device_for(k)
                 if d != torch.device("cuda:0"):
                     state[k] = v.to(d)
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
         return state
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks) -> tuple[int, int, bool]:
@@ -1032,6 +1039,12 @@ class Engine:
 
     @torch.inference_mode()
     def _warmup_prefill(self) -> None:
+        import torch.cuda.memory
+        for _i in range(torch.cuda.device_count()):
+            _f, _t = torch.cuda.mem_get_info(_i)
+            logger.info_rank0(
+                f"[mem] cuda:{_i} free={mem_GB(_f)} total={mem_GB(_t)}"
+            )
         """Compile the Triton prefill path before the first real request.
 
         Decode CUDA graph capture warms the decode path, but the first prefill

@@ -58,9 +58,14 @@ def weight_device_for(key: str) -> torch.device:
     if key.startswith("model.layers."):
         layer_id = int(key.split(".")[2])
         return layer_device(layer_id)
-    # final norm + head stay on the NEAR side: the crossing carries the
-    # [T, H] hidden (KBs) instead of [T, vocab] logits (MBs), and the
-    # k-quant lm_head keeps its working ggml GEMV on cuda:0
+    # final norm + head go to the FAR side: every near-tail launch after
+    # the far block (norm Triton, ggml MMQ head) faulted in-server even
+    # though each passed standalone probes -- keeping the whole post-far
+    # tail on dev1 (Triton norm + Triton/bf16 head, no ggml) eliminates
+    # the class. Only the [T, vocab] logits cross back (1 MB decode,
+    # 40 MB prefill).
+    if key.startswith(("model.norm.", "lm_head.")):
+        return dev1()
     return torch.device("cuda:0")
 
 
@@ -88,6 +93,72 @@ class FarSideLinear:
         return x @ self.wt
 
     __call__ = forward
+
+
+class FarHead:
+    """LM head for the far side: Triton Q4_K GEMV, no ggml kernels (they hang
+    on the 7800 XT). Q4_K-only storage (350 MB vs 1.35 GB dual): sampling
+    only ever needs the LAST indices per request (T=1-2, see
+    GgufKQuantLMHead.forward), which kq_gemv covers; the T>8 path
+    (unused in serving) falls back to a chunked dequant GEMM. Output stays
+    on the far device; the caller stages logits back."""
+
+    def __init__(self, packed_q4k, k: int):
+        self.packed = packed_q4k      # [vocab, rb] uint8 on cuda:1
+        self.quant_type = 12
+        self.k = k
+
+    def forward(self, x):
+        from freetoken.kernel.triton.kquant_linear import kq_gemv
+        from freetoken.core import get_global_ctx
+
+        # mirror GgufKQuantLMHead: prefill only needs the LAST index per
+        # request (computing all T rows through the 8-row GEMV loop would
+        # allocate ~1 GB of logit transients on the far side)
+        batch = getattr(get_global_ctx(), "_batch", None)
+        if batch is not None and getattr(batch, "is_prefill", False):
+            indices = batch.attn_metadata.get_last_indices(batch.size)
+            x = x[indices].contiguous()
+        if x.shape[0] <= 8:
+            return kq_gemv(self.packed, x, 12)
+        outs = []
+        for lo in range(0, x.shape[0], 8):
+            hi = min(lo + 8, x.shape[0])
+            outs.append(kq_gemv(self.packed, x[lo:hi], 12))
+        return torch.cat(outs, 0)
+
+    __call__ = forward
+
+
+def convert_far_head(model) -> bool:
+    """Replace the GgufKQuantLMHead with a FarHead (Q4_K requant + bf16)."""
+    from freetoken.models.gguf.dequant import dequantize, requantize_q4_k, row_bytes
+    from freetoken.models.qwen3_5_moe.ggml_dense import GgufKQuantLMHead
+
+    head = getattr(model, "lm_head", None)
+    if not isinstance(head, GgufKQuantLMHead):
+        return False
+    packed, qt = head.packed, int(head.quant_type)
+    out_f = packed.shape[0]
+    k = (packed.shape[1] * 256) // row_bytes(256, qt)
+    rb = packed.shape[1]
+    # chunked on-device requant: a whole-vocab fp32 dequant is 2 GB of
+    # transients the far side does not have; 16k-row chunks cap it ~200 MB.
+    # Q4_K-only artifact (no bf16 copy) -- see FarHead.
+    q4_rows = []
+    CH = 16384
+    with torch.no_grad(), torch.cuda.device(packed.device):
+        flat = packed.reshape(-1)
+        for lo in range(0, out_f, CH):
+            hi = min(lo + CH, out_f)
+            f32 = dequantize(flat[lo * rb: hi * rb], qt, torch.float32)
+            q4_rows.append(requantize_q4_k(f32).reshape(hi - lo, -1))
+            del f32
+        q4 = torch.cat(q4_rows, 0)
+        del q4_rows
+        torch.cuda.empty_cache()
+    model.lm_head = FarHead(q4, k)
+    return True
 
 
 def convert_far_linears(model) -> int:
@@ -122,8 +193,14 @@ def convert_far_linears(model) -> int:
 
     layers = model.model.layers.op_list
     total = 0
-    for i in range(split_at(), len(layers)):
-        total += walk(layers[i])
+    # the far packed weights live on cuda:1 (the device map moved them) and
+    # dequantize launches the ggml ext -- WITHOUT this context the ext runs
+    # under device-0 against device-1 tensors, the silent wrong-context
+    # corruption that later surfaces as a memory fault at the first
+    # post-far ggml call in the warmup
+    with torch.cuda.device(dev1()):
+        for i in range(split_at(), len(layers)):
+            total += walk(layers[i])
     # release the conversion's fp32/bf16 transients back to the driver:
     # the far-side KV budget is measured with mem_get_info right after this
     # (empty_cache frees the CURRENT device's cache -- switch to cuda:1 or
@@ -143,7 +220,11 @@ def _to_device_deep(obj: Any, device: torch.device) -> Any:
     metadata objects use; anything else passes through untouched.
     """
     if torch.is_tensor(obj):
-        return obj.to(device, non_blocking=True) if obj.device != device else obj
+        # blocking direct copy: the metadata tensors are small; the pinned
+        # two-hop is reserved for the big hidden/logit crossings (fresh
+        # pinned buffers per tensor per forward exhausted pinable memory and
+        # surfaced as CUDA OOM at the next warmup alloc)
+        return obj.to(device, non_blocking=False) if obj.device != device else obj
     if isinstance(obj, dict):
         return {k: _to_device_deep(v, device) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -165,6 +246,38 @@ def _to_device_deep(obj: Any, device: torch.device) -> Any:
     return obj
 
 
+_staging: dict = {}
+
+
+def _pin_for(tag, shape, dtype) -> torch.Tensor:
+    """The seam's cached pinned staging buffer for ``tag`` (tag=None ->
+    fresh buffer; cached tags must be long-lived single-purpose buffers --
+    an id()-derived tag can collide across objects and silently deliver the
+    WRONG dtype, e.g. int32 fresh_state_indices into index_fill_)."""
+    if tag is None:
+        return torch.empty(shape, dtype=dtype, pin_memory=True)
+    key = (tag, tuple(shape))
+    pin = _staging.get(key)
+    if pin is None:
+        pin = torch.empty(shape, dtype=dtype, pin_memory=True)
+        _staging[key] = pin
+    return pin
+
+
+def _stage_cross(src: torch.Tensor, dst_dev: torch.device, tag: str) -> torch.Tensor:
+    """Cross a tensor between GPUs through a pinned host buffer.
+
+    DIRECT .to() between the cards -- async OR blocking, with SDMA disabled
+    -- corrupts the far context (probe: kernel sequence passes but the
+    process segfaults at teardown; the server faulted at the first far
+    launch). The pinned two-hop is the pattern the MTP engine ran correctly
+    all day. Buffers are cached per tag+shape (KBs each).
+    """
+    pin = _pin_for(tag, src.shape, src.dtype)
+    pin.copy_(src, non_blocking=False)
+    return pin.to(dst_dev, non_blocking=False)
+
+
 def cross_to_dev1(batch, x: torch.Tensor, residual: torch.Tensor | None):
     """The seam: move the hidden stream and the far side's view of the batch
     metadata to cuda:1. Mutates ``batch`` in place (single forward in flight;
@@ -177,10 +290,19 @@ def cross_to_dev1(batch, x: torch.Tensor, residual: torch.Tensor | None):
     faults / silent garbage. torch ops are unaffected (tensor-device driven).
     """
     d1 = dev1()
-    torch.cuda.set_device(d1)
-    x = x.to(d1, non_blocking=True)
+    # D2H to pinned BEFORE switching devices: the producer (near layers) runs
+    # on the near stream; a blocking D2H issued under the far device would
+    # order against the wrong stream
+    pin_x = _pin_for("x", x.shape, x.dtype)
+    pin_x.copy_(x, non_blocking=False)
+    pin_r = None
     if residual is not None:
-        residual = residual.to(d1, non_blocking=True)
+        pin_r = _pin_for("r", residual.shape, residual.dtype)
+        pin_r.copy_(residual, non_blocking=False)
+    torch.cuda.set_device(d1)
+    x = pin_x.to(d1, non_blocking=False)
+    if pin_r is not None:
+        residual = pin_r.to(d1, non_blocking=False)
     for attr in ("out_loc", "positions", "attn_metadata", "fla_metadata", "input_ids"):
         val = getattr(batch, attr, None)
         if val is not None:
@@ -267,6 +389,10 @@ class SplitLinearStatePool:
     @property
     def num_free_slots(self) -> int:
         return self._lead.num_free_slots
+
+    @property
+    def num_slots(self) -> int:
+        return self._lead.num_slots
 
     def alloc(self, n: int = 1) -> list[int]:
         ids = self._lead.alloc(n)
@@ -451,7 +577,8 @@ def maybe_split_linear_pool(factory, group, num_slots, dtype, device, tp_size):
 
 
 __all__ = [
-    "SplitLinearStatePool", "SplitMHAKVCache", "cross_to_dev1", "dev1",
+    "FarHead", "SplitLinearStatePool", "SplitMHAKVCache", "convert_far_head",
+    "cross_to_dev1", "dev1",
     "layer_device", "maybe_split_kv_pool", "maybe_split_linear_pool",
     "redevice_rotaries", "split_at", "split_enabled", "weight_device_for",
 ]

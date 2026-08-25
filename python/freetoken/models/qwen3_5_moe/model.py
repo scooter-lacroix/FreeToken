@@ -92,6 +92,8 @@ class Qwen3_5Model(BaseOP):
         residual: torch.Tensor | None = None
         from freetoken.engine.layer_split import split_at, split_enabled, cross_to_dev1
 
+        import os as _os
+        _dbg = _os.environ.get("FREETOKEN_LAYER_SPLIT_DEBUG", "0") in {"1", "true", "yes"}
         sa = split_at() if split_enabled() else 0
         if sa:
             # Triton binds kernel modules + launches to the THREAD's current
@@ -107,25 +109,25 @@ class Qwen3_5Model(BaseOP):
             with torch.cuda.device(_dev1()):
                 x, residual = cross_to_dev1(get_global_ctx().batch, x, residual)
                 for i in range(sa, len(layers)):
+                    if _dbg:
+                        print(f"[split-dbg] far layer {i} begin", flush=True)
                     x, residual = layers[i].forward(x, residual)
-                near = get_global_ctx().batch.input_ids.device
-                x = x.to(near, non_blocking=True)
-                if residual is not None:
-                    residual = residual.to(near, non_blocking=True)
-                b = get_global_ctx().batch
-                for attr in ("out_loc", "positions", "attn_metadata", "fla_metadata"):
-                    val = getattr(b, attr, None)
-                    if val is not None:
-                        try:
-                            setattr(b, attr, _to_device_deep(val, near))
-                        except Exception:
-                            pass
-                # drain the far side's queue INSIDE its device context
-                torch.cuda.synchronize()
+                    if _dbg:
+                        torch.cuda.synchronize()
+                        print(f"[split-dbg] far layer {i} done", flush=True)
+                if _dbg:
+                    torch.cuda.synchronize()
+                    print("[split-dbg] far layers complete", flush=True)
+                # trunk norm stays INSIDE the far device context: its Triton
+                # launch under the near device would be a wrong-context launch
+                xn, rn = self.norm.forward_add_residual(x, residual)
+                if _dbg:
+                    torch.cuda.synchronize()
+                    print("[split-dbg] far trunk norm complete", flush=True)
         else:
             for layer in self.layers.op_list:
                 x, residual = layer.forward(x, residual)
-        xn, rn = self.norm.forward_add_residual(x, residual)
+            xn, rn = self.norm.forward_add_residual(x, residual)
         # Pre-final-norm trunk residual for the MTP head (llama.cpp feeds the
         # trunk's final residual to nextn hnorm). ONE stable buffer written by
         # slice: graph capture walks the batch-size list largest -> smallest
@@ -187,10 +189,22 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
     def forward(self) -> torch.Tensor:
         ctx = get_global_ctx()
         output = self.model.forward(ctx.batch.input_ids)
-        if output.device != ctx.batch.input_ids.device:
-            # layer split: logits are produced on cuda:1; the sampler and the
-            # output pipeline live on cuda:0
-            output = output.to(ctx.batch.input_ids.device, non_blocking=True)
+        from freetoken.engine.layer_split import split_enabled
+
+        if split_enabled() and output.device != ctx.batch.input_ids.device:
+            # layer split: the whole trunk tail + head run on cuda:1 (the
+            # hidden NEVER crosses back). Head under the far device context
+            # (Triton), then only the [T, vocab] logits cross (pinned
+            # two-hop; D2H inside the far ctx).
+            from freetoken.engine.layer_split import _pin_for
+
+            with torch.cuda.device(output.device):
+                logits = self.lm_head.forward(output)
+            near = ctx.batch.input_ids.device
+            pin = _pin_for(None, logits.shape, logits.dtype)
+            with torch.cuda.device(logits.device):
+                pin.copy_(logits, non_blocking=False)
+            return pin.to(near, non_blocking=False)
         # Post-norm trunk hidden (MTP diagnostics; lm_head consumes `output`,
         # so it is live every replay). `output` itself is a per-capture-level
         # pool tensor -- publish it through the same stable slice-written

@@ -295,3 +295,38 @@ the near engine stream, far stream waits) or make the crossing blocking.
 (2) near-engine-stream vs far-default-stream race. Next session: add the
 event-ordering at the seam, relaunch, then the full verification battery
 (coherence, 23k prompt, tok/s, TTFT) and the phase commit.
+
+## S2b close-but-not-passed state (2026-08-25, end of session)
+
+The far side now runs its ENTIRE tail on cuda:1 (all far layers + trunk
+norm + a converted Q4_K-only Triton FarHead with the last-indices prefill
+trick; only [T, vocab] logits cross back, pinned two-hop with D2H inside
+the far ctx). With the proven config (split=56, ratio 0.92, fp32 SSM,
+mr=2, no num-pages override, `env -u HSA_OVERRIDE_GFX_VERSION -u
+HSA_TOOLS_LIB -u LD_PRELOAD HSA_ENABLE_SDMA=0`) the server COMPLETES THE
+FULL PREFILL WARMUP on both GPUs and reaches ready-to-serve. The FIRST
+REAL REQUEST then dies: an async far-side fault that masquerades as
+`CUDA error: out of memory` at the next host alloc (impossible OOM: [mem]
+log shows cuda:0 free=2.4-4.2 GiB at the failure point).
+
+Machinery landed this session (uncommitted): far-tail restructure (norm +
+head inside the far device ctx), FarHead (Q4_K requant, kq_gemv, chunked
+conversion, last-indices), head-then-cross logits ordering, fresh-vs-cached
+pinned staging discipline (cached long-lived buffers for x/r/logits;
+metadata crosses via small blocking direct copies — fresh pinned per tensor
+per forward EXHAUSTED pinable memory and surfaced as the same fake-OOM),
+num_slots on the split linear pool, dev0 empty_cache after far-weight
+moves, [mem] logging at warmup.
+
+NEXT SESSION, IN ORDER:
+1. `CUDA_LAUNCH_BLOCKING=1` on the split server (warmup is CPU-bound but
+   tolerable; first request will fault SYNCHRONOUSLY at the exact kernel
+   launch — that names the culprit op directly). One run answers it.
+2. Suspects ranked: the far full-attn layers' store_kv/extend attention
+   with crossed TritonMetadata (only exercised by REAL batches, not the
+   dummy warmup batches — warmup uses the dummy KV slot and dummy pages;
+   a real request hits fresh page indices + the radix insert path);
+   get_last_indices on crossed metadata inside FarHead.
+3. If the far attention is the culprit, the fallback is the far side =
+   last 4-8 GDN/FFN layers only with full-attn layers pinned near (the
+   split point can skip full-attn layers to dev0 by mapping them back).
