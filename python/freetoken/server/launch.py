@@ -59,6 +59,21 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     if args.shell_mode:
         _detach_process_group()
 
+    import os as _os
+
+    if _os.environ.get("FREETOKEN_FAULTHANDLER", "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }:
+        # periodic python-stack dumps for livelock diagnosis (py-spy needs
+        # ptrace the sandbox denies); FREETOKEN_FAULTHANDLER_SECS sets the
+        # interval (default 120)
+        import faulthandler
+
+        faulthandler.dump_traceback_later(
+            int(_os.environ.get("FREETOKEN_FAULTHANDLER_SECS", "120") or 120),
+            repeat=True,
+        )
+
     import torch
     from freetoken.scheduler import Scheduler
 

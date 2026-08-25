@@ -208,3 +208,31 @@ contended run. Next-session opening moves, in order:
    process, llvm target probing both devices).
 NOTE: with HSA_OVERRIDE active the far GPU also returned a wrong sum once
 -- never run the split server with the override set.
+
+## S2b verdict after the power cycle (2026-08-25): pivot to torch-only far side
+
+Post-reboot re-verification, minimal repros, clean box:
+- ggml C++ ext on the 7800 XT: still HANGS (solo). Real, not transient.
+- Triton kernels on cuda:1 with the XTX active: FAULT or HANG broadly --
+  rope faults, conv1d hangs (cache-hit!), trivial kernels fault; the fla
+  chunk was the lone exception. Solo-visible (HIP_VISIBLE_DEVICES=1) every
+  kernel is 0.3s and correct.
+- Pure torch (hipBLAS/SDPA/matmul) on cuda:1 with XTX active: works
+  perfectly, at full speed. The MTP bf16 draft engine ran this way all of
+  2026-08-24.
+- The 30-60 min "warmup livelocks" pre-reboot were STALE TORCH-EXTENSION
+  BATONS (faulthandler stack: _warmup_prefill -> ggml_dequantize ->
+  file_baton.wait) -- rm -rf ~/.cache/torch_extensions/<py-tag> clears.
+
+CONCLUSION: on this ROCm stack (7800 XT = gfx1101 as second device),
+heterogeneous Triton is not viable. The layer split lives ONLY if the far
+side is torch-only:
+- FarSideLinear (bf16 x @ Wt) already proven on GPU1.
+- Far GDN layers: torch causal-conv (F.conv1d groups=dim, trivial) + the
+  reference chunked delta-rule (gdn_reference.py) -- decode is a handful of
+  einsums (fine for 6 layers), prefill ~50-200ms/layer/2048-chunk.
+- Far full-attn layers: torch SDPA + explicit KV gather on GPU1's sub-pool.
+Tooling landed: tools/mtp/far_seed.py (solo-GPU1 Triton cache seeder; conv1d
+kernel specializes num_cache_lines = state-pool slots 13 -- seeder must
+match), FREETOKEN_FAULTHANDLER=1 (+_SECS) periodic stack dumps in the
+scheduler (py-spy is ptrace-blocked in the sandbox).
