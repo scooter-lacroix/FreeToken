@@ -93,29 +93,38 @@ class Qwen3_5Model(BaseOP):
         from freetoken.engine.layer_split import split_at, split_enabled, cross_to_dev1
 
         sa = split_at() if split_enabled() else 0
-        for i, layer in enumerate(self.layers.op_list):
-            if sa and i == sa:
-                # layer-split seam: hidden stream + far-side batch metadata
-                # cross to cuda:1 once per forward (eager path)
-                x, residual = cross_to_dev1(get_global_ctx().batch, x, residual)
-            x, residual = layer.forward(x, residual)
         if sa:
-            # cross back for the final norm + lm_head on the near side (the
-            # crossing carries [T, H] hidden, not [T, vocab] logits)
-            d0 = x.device  # near side = the embedding's device
-            near = get_global_ctx().batch.input_ids.device
-            x = x.to(near, non_blocking=True)
-            residual = residual.to(near, non_blocking=True)
-            from freetoken.engine.layer_split import _to_device_deep
+            # Triton binds kernel modules + launches to the THREAD's current
+            # device (never inferred from tensor args). NEAR layers run under
+            # the ambient (cuda:0) context; the FAR block runs inside an
+            # explicit cuda:1 context so no interior call can reset it, then
+            # restores cuda:0 for the final norm + lm_head.
+            from freetoken.engine.layer_split import dev1 as _dev1, _to_device_deep
 
-            b = get_global_ctx().batch
-            for attr in ("out_loc", "positions", "attn_metadata", "fla_metadata"):
-                val = getattr(b, attr, None)
-                if val is not None:
-                    try:
-                        setattr(b, attr, _to_device_deep(val, near))
-                    except Exception:
-                        pass
+            layers = self.layers.op_list
+            for i in range(sa):
+                x, residual = layers[i].forward(x, residual)
+            with torch.cuda.device(_dev1()):
+                x, residual = cross_to_dev1(get_global_ctx().batch, x, residual)
+                for i in range(sa, len(layers)):
+                    x, residual = layers[i].forward(x, residual)
+                near = get_global_ctx().batch.input_ids.device
+                x = x.to(near, non_blocking=True)
+                if residual is not None:
+                    residual = residual.to(near, non_blocking=True)
+                b = get_global_ctx().batch
+                for attr in ("out_loc", "positions", "attn_metadata", "fla_metadata"):
+                    val = getattr(b, attr, None)
+                    if val is not None:
+                        try:
+                            setattr(b, attr, _to_device_deep(val, near))
+                        except Exception:
+                            pass
+                # drain the far side's queue INSIDE its device context
+                torch.cuda.synchronize()
+        else:
+            for layer in self.layers.op_list:
+                x, residual = layer.forward(x, residual)
         xn, rn = self.norm.forward_add_residual(x, residual)
         # Pre-final-norm trunk residual for the MTP head (llama.cpp feeds the
         # trunk's final residual to nextn hnorm). ONE stable buffer written by

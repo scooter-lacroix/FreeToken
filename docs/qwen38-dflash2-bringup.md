@@ -236,3 +236,37 @@ Tooling landed: tools/mtp/far_seed.py (solo-GPU1 Triton cache seeder; conv1d
 kernel specializes num_cache_lines = state-pool slots 13 -- seeder must
 match), FREETOKEN_FAULTHANDLER=1 (+_SECS) periodic stack dumps in the
 scheduler (py-spy is ptrace-blocked in the sandbox).
+
+## S2b: THE REAL ROOT CAUSE (2026-08-25, user-directed deep research — supersedes 4a20e67's 'torch-only far side' verdict)
+
+**Triton runs fine on the 7800 XT with the XTX active.** The user was right
+that a flag/architecture-level fix existed. Deep research trail: the
+transformers finegrained_fp8.py docstring describes the exact mechanism
+class ("CUfunction handle binds to the CUDA context live at load time;
+driving that cached handle from another device launches it against the
+wrong context"); inspecting the installed triton/backends/amd/driver.c
+`loadBinary` shows the `device` argument is parsed and IGNORED (no
+hipSetDevice before hipModuleLoadDataEx), and jit.py's `run()` launches on
+the THREAD-CURRENT device's stream, never inferring device from tensor
+args. So every far-side Triton launch executed a device-0-bound function
+on device-1 pointers -> faults / hangs / silent sum=0.0. THAT was the
+"Triton can't run on the second GPU" mystery, not the hardware.
+
+**Fix**: `torch.cuda.set_device(1)` / `with torch.cuda.device(1)` around
+far-side Triton launches. PROVEN (dual-visible, dev0 warmed first):
+trivial kernel 0.6s correct; full far-side battery (fla chunk T=80..2048,
+fla decode bs=1-4, causal conv1d, rope, extend paged attention, kq_gemv)
+ALL pass, 0.02-0.6s each. Also proven: dev0-then-dev1 kernel sequences and
+engine-stream(near)+default-stream(far) sequences pass.
+
+In-server integration state (fable39): seam machinery is correct (near
+layers OUTSIDE the device ctx, far block inside, cross-back + far-queue
+drain inside the ctx — an earlier iteration wrongly wrapped the near
+layers too and faulted the ggml ext with 'invalid resource handle').
+Remaining: the server still HANGS in `causal_conv1d_varlen`
+(causal_conv1d_triton.py:457 <- gdn.py:_conv_prefill) on the far side
+during _warmup_prefill — GPU-side hang (CPU 1.2%), all miniature repros
+pass. Next iteration: print the far conv1d launch args (shapes/strides of
+the _RoutingLayerTensor conv_states view + x layout) at the hang site, or
+bisect FREETOKEN_LAYER_SPLIT=63 (2 far layers) to shrink it. Everything
+else (weights converted, pools split, seam executed) already works.

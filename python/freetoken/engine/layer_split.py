@@ -168,8 +168,16 @@ def _to_device_deep(obj: Any, device: torch.device) -> Any:
 def cross_to_dev1(batch, x: torch.Tensor, residual: torch.Tensor | None):
     """The seam: move the hidden stream and the far side's view of the batch
     metadata to cuda:1. Mutates ``batch`` in place (single forward in flight;
-    the next batch rebuilds its metadata)."""
+    the next batch rebuilds its metadata).
+
+    MUST set the thread's current device: Triton's launcher binds kernel
+    modules and launches on the CURRENT device's stream (it does not infer
+    the device from tensor args), so far-side launches under a device-0
+    context execute device-0 streams against device-1 pointers -> memory
+    faults / silent garbage. torch ops are unaffected (tensor-device driven).
+    """
     d1 = dev1()
+    torch.cuda.set_device(d1)
     x = x.to(d1, non_blocking=True)
     if residual is not None:
         residual = residual.to(d1, non_blocking=True)
