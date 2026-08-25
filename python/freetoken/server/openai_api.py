@@ -55,6 +55,17 @@ def _thinking_type(req: Any) -> str | None:
 
 
 
+def _default_reasoning_effort() -> str | None:
+    """Server-wide default for requests that don't ask for an effort
+    (FREETOKEN_DEFAULT_REASONING_EFFORT). Heavy reasoners burn an entire
+    agent harness's max_tokens budget on thinking before any content --
+    "none"/"minimal"/"low" makes them answer directly; per-request
+    reasoning_effort and explicit chat_template_kwargs still win."""
+    import os
+
+    return os.environ.get("FREETOKEN_DEFAULT_REASONING_EFFORT", "").strip().lower() or None
+
+
 def chat_request_to_genspec(
     req: ChatCompletionRequest,
     model_sampling: dict[str, Any],
@@ -64,8 +75,9 @@ def chat_request_to_genspec(
 
     ctk = req.chat_template_kwargs
     thinking_type = _thinking_type(req)
-    if req.reasoning_effort or thinking_type:
-        ctk = effort_toggle_kwargs(req.reasoning_effort, ctk, thinking_type=thinking_type)
+    effort = req.reasoning_effort or _default_reasoning_effort()
+    if effort or thinking_type:
+        ctk = effort_toggle_kwargs(effort, ctk, thinking_type=thinking_type)
     return GenSpec(
         messages=render_messages([m.model_dump(exclude_none=True) for m in req.messages]),
         sampling_params=resolve_sampling(

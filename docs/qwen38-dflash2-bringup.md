@@ -127,3 +127,28 @@ engine's private-stream + pinned-staging exchange pattern applies verbatim.
 - **Known anomaly for next pass**: FIRST request after startup pays ~160 s
   (prefill of ~26 tokens; suspect per-shape kernel JIT/compile in the
   extend path — warm prefill is 0.5 s).
+
+## Harness-usability fixes (2026-08-25, for maestro-terminal et al.)
+
+Symptom: agent harness saw "recognized and processes but no output". Three
+stacked causes, all fixed:
+
+1. **Reasoning budget**: Fable thinks at length before any `content`; a
+   harness with a modest max_tokens gets an all-reasoning response.
+   `FREETOKEN_DEFAULT_REASONING_EFFORT` (e.g. `none`) now sets a server-wide
+   default; per-request `reasoning_effort` and explicit
+   `chat_template_kwargs` still win.
+2. **Sampler Triton cliff**: torch 2.13's multinomial compiles ~190 kernels
+   per shape on first use -- measured 74-207 s stalls on the first sampled
+   request (attribution: fresh TRITON_CACHE_DIR, kernel names
+   `_draw_*`/`_count_hist`/`_refine_mass`). `_warmup_sampler()` now
+   pre-compiles all top-k/top-p variants at startup (FREETOKEN_WARM_SAMPLER=0
+   to skip).
+3. **Prefill warmup ladder** [80..1024] + `torch.cuda.empty_cache()` after
+   the sampler warmup: on a nearly-full GPU the retained warmup cache
+   starved the tokenizer worker's lazy CUDA context and requests hung
+   indefinitely (0.68 vs 0.84 GiB free was the difference).
+
+Measured after fixes (warm triton disk cache): FIRST short request 0.8 s,
+sampled mid-length 7.3 s, tools+system 3.9 s. On a fresh triton cache the
+compiles move to startup (~1-2 + ~10 min one-time).

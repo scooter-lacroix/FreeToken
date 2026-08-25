@@ -387,6 +387,7 @@ class Engine:
 
         # ======================= Sampler initialization ========================
         self.sampler = Sampler(self.device, config.model_config.vocab_size)
+        self._warmup_sampler()
         # MTP acceptance probe (FREETOKEN_MTP=1 FREETOKEN_MTP_PROBE=1): runs the
         # loaded draft head eagerly beside decode and reports k=1 acceptance.
         self.mtp_probe = None
@@ -461,6 +462,49 @@ class Engine:
             tp_cpu_group = torch.distributed.new_group(backend="gloo")
             assert tp_cpu_group is not None
         return tp_cpu_group
+
+    def _warmup_sampler(self) -> None:
+        """Pre-compile the non-greedy sampling paths.
+
+        torch 2.13's multinomial is Triton-backed and compiles ~190 kernel
+        variants on first use per shape -- measured as a 74-200 s stall on
+        the FIRST sampled request mid-serving (the decode-graph capture only
+        exercises greedy argmax). Pay that at startup instead, once per
+        batch width and once per top-k/top-p variant. Disable with
+        FREETOKEN_WARM_SAMPLER=0.
+        """
+        import time
+
+        if os.environ.get("FREETOKEN_WARM_SAMPLER", "1").strip().lower() in {
+            "0", "false", "no", "off"
+        }:
+            return
+        from .sample import sample_impl
+
+        vocab = self.sampler.vocab_size
+        t0 = time.time()
+        try:
+            for bs in (1, 2, 4):
+                logits = torch.zeros(bs, vocab, device=self.device)
+                temps = torch.full((bs,), 1.0, device=self.device)
+                ks = torch.full((bs,), 20, dtype=torch.int32, device=self.device)
+                ps = torch.full((bs,), 0.95, device=self.device)
+                sample_impl(logits, temps, None, None)
+                sample_impl(logits, temps, ks, None)
+                sample_impl(logits, temps, None, ps)
+                sample_impl(logits, temps, ks, ps)
+            torch.cuda.synchronize(self.device)
+        except Exception:
+            logger.warning_rank0("sampler warmup failed; first sampled request may stall",
+                                 exc_info=True)
+            return
+        finally:
+            # release the warmup buffers: on a nearly-full GPU the retained
+            # cache can starve the tokenizer worker's lazy CUDA context
+            torch.cuda.empty_cache()
+        logger.info_rank0(
+            f"Sampler warmup complete in {time.time() - t0:.1f} s"
+        )
 
     def _load_weight_state_dict(self, config: EngineConfig) -> Dict[str, torch.Tensor]:
         model_state = self.model.state_dict()
@@ -948,10 +992,23 @@ class Engine:
         if self.max_seq_len < 2:
             return
 
-        warmup_lens = [min(80, self.max_seq_len)]
-        if self.max_seq_len >= 128:
-            warmup_lens.append(128)
-        warmup_lens = sorted({length for length in warmup_lens if length >= 2})
+        # Geometric ladder: Triton/fla prefill kernels compile per shape
+        # bucket, and the first REAL request at an unwarmed length paid
+        # ~150 s of compilation mid-serving (measured, Qwen3.8-27B: 313-token
+        # prefill after a [80, 128]-only warmup). Cover the buckets up to the
+        # extend cap at startup instead. FREETOKEN_PREFILL_WARMUP_LENS
+        # overrides (comma-separated).
+        import os as _os
+
+        _env = _os.environ.get("FREETOKEN_PREFILL_WARMUP_LENS", "").strip()
+        if _env:
+            warmup_lens = [int(x) for x in _env.split(",") if x.strip()]
+        else:
+            cap = min(self.max_seq_len, self.config.max_extend_tokens)
+            warmup_lens = [n for n in (80, 128, 256, 512, 1024, 2048) if n <= cap]
+            if not warmup_lens:
+                warmup_lens = [min(80, self.max_seq_len)]
+        warmup_lens = sorted({length for length in warmup_lens if 2 <= length <= self.max_seq_len})
         if not warmup_lens:
             return
 
