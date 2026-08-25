@@ -102,3 +102,28 @@ engine's private-stream + pinned-staging exchange pattern applies verbatim.
    GDN-state snapshot/restore, greedy longest-prefix accept + bonus token.
 5. Sweep k, measure tok/s + acceptance; compare against the video's
    3.43×/2.67× reference points.
+
+## S1/S2a results (2026-08-24, measured)
+
+- **S1 adapter + serving both landed.** Strict-load clean; then two bring-up
+  fixes: (1) `_TOKENIZER_ARCH["qwen35"] = "qwen2"`; (2) the loader's
+  `include_moe_experts` flag is the resident-path default True for dense
+  models too (my assert was wrong, not the engine).
+- **v-head regroup is r-generalized**: the converter's reorder is
+  grouped-by-K -> tiled (`_LinearAttentionVReorderBase`). For Ornith
+  (nv=32, nk=16, r=2) tiled == [evens|odds], which the qwen35moe loader
+  hardcodes; **Fable has r=3 (48v/16k)** where that pair split garbles the
+  GDN v-heads -> degenerate "covering Paris, covering Paris..." output.
+  Correct inverse: `src = (j % r)*nk + j//r` (now `_v_src_index` in
+  qwen35_dense/gguf.py). Symptom-to-cause signature for future ports.
+- **Single-GPU baseline (user-confirmed LM Studio parity)**: Q6_K weights
+  22.9 GiB on the XTX with 0.89 GiB spare at 4k ctx (flags:
+  `--max-seq-len-override 4096 --memory-ratio 0.96 --max-extend-length 1024
+  --max-prefill-length 1024 --kv-reserve-tokens 2048 --max-running-requests 2`;
+  bf16 KV — q8 KV remains a gap).
+- **Empiricals**: decode 28.2 tok/s (early ctx) -> 26.3 @ 2.5k; warm TTFT
+  0.50 s; coherent reasoning AND content (enable_thinking=false path
+  verified); graphs captured bs [1,2].
+- **Known anomaly for next pass**: FIRST request after startup pays ~160 s
+  (prefill of ~26 tokens; suspect per-shape kernel JIT/compile in the
+  extend path — warm prefill is 0.5 s).

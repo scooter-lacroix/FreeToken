@@ -46,15 +46,46 @@ if TYPE_CHECKING:
 from freetoken.models.qwen3_5_moe.gguf import (
     _gguf_dense_quant_flag,
     _norm_plus_one,
-    _reinterleave_vheads_cols,
-    _reinterleave_vheads_rows,
     _to_bf16,
-    _vhead_perm_tensor,
 )
 
 
 def _qt_scalar(qt: int):
     return torch.tensor(qt, dtype=torch.int32)
+
+
+def _v_src_index(nv: int, nk: int) -> list[int]:
+    """Inverse of the converter's grouped->tiled v-head reorder
+    (_LinearAttentionVReorderBase): HF head j (group g=j//r, sub s=j%r,
+    r = nv//nk) lives at GGUF position s*nk + g. For r==2 this reduces to
+    the [even | odd] split the qwen35moe loader hardcodes; Qwen3.8-27B has
+    r==3 (48 v-heads over 16 k-heads), where that pair split is WRONG."""
+    r = nv // nk
+    return [(j % r) * nk + j // r for j in range(nv)]
+
+
+def _v_perm(nv: int, nk: int) -> torch.Tensor:
+    return torch.tensor(_v_src_index(nv, nk))
+
+
+def _regroup_v_rows(t: torch.Tensor, nv: int, nk: int, vd: int, v_offset: int = 0):
+    """Regroup v-head ROW blocks from the GGUF's tiled order to plain HF
+    order. Row permutations, so they apply identically to packed bytes."""
+    idx = _v_perm(nv, nk)
+    total_v = nv * vd
+    assert (t.shape[0] - v_offset) == total_v, (t.shape, v_offset, total_v)
+    v = t[v_offset:].reshape(nv, vd, *t.shape[1:])
+    gathered = v[idx]
+    if v_offset:
+        return torch.cat([t[:v_offset], gathered.reshape(total_v, *t.shape[1:])], dim=0)
+    return gathered.reshape(total_v, *t.shape[1:])
+
+
+def _regroup_v_cols(t: torch.Tensor, nv: int, nk: int, vd: int):
+    """Column (input-side) variant for out_proj."""
+    idx = _v_perm(nv, nk)
+    c = t.reshape(t.shape[0], nv, vd)
+    return c[:, idx].reshape(t.shape)
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
@@ -154,7 +185,8 @@ def iter_gguf_weights(
     from freetoken.models.gguf.reader import iter_gguf_tensors
     from freetoken.utils import cached_load_hf_config
 
-    assert not include_moe_experts, "dense qwen35 has no routed experts"
+    # include_moe_experts is True on the resident path; a dense model simply
+    # has no expert tensors to yield either way.
     assert include_non_moe
 
     config = parse_gguf_config(cached_load_hf_config(model_path))
@@ -163,7 +195,8 @@ def iter_gguf_weights(
     linear_ids = set(config.linear_attention_group().layer_ids)
     lg = config.linear_attention_group()
     nv, vd = lg.num_value_heads, lg.value_head_dim
-    k_dim = lg.num_key_heads * lg.key_head_dim
+    nk = lg.num_key_heads
+    k_dim = nk * lg.key_head_dim
 
     # Fusion buffers: parts arrive in tensor-table order; flush when complete.
     qkv_buf: dict[int, dict[str, tuple]] = {}
@@ -264,23 +297,23 @@ def iter_gguf_weights(
             # (row permutations apply identically to packed bytes).
             if suffix == "attn_qkv.weight":
                 if dense_q:
-                    w = _reinterleave_vheads_rows(t.packed(), nv, vd, v_offset=2 * k_dim)
+                    w = _regroup_v_rows(t.packed(), nv, nk, vd, v_offset=2 * k_dim)
                 else:
-                    w = _reinterleave_vheads_rows(_to_bf16(t), nv, vd, v_offset=2 * k_dim)
+                    w = _regroup_v_rows(_to_bf16(t), nv, nk, vd, v_offset=2 * k_dim)
                 in_proj_buf.setdefault(layer, {})["qkv"] = (w, t.ggml_type)
             elif suffix == "attn_gate.weight":
                 if dense_q:
-                    w = _reinterleave_vheads_rows(t.packed(), nv, vd)
+                    w = _regroup_v_rows(t.packed(), nv, nk, vd)
                 else:
-                    w = _reinterleave_vheads_rows(_to_bf16(t), nv, vd)
+                    w = _regroup_v_rows(_to_bf16(t), nv, nk, vd)
                 in_proj_buf.setdefault(layer, {})["z"] = (w, t.ggml_type)
             elif suffix == "ssm_beta.weight":
-                perm = _vhead_perm_tensor(nv)
+                perm = _v_perm(nv, nk)
                 in_proj_buf.setdefault(layer, {})["b"] = (
                     (t.packed()[perm], t.ggml_type) if dense_q else _to_bf16(t)[perm]
                 )
             elif suffix == "ssm_alpha.weight":
-                perm = _vhead_perm_tensor(nv)
+                perm = _v_perm(nv, nk)
                 in_proj_buf.setdefault(layer, {})["a"] = (
                     (t.packed()[perm], t.ggml_type) if dense_q else _to_bf16(t)[perm]
                 )
@@ -288,14 +321,14 @@ def iter_gguf_weights(
                 # llama.cpp stores A pre-negated (-exp(A_log)); FreeToken
                 # keeps A_log and negates at use.
                 a_neg = t.packed().view(torch.float32).reshape(-1)
-                a_neg = a_neg[_vhead_perm_tensor(nv)]
+                a_neg = a_neg[_v_perm(nv, nk)]
                 yield f"{p}.linear_attn.A_log", torch.log(a_neg.clamp(max=-1e-8).neg())
             elif suffix == "ssm_dt.bias":
-                db = t.packed().view(torch.float32).reshape(-1)[_vhead_perm_tensor(nv)]
+                db = t.packed().view(torch.float32).reshape(-1)[_v_perm(nv, nk)]
                 yield f"{p}.linear_attn.dt_bias", db
             elif suffix == "ssm_conv1d.weight":
                 w = _to_bf16(t)
-                w = _reinterleave_vheads_rows(w, nv, vd, v_offset=2 * k_dim)
+                w = _regroup_v_rows(w, nv, nk, vd, v_offset=2 * k_dim)
                 yield f"{p}.linear_attn.conv1d.weight", w.reshape(w.shape[0], 1, -1)
             elif suffix == "ssm_norm.weight":
                 yield f"{p}.linear_attn.norm.weight", _to_bf16(t)
@@ -306,7 +339,7 @@ def iter_gguf_weights(
                     # same recipe as the qwen35moe GDN out_proj.
                     from freetoken.models.gguf.dequant import requantize_q4_k
 
-                    w = _reinterleave_vheads_cols(_to_bf16(t), nv, vd)
+                    w = _regroup_v_cols(_to_bf16(t), nv, nk, vd)
                     rows_n = w.shape[0]
                     pk = (
                         requantize_q4_k(w.reshape(-1).float())
@@ -317,7 +350,7 @@ def iter_gguf_weights(
                     yield f"{p}.linear_attn.out_proj.quant_type", _qt_scalar(12)
                 else:
                     w = _to_bf16(t)
-                    yield f"{p}.linear_attn.out_proj.weight", _reinterleave_vheads_cols(w, nv, vd)
+                    yield f"{p}.linear_attn.out_proj.weight", _regroup_v_cols(w, nv, nk, vd)
             elif suffix == "ffn_gate.weight":
                 ffn_buf.setdefault(layer, {})["gate"] = (
                     (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
