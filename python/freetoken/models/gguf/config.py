@@ -19,6 +19,8 @@ from .reader import gguf_architecture, load_gguf_metadata, gguf_tensor_names
 GGUF_ARCH_TO_REGISTRY: dict[str, str] = {
     "gemma4": "Gemma4GGUFForCausalLM",
     "qwen35moe": "Qwen35MoeGGUFForCausalLM",
+    # dense Qwen3.8-27B class (hybrid GDN + every-4th full attention)
+    "qwen35": "Qwen35DenseGGUFForCausalLM",
 }
 
 

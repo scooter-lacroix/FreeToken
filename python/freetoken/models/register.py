@@ -114,6 +114,14 @@ _MODEL_REGISTRY: dict[str, ModelSpec] = {
         parse_config="parse_gguf_config",
         iter_weights="iter_gguf_weights",
     ),
+    # GGUF (native k-quant) dense qwen35 (Qwen3.8-27B class): same model
+    # classes (the decoder layer branches to the dense MLP when moe is off).
+    "Qwen35DenseGGUFForCausalLM": ModelSpec(
+        "freetoken.models.qwen35_dense",
+        "Qwen3_5MoEForCausalLM",
+        parse_config="parse_gguf_config",
+        iter_weights="iter_gguf_weights",
+    ),
     "GptOssForCausalLM": ModelSpec(
         "freetoken.models.gpt_oss",
         "GptOssForCausalLM",
