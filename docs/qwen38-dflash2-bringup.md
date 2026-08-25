@@ -270,3 +270,28 @@ pass. Next iteration: print the far conv1d launch args (shapes/strides of
 the _RoutingLayerTensor conv_states view + x layout) at the hang site, or
 bisect FREETOKEN_LAYER_SPLIT=63 (2 far layers) to shrink it. Everything
 else (weights converted, pools split, seam executed) already works.
+
+## S2b state at handoff (2026-08-25 late): every component PROVEN, one server-side delta left
+
+Clean-env recipe (PROVEN, dual-visible, dev0 warmed, engine stream current,
+ggml ext loaded): `env -u HSA_OVERRIDE_GFX_VERSION -u HSA_TOOLS_LIB -u
+LD_PRELOAD HSA_ENABLE_SDMA=0` + device-ctx far block. Under this recipe the
+FULL server pattern passes in a probe: near ggml work on the engine stream,
+far fla chunk, far gemma_rmsnorm fresh-compiled (never seeded) — correct
+results, sub-second. HSA_OVERRIDE unset is load-bearing: with it, both GPUs
+report gfx1100 and triton.compile's GLOBAL cache returns the dev0-bound
+CompiledKernel object for dev1 (same target key) -> wrong-context launch.
+Without it, gfx1100 vs gfx1101 = distinct targets = per-device kernels.
+HSA_TOOLS_LIB unset: with it, the first far launch segfaulted inside the
+rocprofiler-wrapped hipModuleLaunchKernel dispatch.
+
+Server (fable41) with this exact env STILL segfaulted at the first far
+Triton launch after the seam. Remaining deltas vs the passing probe (in
+likelihood order): (1) the SEAM CROSSING itself — x/residual cross-device
+.to(non_blocking=True) enqueued after switching current device to 1 with
+SDMA disabled (peer copy staged through host); the probe never crosses, it
+allocates directly on dev1. Fix: event-order the crossing (record event on
+the near engine stream, far stream waits) or make the crossing blocking.
+(2) near-engine-stream vs far-default-stream race. Next session: add the
+event-ordering at the seam, relaunch, then the full verification battery
+(coherence, 23k prompt, tok/s, TTFT) and the phase commit.
