@@ -90,8 +90,32 @@ class Qwen3_5Model(BaseOP):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
         residual: torch.Tensor | None = None
-        for layer in self.layers.op_list:
+        from freetoken.engine.layer_split import split_at, split_enabled, cross_to_dev1
+
+        sa = split_at() if split_enabled() else 0
+        for i, layer in enumerate(self.layers.op_list):
+            if sa and i == sa:
+                # layer-split seam: hidden stream + far-side batch metadata
+                # cross to cuda:1 once per forward (eager path)
+                x, residual = cross_to_dev1(get_global_ctx().batch, x, residual)
             x, residual = layer.forward(x, residual)
+        if sa:
+            # cross back for the final norm + lm_head on the near side (the
+            # crossing carries [T, H] hidden, not [T, vocab] logits)
+            d0 = x.device  # near side = the embedding's device
+            near = get_global_ctx().batch.input_ids.device
+            x = x.to(near, non_blocking=True)
+            residual = residual.to(near, non_blocking=True)
+            from freetoken.engine.layer_split import _to_device_deep
+
+            b = get_global_ctx().batch
+            for attr in ("out_loc", "positions", "attn_metadata", "fla_metadata"):
+                val = getattr(b, attr, None)
+                if val is not None:
+                    try:
+                        setattr(b, attr, _to_device_deep(val, near))
+                    except Exception:
+                        pass
         xn, rn = self.norm.forward_add_residual(x, residual)
         # Pre-final-norm trunk residual for the MTP head (llama.cpp feeds the
         # trunk's final residual to nextn hnorm). ONE stable buffer written by
@@ -154,6 +178,10 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
     def forward(self) -> torch.Tensor:
         ctx = get_global_ctx()
         output = self.model.forward(ctx.batch.input_ids)
+        if output.device != ctx.batch.input_ids.device:
+            # layer split: logits are produced on cuda:1; the sampler and the
+            # output pipeline live on cuda:0
+            output = output.to(ctx.batch.input_ids.device, non_blocking=True)
         # Post-norm trunk hidden (MTP diagnostics; lm_head consumes `output`,
         # so it is live every replay). `output` itself is a per-capture-level
         # pool tensor -- publish it through the same stable slice-written

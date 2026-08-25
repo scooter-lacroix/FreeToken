@@ -168,3 +168,43 @@ compiles move to startup (~1-2 + ~10 min one-time).
   layers/chunks). A 23k prompt would take ~4 min even with capacity. Fix
   direction: chunked prefill runs at a FIXED chunk size (constant shapes)
   -> prefill chunks are graph-capturable; schedule with S2b.
+
+## S2b layer split -- machinery landed, one environmental blocker (2026-08-25)
+
+Landed (engine/layer_split.py + hooks, uncommitted-to-committed WIP):
+- Routing pools: SplitMHAKVCache / SplitLinearStatePool keep global layer
+  ids; page/slot ids identical on both sides; store_kv moves out_loc to the
+  owning device. Far-side KV budget cap with draft reserve
+  (FREETOKEN_LAYER_SPLIT_FAR_RESERVE_GB).
+- Seam crossing: (x, residual) + batch metadata (out_loc/positions/
+  attn+fla metadata, recursively) cross to cuda:1 at layer FREETOKEN_LAYER_SPLIT;
+  hidden crosses BACK before the final norm + lm_head (KBs, not MBs of logits;
+  the k-quant head keeps its working ggml GEMV on cuda:0).
+- FarSideLinear: the vendored ggml kernels HANG on the 7800 XT even with a
+  dual-arch fatbin (reproduced standalone, single GPU). Far-side projections
+  convert at load to Q4_K (Triton kq_gemv decode) + bf16-transposed (prefill
+  GEMM); 48-72 projections depending on split point. empty_cache is
+  device-scoped (the plain call frees cuda:0's cache only -- cost a full
+  debug cycle).
+- The inter-GPU flags the user recalled are real and inherited from the
+  stack env: HSA_ENABLE_SDMA=0 (SDMA off; crossing copies stage via CPU --
+  why pinned crossings worked), HSA_OVERRIDE_GFX_VERSION=11.0.0 (7800 XT
+  presents as gfx1100; needed for RCCL, UNUSED by this TP=1 server),
+  RCCL/NCCL_P2P_DISABLE=1.
+
+**THE BLOCKER**: Triton JIT for a kernel first invoked on cuda:1 with BOTH
+GPUs visible is pathologically slow -- a trivial kernel churns 200s+ at
+~200% CPU (compile subprocess), which is what "hung" the warmup (the server
+spun at 99.8% CPU for an hour in Prefill-warmup). With the 7800 XT as the
+SOLE visible device the same kernel compiles in 0.3 s and runs CORRECTLY.
+Under HSA_OVERRIDE it also returned a WRONG result (sum=0.0) in a
+contended run. Next-session opening moves, in order:
+1. If the dual-visible compile eventually completes correctly (900 s test
+   queued in /tmp/tri_dual.log), the fix is a Triton cache pre-warm: run
+   the far-side kernel set once with HIP_VISIBLE_DEVICES=1 (cache keys are
+   arch-based, not device-index-based) so the dual-visible server hits
+   disk cache and never compiles on device 1.
+2. Else root-cause Triton's second-device compile (TRITON_CACHE_DIR per
+   process, llvm target probing both devices).
+NOTE: with HSA_OVERRIDE active the far GPU also returned a wrong sum once
+-- never run the split server with the override set.

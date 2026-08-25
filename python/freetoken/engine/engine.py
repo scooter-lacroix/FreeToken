@@ -321,6 +321,15 @@ class Engine:
         with torch.device("meta"), torch_dtype(config.dtype):
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
+        from freetoken.engine.layer_split import (
+            convert_far_linears, split_enabled, redevice_rotaries,
+        )
+
+        if split_enabled():
+            redevice_rotaries(self.model)
+            n = convert_far_linears(self.model)
+            logger.info_rank0(f"layer split: converted {n} far-side projections "
+                              "(Q4_K Triton decode + bf16 prefill)")
         post_weights_free = self._sync_get_memory()[0]
         self._weights_bytes = self._baseline_free - post_weights_free
         # Pool-budget baseline for the desktop cache sliders: free VRAM after the weights are
@@ -343,22 +352,53 @@ class Engine:
         available_memory = _startup_kv_budget(config.memory_ratio, init_free_memory, new_free)
         available_memory -= state_pool_bytes(config)
         self.num_pages = self._pool_cls.solve_num_pages(config, available_memory)
+        from freetoken.engine.layer_split import split_at as _lsa, split_enabled as _lsen, dev1 as _dev1
+
+        if _lsen():
+            # The budget solve is near-side and all-layer; with the split,
+            # each side stores only ITS layers' KV for the same page count.
+            # Cap pages by the far side's real budget (weights already there;
+            # leave room for the draft engine + activation buffers).
+            sa = _lsa()
+            n_full_far = sum(
+                1 for spec in config.model_config.kv_cache_group_specs()
+                for i in spec.layer_ids if i >= sa
+            )
+            free_far, _total = torch.cuda.mem_get_info(_dev1())
+            reserve = float(os.environ.get("FREETOKEN_LAYER_SPLIT_FAR_RESERVE_GB", "3.4")) * 2**30
+            per_token_far = 2 * config.model_config.num_kv_heads * config.model_config.head_dim \
+                * config.dtype.itemsize * max(n_full_far, 1)
+            cap = int(max((free_far - reserve) // per_token_far, 2048))
+            if self.num_pages > cap:
+                logger.info_rank0(
+                    f"layer split: far-side budget caps KV pages {self.num_pages} -> {cap} "
+                    f"({n_full_far} far full-attn layers, {mem_GB(free_far)} free on cuda:1)"
+                )
+                self.num_pages = cap
         num_tokens = self.num_pages * config.page_size
-        self.ctx.kv_cache = self.kv_cache = create_kv_pool(
-            config, self.num_pages, device=self.device, dtype=self.dtype
+        from freetoken.engine.layer_split import maybe_split_kv_pool
+
+        self.ctx.kv_cache = self.kv_cache = maybe_split_kv_pool(
+            lambda: create_kv_pool(config, self.num_pages, device=self.device, dtype=self.dtype),
+            config.model_config, self.num_pages, config.page_size, self.dtype, self.device,
         )
 
         # ======================= Linear (GatedDeltaNet) state initialization ========================
         linear_group = config.model_config.linear_attention_group()
         if linear_group is not None:
             from freetoken.kvcache.linear_state_pool import LinearStatePool
+            from freetoken.engine.layer_split import maybe_split_linear_pool
 
-            self.linear_state_pool = LinearStatePool(
-                group=linear_group,
-                num_slots=_linear_pool_num_slots(config),
-                dtype=self.dtype,
-                device=self.device,
-                tp_size=config.tp_info.size,
+            self.linear_state_pool = maybe_split_linear_pool(
+                lambda g=None: LinearStatePool(
+                    group=g or linear_group,
+                    num_slots=_linear_pool_num_slots(config),
+                    dtype=self.dtype,
+                    device=self.device,
+                    tp_size=config.tp_info.size,
+                ),
+                linear_group, _linear_pool_num_slots(config), self.dtype,
+                self.device, config.tp_info.size,
             )
             self.ctx.linear_state_pool = self.linear_state_pool
         else:
@@ -513,7 +553,7 @@ class Engine:
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
-        return _materialize_loaded_weight_state_dict(
+        state = _materialize_loaded_weight_state_dict(
             model_state,
             load_weight(
                 config.model_path,
@@ -522,6 +562,16 @@ class Engine:
             ),
             device=self.device,
         )
+        from freetoken.engine.layer_split import split_enabled, weight_device_for
+
+        if split_enabled():
+            # move the far side's weights to cuda:1 (they streamed in on
+            # cuda:0; peak near-side usage stays one tensor)
+            for k, v in list(state.items()):
+                d = weight_device_for(k)
+                if d != torch.device("cuda:0"):
+                    state[k] = v.to(d)
+        return state
 
     def _resolve_auto_moe_cache_size(self, config: EngineConfig, banks) -> tuple[int, int, bool]:
         """Resolve --moe-cache-auto into (moe_cache_size, num_pages, prefill_overlap).
