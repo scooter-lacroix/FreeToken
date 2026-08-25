@@ -222,6 +222,10 @@ class Bf16DraftEngine:
         shared = shared * torch.sigmoid(x2 @ self.ginp_sh_t).bfloat16()
 
         h2 = xr + routed.unsqueeze(0) + shared
+        # the draft's own hidden feeds back as the chain input when drafting
+        # deeper than k=1 (DeepSeek-MTP recursion: the head recurs on its own
+        # stream since no trunk hidden exists for speculative positions)
+        self.last_h2 = h2
         y = self._rms(h2, self.head_norm).bfloat16()        # [1, H]
         from freetoken.kernel.triton.kquant_linear import kq_gemv
 
