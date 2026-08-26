@@ -330,3 +330,39 @@ NEXT SESSION, IN ORDER:
 3. If the far attention is the culprit, the fallback is the far side =
    last 4-8 GDN/FFN layers only with full-attn layers pinned near (the
    split point can skip full-attn layers to dev0 by mapping them back).
+
+## S2b PASSED (2026-08-26, commits 368586e)
+
+Phase gate: server/model running on BOTH GPUs — MET.
+
+Final blocker chain (this session):
+1. fable77 "capture crash" = CUDA_LAUNCH_BLOCKING=1 self-sabotage inside graph
+   capture. The gfx1101 wmma "[0,0,K]" compile stderr is non-fatal noise
+   (FMA fallback: solo-7800XT probe compiles + launches fine, exit 0).
+   Rule: blocking mode ONLY with --cuda-graph-max-bs 0.
+2. True seam bug: cross_to_dev1 moved batch.input_ids to cuda:1 -> CausalLM's
+   logits-crossing branch (output.device != input_ids.device) silently
+   disabled -> raw far-side [T,248320] logits handed to the near sampler ->
+   HSA page fault at the next idle sync. Fix: input_ids never crosses;
+   branch keys on output.device == dev1(). Trace-proven coherent Fable run.
+3. Graph capture with the split still OOMs at 2.42 GiB free (capture pools
+   double-account far-side weights). Decode-runs-eager for now; split-aware
+   capture/piecewise decode is S2c.
+
+Ridge pivot (user directive): empero-ai Qwen3.8-27B-Ridge-3.7bpw.
+- Types IQ2_S/IQ3_S/Q8_0/Q5_K added to Python dequant (source = vendored
+  ggml-common.h/dequantize.cuh; _iq_tables.py generated). Verified vs GPU ext.
+- '!!!' degenerate root cause: ext MMQ prefill kernels BROKEN on IQ2_S/IQ3_S
+  (rel~1.0/NaN); MMVQ clean -> every prefill poisoned KV. Fix _ext_packed():
+  requant unsafe types to Q4_K at load; native only {Q8_0,Q4_K,Q5_K,Q6_K}.
+- Beware the pip cwd trap AGAIN: installs from repo root install Rusty-Stack,
+  not freetoken (ridge04 learned this twice).
+
+Measured (Ridge split=56 eager): decode 24.4 tok/s e2e coherent; ~4.2k-token
+prefill 100 s; Ridge has NO no-think mode — effort "none" yields empty chat
+outputs by design (reasoning stream itself is coherent). Fable empty-think
+answering is the exception.
+
+DFlash2 note: incoai Qwen3.8-27B-DFlash2-Q8_0 exists for Fable trunk. NO
+Ridge-matched draft head exists — S3 needs a decision if the target stays
+Ridge (train head? use Fable pair first? switch trunk back to Fable?).
