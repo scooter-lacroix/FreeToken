@@ -125,3 +125,20 @@ conversational multipliers at bs=1, ~1.0× under load.
   RoPE contract for our engine forward: position_ids length MUST equal
   Tc + Tq (ctx rows first, then noise rows), matching their
   `position_ids[start - ctx_len : start + verify]`.
+
+## Status log (cont.)
+
+- 2026-08-26 (3): **S3d ACCEPTANCE MEASURED — head transfer VERDICT: GO.**
+  Capture: split trunk taps [6,20,34,48,62] + greedy continuation over 1383
+  decode steps / 7 prose prompts (tools/mtp via FREETOKEN_DFLASH_TAPS +
+  TAP_DUMP; pinned-staging per-depth buffers — raw `.to("cpu")` in the far
+  ctx hard-faults, and unpickled views serialized whole pinned storages ->
+  always clone). Replay (CPU, fp32): teacher-forced chained-selector proposals
+  vs recorded continuations:
+    k=4 mean acc 1.858, P(acc>0) .762, E[tok/verify] 2.86
+    k=5           2.131            .807                 3.13
+    k=8           2.704            .837                 3.70
+  Projection from the 24.4 tok/s eager baseline (draft overlapped on GPU1):
+  ~70-90 tok/s — squarely in the published-DFlash2 multiple band WITHOUT any
+  Ridge-specific training. Remaining gap to the paper's 3.43x: prefill chunk
+  graphs (S2c) raise the base and shrink verify cost share.

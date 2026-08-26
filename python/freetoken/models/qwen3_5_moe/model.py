@@ -94,6 +94,46 @@ class Qwen3_5Model(BaseOP):
 
         import os as _os
         _dbg = _os.environ.get("FREETOKEN_LAYER_SPLIT_DEBUG", "0") in {"1", "true", "yes"}
+        # DFlash2 tap capture (S3d acceptance probing): stash the hidden AFTER
+        # each target depth into a module-held CPU dump dict, keyed by global
+        # decoder-layer id. Decode-only (prefill taps are the same-for-all
+        # batch noise the proposals never see). Default off.
+        _taps = None
+        if _os.environ.get("FREETOKEN_DFLASH_TAPS", "0") in {"1", "true", "yes"}:
+            import json as _json
+
+            _taps = {
+                int(v) for v in _json.loads(
+                    _os.environ.get(
+                        "FREETOKEN_DFLASH_TAP_LAYERS",
+                        "[6, 20, 34, 48, 62]",
+                    )
+                )
+            }
+            if not hasattr(self, "_dflash_tap_dump"):
+                self._dflash_tap_dump = {}
+            store = self._dflash_tap_dump
+
+        def _tap(hidden, depth: int):
+            """D2H into a per-depth LONG-LIVED pinned buffer (blocking). A raw
+            ``.to("cpu")`` from inside the far device context hard-faults this
+            HIP stack; pinned-staging copy is what the lm_head logits crossing
+            already proves safe."""
+            pins = getattr(self, "_dflash_tap_pins", None)
+            if pins is None:
+                pins = {}
+                self._dflash_tap_pins = pins
+            buf = pins.get(depth)
+            if buf is None or buf.shape[0] < hidden.shape[0]:
+                buf = torch.empty(
+                    (max(hidden.shape[0], 1), *hidden.shape[1:]),
+                    dtype=torch.bfloat16,
+                    pin_memory=True,
+                )
+                pins[depth] = buf
+            view = buf[: hidden.shape[0]]
+            view.copy_(hidden.detach(), non_blocking=False)
+            store[depth] = view.clone()
         sa = split_at() if split_enabled() else 0
         if sa:
             # Triton binds kernel modules + launches to the THREAD's current
@@ -106,18 +146,14 @@ class Qwen3_5Model(BaseOP):
             layers = self.layers.op_list
             for i in range(sa):
                 x, residual = layers[i].forward(x, residual)
+                if _taps and i in _taps:
+                    _tap(x, i)
             with torch.cuda.device(_dev1()):
                 x, residual = cross_to_dev1(get_global_ctx().batch, x, residual)
                 for i in range(sa, len(layers)):
-                    if _dbg:
-                        print(f"[split-dbg] far layer {i} begin", flush=True)
                     x, residual = layers[i].forward(x, residual)
-                    if _dbg:
-                        torch.cuda.synchronize()
-                        print(f"[split-dbg] far layer {i} done", flush=True)
-                if _dbg:
-                    torch.cuda.synchronize()
-                    print("[split-dbg] far layers complete", flush=True)
+                    if _taps and i in _taps:
+                        _tap(x, i)
                 # trunk norm stays INSIDE the far device context: its Triton
                 # launch under the near device would be a wrong-context launch
                 xn, rn = self.norm.forward_add_residual(x, residual)
@@ -191,10 +227,6 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         output = self.model.forward(ctx.batch.input_ids)
         from freetoken.engine.layer_split import split_enabled
 
-        # Key on the OUTPUT device, not on batch.input_ids.device: the seam
-        # re-devices batch tensors onto cuda:1 in place, so any batch-tensor
-        # comparison is unstable across the seam. output.device == dev1 is
-        # exactly "the trunk tail ran far-side".
         from freetoken.engine.layer_split import dev1 as _dev1
 
         if split_enabled() and output.device == _dev1():
@@ -215,7 +247,7 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             _trace(f"head: logits staged to pinned ({logits.shape[0]} rows); crossing to {near}")
             out = pin.to(near, non_blocking=False)
             _trace("head: logits on near side")
-            return out
+            logits = out
         # Post-norm trunk hidden (MTP diagnostics; lm_head consumes `output`,
         # so it is live every replay). `output` itself is a per-capture-level
         # pool tensor -- publish it through the same stable slice-written
@@ -231,7 +263,42 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 ctx.trunk_hidden = buf
             else:
                 ctx.trunk_hidden = output  # oversized eager decode
-        return self.lm_head.forward(output)
+        logits = self.lm_head.forward(output)
+
+        # S3d capture flush (after every branch converged to near-side
+        # [T, vocab] logits): on a T==1 decode step with taps armed, append
+        # one pickle line {position, taps{depth:[H] bf16}, argmax}. The
+        # acceptance probe teacher-verifies proposals against these recorded
+        # greedy continuations WITHOUT re-running the trunk.
+        tap_store = getattr(self.model, "_dflash_tap_dump", None)
+        import os as _os2
+
+        if (
+            tap_store is not None
+            and not getattr(ctx.batch, "is_prefill", False)
+            and logits.shape[0] == 1
+        ):
+            dump_path = _os2.environ.get("FREETOKEN_DFLASH_TAP_DUMP")
+            if dump_path:
+                entry = {
+                    "position": int(
+                        ctx.batch.positions.reshape(-1)[-1].item()
+                    ),
+                    "taps": {
+                        d: t.to(torch.bfloat16) for d, t in tap_store.items()
+                    },
+                    "argmax": int(logits.argmax(-1).reshape(-1)[-1].item()),
+                }
+                # selector-unary substitute: top-64 logits let the offline
+                # probe run proposals WITHOUT the 248320-wide trunk head
+                tk = torch.topk(logits.reshape(-1).float(), 64)
+                entry["topk_ids"] = [int(v) for v in tk.indices.tolist()]
+                entry["topk_vals"] = [float(v) for v in tk.values.tolist()]
+                import pickle as _p
+
+                with open(dump_path, "ab") as f:
+                    f.write(_p.dumps(entry))
+        return logits
 
 
 __all__ = ["Qwen3_5MoEForCausalLM"]
