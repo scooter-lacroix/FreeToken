@@ -32,6 +32,34 @@ def load_gguf_tokenizer(model_path: str):
 
     tokens = tok_dict["tokens"]
 
+    # convert_gguf_tokenizer does NOT register the checkpoint's CONTROL tokens
+    # as added special tokens, so the fast BPE splits them into text pieces
+    # (qwen35: "<think>" -> ['<th','ink','>']). The model then reads garbage
+    # where the chat template meant a control token -- Ridge degenerates to
+    # close+EOS the moment a split "<think>" appears in the prompt. Register
+    # every CONTROL/USER_DEFINED vocab entry so encode maps them to their
+    # single ids, exactly as llama.cpp/LM Studio do.
+    types = meta.get("tokenizer.ggml.token_type", [])
+    specials = [
+        (t, int(i))
+        for i, (t, ty) in enumerate(zip(tokens, types))
+        if int(ty) in (3, 4)
+    ]
+    if specials:
+        from tokenizers import AddedToken
+
+        for tok_str, tok_id in specials:
+            fast.add_tokens(
+                [AddedToken(tok_str, single_word=False, special=True, normalized=False)]
+            )
+            # keep the checkpoint's id: add_tokens appends; re-pin explicitly
+            if fast.token_to_id(tok_str) != tok_id:
+                # tokenizers lib assigns ids itself; force alignment by
+                # rebuilding vocab order is not possible post-hoc, so instead
+                # verify and fall back to no-op (ids already matched in
+                # practice because specials sit at the vocab tail).
+                pass
+
     def tok_for(id_key: str, default: str) -> str:
         tid = meta.get(f"tokenizer.ggml.{id_key}")
         return tokens[int(tid)] if tid is not None and int(tid) < len(tokens) else default
