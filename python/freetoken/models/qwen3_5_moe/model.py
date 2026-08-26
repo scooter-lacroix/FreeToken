@@ -191,20 +191,31 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         output = self.model.forward(ctx.batch.input_ids)
         from freetoken.engine.layer_split import split_enabled
 
-        if split_enabled() and output.device != ctx.batch.input_ids.device:
+        # Key on the OUTPUT device, not on batch.input_ids.device: the seam
+        # re-devices batch tensors onto cuda:1 in place, so any batch-tensor
+        # comparison is unstable across the seam. output.device == dev1 is
+        # exactly "the trunk tail ran far-side".
+        from freetoken.engine.layer_split import dev1 as _dev1
+
+        if split_enabled() and output.device == _dev1():
             # layer split: the whole trunk tail + head run on cuda:1 (the
             # hidden NEVER crosses back). Head under the far device context
             # (Triton), then only the [T, vocab] logits cross (pinned
             # two-hop; D2H inside the far ctx).
-            from freetoken.engine.layer_split import _pin_for
+            from freetoken.engine.layer_split import _pin_for, _trace
 
             with torch.cuda.device(output.device):
+                _trace(f"head: entering lm_head with {tuple(output.shape)} on {output.device}")
                 logits = self.lm_head.forward(output)
+                _trace(f"head: logits {tuple(logits.shape)} on {logits.device}")
             near = ctx.batch.input_ids.device
             pin = _pin_for(None, logits.shape, logits.dtype)
             with torch.cuda.device(logits.device):
                 pin.copy_(logits, non_blocking=False)
-            return pin.to(near, non_blocking=False)
+            _trace(f"head: logits staged to pinned ({logits.shape[0]} rows); crossing to {near}")
+            out = pin.to(near, non_blocking=False)
+            _trace("head: logits on near side")
+            return out
         # Post-norm trunk hidden (MTP diagnostics; lm_head consumes `output`,
         # so it is live every replay). `output` itself is a per-capture-level
         # pool tensor -- publish it through the same stable slice-written

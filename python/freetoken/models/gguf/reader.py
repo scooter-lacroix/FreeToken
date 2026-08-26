@@ -106,6 +106,7 @@ class GgufTensor:
     rows: int  # product of shape[:-1] over the *ggml* layout = blocks-major rows
     row_bytes: int  # packed bytes per row (whole quant blocks of the fastest dim)
     _raw: np.ndarray  # uint8 view, shape [rows, row_bytes]
+    flat_blocks: bool = False  # blocks tile the whole tensor, not each row
 
     def packed(self) -> torch.Tensor:
         """Zero-copy ``[rows, row_bytes]`` uint8 tensor of the native block bytes."""
@@ -150,11 +151,31 @@ def iter_gguf_tensors(model_path: str) -> Iterator[GgufTensor]:
         torch_shape = tuple(reversed(ne))
         block, type_size = gguf.GGML_QUANT_SIZES[t.tensor_type]
         n_fast = ne[0]
+        total = int(np.prod(ne))
         if n_fast % block != 0:
-            raise ValueError(
-                f"{t.name}: fastest dim {n_fast} not a multiple of block {block} "
-                f"for {t.tensor_type.name}"
+            if total % block != 0:
+                raise ValueError(
+                    f"{t.name}: fastest dim {n_fast} not a multiple of block {block} "
+                    f"for {t.tensor_type.name}"
+                )
+            # Dynamic-quant checkpoints (e.g. Ridge's Q8_0 ssm_alpha/beta,
+            # in-dim 48) tile whole-tensor blocks ACROSS rows: the flat
+            # numel divides evenly even though no single row does. Expose a
+            # single flat row of blocks; consumers that need per-row layout
+            # (the packed GEMMs) must dequantize via the flat view instead.
+            row_bytes = total // block * type_size
+            rows = 1
+            flat = np.ascontiguousarray(t.data).reshape(-1).view(np.uint8)
+            yield GgufTensor(
+                name=t.name,
+                shape=torch_shape,
+                ggml_type=int(t.tensor_type),
+                rows=rows,
+                row_bytes=row_bytes,
+                _raw=flat.reshape(1, -1),
+                flat_blocks=True,
             )
+            continue
         row_bytes = n_fast // block * type_size
         rows = int(np.prod(ne[1:])) if len(ne) > 1 else 1
         # gguf-py returns quantized tensors as raw uint8 but F32/F16 as typed arrays;

@@ -22,9 +22,12 @@ import torch
 GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
+GGML_Q5_K = 13
 GGML_Q8_0 = 8
 GGML_Q4_K = 12
 GGML_Q6_K = 14
+GGML_IQ3_S = 21
+GGML_IQ2_S = 22
 GGML_BF16 = 30
 
 # (block numel, bytes per block) per ggml type.
@@ -35,7 +38,10 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
     GGML_Q4_K: (256, 144),
+    GGML_Q5_K: (256, 176),
     GGML_Q6_K: (256, 210),
+    GGML_IQ3_S: (256, 110),
+    GGML_IQ2_S: (256, 82),
 }
 
 GGML_NAME = {
@@ -45,7 +51,10 @@ GGML_NAME = {
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
     GGML_Q4_K: "Q4_K",
+    GGML_Q5_K: "Q5_K",
     GGML_Q6_K: "Q6_K",
+    GGML_IQ3_S: "IQ3_S",
+    GGML_IQ2_S: "IQ2_S",
 }
 
 
@@ -165,6 +174,121 @@ def dequant_q4_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     return y.reshape(-1).to(out_dtype)
 
 
+def dequant_q8_0(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q8_0: per 32-elem block = fp16 ``d`` + 32 int8 values; ``w = d*q``."""
+    raw = raw.reshape(-1, 34)
+    d = _f16_scales(raw, 0, 2)  # [N,1]
+    q = raw[:, 2:34].view(torch.int8).to(torch.float32)  # [N,32]
+    return (q * d).reshape(-1).to(out_dtype)
+
+
+def dequant_q5_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """Q5_K: 256-elem super-block = fp16 d + fp16 dmin + 12 packed 6-bit
+    sub-scales + 32 high-bit bytes + 128 packed nibbles.
+
+    Vectorization of dequantize_block_q5_K: within byte chunk ``il`` (32 bytes),
+    byte ``j`` low nibble drives output ``64*il + j`` (sub-block ``2*il``) and its
+    high nibble output ``64*il + 32 + j`` (sub-block ``2*il + 1``); the fifth bit
+    comes from bit ``2*il`` / ``2*il + 1`` of high-bit byte ``j``."""
+    raw = raw.reshape(-1, 176)
+    n = raw.shape[0]
+    dall = _f16_scales(raw, 0, 2)  # [n,1] (half2 low half)
+    dmin = _f16_scales(raw, 2, 4)  # [n,1] (half2 high half)
+    sc, mn = _scale_min_k4(raw[:, 4:16])  # [n,8]
+    qh = raw[:, 16:48].to(torch.int32)  # [n,32]
+    qs = raw[:, 48:176]  # [n,128]
+
+    d_sc = dall * sc
+    d_mn = dmin * mn
+    y = torch.empty((n, 256), dtype=torch.float32, device=raw.device)
+    for il in range(4):
+        ql = qs[:, il * 32:(il + 1) * 32]  # [n,32]
+        lo = (ql & 0x0F).to(torch.float32) + 16.0 * ((qh >> (2 * il)) & 1).to(torch.float32)
+        hi = (ql >> 4).to(torch.float32) + 16.0 * ((qh >> (2 * il + 1)) & 1).to(torch.float32)
+        base = 64 * il
+        y[:, base:base + 32] = d_sc[:, 2 * il:2 * il + 1] * lo - d_mn[:, 2 * il:2 * il + 1]
+        y[:, base + 32:base + 64] = d_sc[:, 2 * il + 1:2 * il + 2] * hi - d_mn[:, 2 * il + 1:2 * il + 2]
+    return y.reshape(-1).to(out_dtype)
+
+
+_KMASK_IQ = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], dtype=torch.uint8)
+
+
+def dequant_iq2_s(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """IQ2_S: 256-elem block = fp16 d + 64B grid indices/signs + 8B high index
+    bits + 8B nibble scales. Direct port of dequantize_block_iq2_s.
+
+    Layout per 32-elem sub-block ``ib``, lane group ``il in 0..3``: grid index =
+    ``qs[4*ib+il] | ((qh[ib] << (8-2*il)) & 0x300)`` into the vendored
+    ``iq2s_grid`` (8 byte-values per entry); the sign byte lives in the second
+    32 bytes of ``qs`` at ``32 + 4*ib + il``; per-group scale nibble is
+    ``(scales[ib] >> 4*(il//2)) & 0xF`` with effective ``d*(0.5+nibble)*0.25``."""
+    from ._iq_tables import iq2s_grid_u8
+
+    raw = raw.reshape(-1, 82)
+    n = raw.shape[0]
+    d = _f16_scales(raw, 0, 2)  # [n,1]
+    qs = raw[:, 2:66]
+    qh = raw[:, 66:74].to(torch.int32)  # [n,8]
+    scales = raw[:, 74:82].to(torch.int32)  # [n,8]
+
+    qs_lo = qs[:, :32].reshape(n, 8, 4).to(torch.int32)  # [n,ib,il] grid index bytes
+    signs = qs[:, 32:64].reshape(n, 8, 4).to(torch.int32)  # [n,ib,il]
+    shifts = torch.tensor([8, 6, 4, 2], device=raw.device).view(1, 1, 4)
+    idx = qs_lo | ((qh.unsqueeze(2) << shifts) & 0x300)  # [n,8,4] 10-bit
+
+    nib = (scales.unsqueeze(2) >> (4 * (torch.arange(4, device=raw.device) // 2))) & 0xF
+    d_eff = d.unsqueeze(-1) * (0.5 + nib.to(torch.float32)) * 0.25  # [n,8,4]
+
+    grid = iq2s_grid_u8().to(raw.device)[idx.reshape(-1)].reshape(n, 8, 4, 8).to(torch.float32)
+    sgn = torch.where(
+        (signs.unsqueeze(-1) & _KMASK_IQ.to(raw.device)) != 0, -1.0, 1.0
+    )  # [n,8,4,8]
+    y = (d_eff.unsqueeze(-1) * grid * sgn).reshape(n, 256)
+    return y.reshape(-1).to(out_dtype)
+
+
+def dequant_iq3_s(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+    """IQ3_S: 256-elem block = fp16 d + 64B grid indices + 8B high index bits +
+    32B signs + 4B nibble scales. Direct port of dequantize_block_iq3_s.
+
+    Per 32-elem sub-block ``ib``, lane group ``il``: two grid indices into
+    ``iq3xs_grid`` (4 byte-values per entry) from ``qs[8*ib + 2*il (+1)]`` with
+    the 9th bit taken from ``qh[ib]`` bits; scale nibble is
+    ``(scales[ib/2] >> 4*(ib%2)) & 0xF`` with effective ``d*(0.5+nibble)*0.5``;
+    sign byte ``signs[4*ib + il]`` covers both 4-value halves."""
+    from ._iq_tables import iq3xs_grid_u8
+
+    raw = raw.reshape(-1, 110)
+    n = raw.shape[0]
+    d = _f16_scales(raw, 0, 2)  # [n,1]
+    qs = raw[:, 2:66].reshape(n, 8, 4, 2).to(torch.int32)  # [n,ib,il,{g1,g2}]
+    qh = raw[:, 66:74].to(torch.int32)  # [n,8]
+    signs = raw[:, 74:106].reshape(n, 8, 4).to(torch.int32)  # [n,ib,il]
+    scales = raw[:, 106:110].to(torch.int32)  # [n,4]
+
+    il = torch.arange(4, device=raw.device).view(1, 1, 4)
+    idx1 = qs[..., 0] | ((qh.unsqueeze(2) << (8 - 2 * il)) & 0x100)
+    idx2 = qs[..., 1] | ((qh.unsqueeze(2) << (7 - 2 * il)) & 0x100)
+
+    ib = torch.arange(8, device=raw.device)
+    nib = (scales.index_select(1, ib // 2) >> (4 * (ib % 2))) & 0xF
+    d_eff = d * (0.5 + nib.to(torch.float32)) * 0.5  # [n,8]
+    d_eff = d_eff.unsqueeze(-1).unsqueeze(-1)  # [n,8,1,1]
+
+    table = iq3xs_grid_u8().to(raw.device)
+    g1 = table[idx1.reshape(-1)].reshape(n, 8, 4, 4).to(torch.float32)
+    g2 = table[idx2.reshape(-1)].reshape(n, 8, 4, 4).to(torch.float32)
+    kmask = _KMASK_IQ.to(raw.device)[:4]
+    sgn1 = torch.where((signs.unsqueeze(-1) & kmask) != 0, -1.0, 1.0)  # [n,8,4,4]
+    sgn2 = torch.where((signs.unsqueeze(-1) & (_KMASK_IQ.to(raw.device)[4:])) != 0, -1.0, 1.0)
+
+    y = torch.empty((n, 8, 4, 8), dtype=torch.float32, device=raw.device)
+    y[..., 0:4] = d_eff * g1 * sgn1
+    y[..., 4:8] = d_eff * g2 * sgn2
+    return y.reshape(-1).to(out_dtype)
+
+
 def requantize_q4_k(w: torch.Tensor) -> torch.Tensor:
     """Quantize flat fp32 values to raw Q4_K block bytes (uint8).
 
@@ -216,7 +340,11 @@ def requantize_q4_k(w: torch.Tensor) -> torch.Tensor:
 _DEQUANT = {
     GGML_Q4_0: dequant_q4_0,
     GGML_Q4_K: dequant_q4_k,
+    GGML_Q5_K: dequant_q5_k,
     GGML_Q6_K: dequant_q6_k,
+    GGML_Q8_0: dequant_q8_0,
+    GGML_IQ2_S: dequant_iq2_s,
+    GGML_IQ3_S: dequant_iq3_s,
 }
 
 
@@ -243,13 +371,20 @@ __all__ = [
     "GGML_Q4_0",
     "GGML_Q8_0",
     "GGML_Q4_K",
+    "GGML_Q5_K",
     "GGML_Q6_K",
+    "GGML_IQ2_S",
+    "GGML_IQ3_S",
     "GGML_NAME",
     "BLOCK_SHAPE",
     "row_bytes",
     "dequant_q4_0",
     "dequant_q4_k",
+    "dequant_q5_k",
     "requantize_q4_k",
     "dequant_q6_k",
+    "dequant_q8_0",
+    "dequant_iq2_s",
+    "dequant_iq3_s",
     "dequantize",
 ]

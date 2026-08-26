@@ -112,19 +112,27 @@ class FarHead:
         from freetoken.kernel.triton.kquant_linear import kq_gemv
         from freetoken.core import get_global_ctx
 
+        _trace(f"FarHead.forward: x {tuple(x.shape)} on {x.device}")
         # mirror GgufKQuantLMHead: prefill only needs the LAST index per
         # request (computing all T rows through the 8-row GEMV loop would
         # allocate ~1 GB of logit transients on the far side)
         batch = getattr(get_global_ctx(), "_batch", None)
         if batch is not None and getattr(batch, "is_prefill", False):
+            _trace("FarHead: get_last_indices")
             indices = batch.attn_metadata.get_last_indices(batch.size)
+            _trace(f"FarHead: indices {tuple(indices.shape)} on {indices.device}; indexing x")
             x = x[indices].contiguous()
+            _trace("FarHead: x indexed")
         if x.shape[0] <= 8:
-            return kq_gemv(self.packed, x, 12)
+            _trace(f"FarHead: kq_gemv T={x.shape[0]}")
+            out = kq_gemv(self.packed, x, 12)
+            _trace(f"FarHead: kq_gemv done -> {tuple(out.shape)}")
+            return out
         outs = []
         for lo in range(0, x.shape[0], 8):
             hi = min(lo + 8, x.shape[0])
             outs.append(kq_gemv(self.packed, x[lo:hi], 12))
+        _trace(f"FarHead: chunked gemv done ({len(outs)} chunks)")
         return torch.cat(outs, 0)
 
     __call__ = forward
@@ -278,6 +286,15 @@ def _stage_cross(src: torch.Tensor, dst_dev: torch.device, tag: str) -> torch.Te
     return pin.to(dst_dev, non_blocking=False)
 
 
+def _trace(msg: str) -> None:
+    import os
+
+    if os.environ.get("FREETOKEN_LAYER_SPLIT_TRACE", "").strip().lower() not in (
+        "", "0", "false", "no", "off",
+    ):
+        print(f"[split-trace] {msg}", flush=True)
+
+
 def cross_to_dev1(batch, x: torch.Tensor, residual: torch.Tensor | None):
     """The seam: move the hidden stream and the far side's view of the batch
     metadata to cuda:1. Mutates ``batch`` in place (single forward in flight;
@@ -290,6 +307,7 @@ def cross_to_dev1(batch, x: torch.Tensor, residual: torch.Tensor | None):
     faults / silent garbage. torch ops are unaffected (tensor-device driven).
     """
     d1 = dev1()
+    _trace(f"seam: staging x {tuple(x.shape)} pin D2H")
     # D2H to pinned BEFORE switching devices: the producer (near layers) runs
     # on the near stream; a blocking D2H issued under the far device would
     # order against the wrong stream
@@ -299,13 +317,21 @@ def cross_to_dev1(batch, x: torch.Tensor, residual: torch.Tensor | None):
     if residual is not None:
         pin_r = _pin_for("r", residual.shape, residual.dtype)
         pin_r.copy_(residual, non_blocking=False)
+    _trace("seam: pin D2H done, switching device + H2D")
     torch.cuda.set_device(d1)
     x = pin_x.to(d1, non_blocking=False)
     if pin_r is not None:
         residual = pin_r.to(d1, non_blocking=False)
-    for attr in ("out_loc", "positions", "attn_metadata", "fla_metadata", "input_ids"):
+    _trace("seam: x/resident on far side; crossing metadata attrs")
+    # input_ids is deliberately NOT crossed: the embedding ran near-side, no
+    # far consumer exists, and CausalLM.forward keys its logits-crossing
+    # branch on output.device != batch.input_ids.device -- a far-side
+    # input_ids silently disables that branch and hands the near-side sampler
+    # a raw cuda:1 logits tensor (cross-device access fault).
+    for attr in ("out_loc", "positions", "attn_metadata", "fla_metadata"):
         val = getattr(batch, attr, None)
         if val is not None:
+            _trace(f"seam: crossing {attr}")
             try:
                 setattr(batch, attr, _to_device_deep(val, d1))
             except Exception as e:  # noqa: BLE001
@@ -317,6 +343,7 @@ def cross_to_dev1(batch, x: torch.Tensor, residual: torch.Tensor | None):
                         "layer-split seam: could not move %r (%s); far-side kernels "
                         "may see cross-device tensors", attr, e,
                     )
+            _trace(f"seam: crossed {attr}")
     if not getattr(cross_to_dev1, "_logged", False):
         cross_to_dev1._logged = True
         fla = getattr(batch, "fla_metadata", None)

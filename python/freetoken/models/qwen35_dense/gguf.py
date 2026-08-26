@@ -172,6 +172,35 @@ def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
     )
 
 
+# ggml-ext kernels whose MMVQ AND MMQ paths are both verified against true
+# matmul on this stack (gfx1100, wave64) — everything else gets dequantized
+# and requantized to Q4_K at load. Measured on Ridge (2026-08-26): the IQ
+# types' GEMV is exact but their MMQ prefill path produces NaN/garbage
+# (rel≈1.0), poisoning KV for every decode; Fable was uniform Q6_K and never
+# exercised it. Requant inflates Ridge's 5.8 GB of IQ payload to 9.6 GB of
+# Q4_K (~16.4 GB packed weights total) — fits solo XTX and split alike.
+_EXT_SAFE_TYPES = frozenset({8, 12, 13, 14})  # Q8_0, Q4_K, Q5_K, Q6_K
+
+
+def _ext_qt(t) -> int:
+    """The ggml_type its ext-side bytes carry AFTER _ext_packed (requant'd
+    IQ tensors become Q4_K)."""
+    qt = int(t.ggml_type)
+    return qt if qt in _EXT_SAFE_TYPES else 12
+
+
+def _ext_packed(t, device) -> tuple[torch.Tensor, int]:
+    """(packed_rows_uint8, ggml_type) safe to hand to the ggml ext."""
+    qt = int(t.ggml_type)
+    if qt in _EXT_SAFE_TYPES:
+        return t.packed().to(device), qt
+    from freetoken.models.gguf.dequant import dequantize, requantize_q4_k
+
+    w = dequantize(t.packed().reshape(-1).to(device), qt, torch.float32)
+    pk = requantize_q4_k(w.reshape(-1)).view(torch.uint8)
+    return pk.reshape(t.rows, -1).contiguous(), 12
+
+
 def iter_gguf_weights(
     model_path: str,
     device,
@@ -212,7 +241,8 @@ def iter_gguf_weights(
                 yield f"{p}.{mod}.packed", pk
                 yield f"{p}.{mod}.quant_type", _qt_scalar(qt)
         else:
-            fused = torch.cat([parts["q"][0], parts["k"][0], parts["v"][0]], dim=0)
+            # bare bf16 tensors in the non-dense path (no (tensor, type) tuples)
+            fused = torch.cat([parts["q"], parts["k"], parts["v"]], dim=0)
             yield f"{p}.qkv_proj.weight", fused
 
     def flush_in_proj(layer: int):
@@ -228,8 +258,10 @@ def iter_gguf_weights(
             yield f"{p}.in_proj_ba.packed", torch.cat([b[0], a[0]], dim=0)
             yield f"{p}.in_proj_ba.quant_type", _qt_scalar(b[1])
         else:
+            # b|a are stored as plain bf16 tensors in the non-dense path
+            # (no (tensor, type) tuples there -- latent upstream slip).
             fused = torch.cat(
-                [parts["qkv"][0], parts["z"][0], parts["b"][0], parts["a"][0]], dim=0
+                [parts["qkv"][0], parts["z"][0], parts["b"], parts["a"]], dim=0
             )
             yield f"{p}.in_proj.weight", fused
 
@@ -244,18 +276,18 @@ def iter_gguf_weights(
             yield f"{p}.down_proj.packed", d[0]
             yield f"{p}.down_proj.quant_type", _qt_scalar(d[1])
         else:
-            yield f"{p}.gate_up_proj.weight", torch.cat([g[0], u[0]], dim=0)
-            yield f"{p}.down_proj.weight", d[0]
+            # bare bf16 tensors in the non-dense path (no (tensor, type) tuples)
+            yield f"{p}.gate_up_proj.weight", torch.cat([g, u], dim=0)
+            yield f"{p}.down_proj.weight", d
 
     for t in iter_gguf_tensors(model_path):
         name = t.name
         if not name.startswith("blk."):
             if name == "token_embd.weight":
                 if dense_q:
-                    pk = t.packed()
-                    qt = _qt_scalar(t.ggml_type)
+                    pk, qt_i = _ext_packed(t, device)
                     yield "model.embed_tokens.packed", pk
-                    yield "model.embed_tokens.quant_type", qt
+                    yield "model.embed_tokens.quant_type", _qt_scalar(qt_i)
                     if config.tie_word_embeddings:
                         yield "lm_head.packed", pk
                         yield "lm_head.quant_type", qt
@@ -265,8 +297,9 @@ def iter_gguf_weights(
                 yield "model.norm.weight", _norm_plus_one(t)
             elif name == "output.weight":
                 if dense_q:
-                    yield "lm_head.packed", t.packed()
-                    yield "lm_head.quant_type", _qt_scalar(t.ggml_type)
+                    pk, qt = _ext_packed(t, device)
+                    yield "lm_head.packed", pk
+                    yield "lm_head.quant_type", _qt_scalar(qt)
                 else:
                     yield "lm_head.weight", _to_bf16(t)
             continue
@@ -287,8 +320,9 @@ def iter_gguf_weights(
             yield f"{p}.self_attn.k_norm.weight", _norm_plus_one(t)
         elif suffix == "attn_output.weight":
             if dense_q:
-                yield f"{p}.self_attn.o_proj.packed", t.packed()
-                yield f"{p}.self_attn.o_proj.quant_type", _qt_scalar(t.ggml_type)
+                pk, qt = _ext_packed(t, device)
+                yield f"{p}.self_attn.o_proj.packed", pk
+                yield f"{p}.self_attn.o_proj.quant_type", _qt_scalar(qt)
             else:
                 yield f"{p}.self_attn.o_proj.weight", _to_bf16(t)
         elif layer in linear_ids:
@@ -297,25 +331,25 @@ def iter_gguf_weights(
             # (row permutations apply identically to packed bytes).
             if suffix == "attn_qkv.weight":
                 if dense_q:
-                    w = _regroup_v_rows(t.packed(), nv, nk, vd, v_offset=2 * k_dim)
+                    w = _regroup_v_rows(_ext_packed(t, device)[0], nv, nk, vd, v_offset=2 * k_dim)
                 else:
                     w = _regroup_v_rows(_to_bf16(t), nv, nk, vd, v_offset=2 * k_dim)
-                in_proj_buf.setdefault(layer, {})["qkv"] = (w, t.ggml_type)
+                in_proj_buf.setdefault(layer, {})["qkv"] = (w, _ext_qt(t))
             elif suffix == "attn_gate.weight":
                 if dense_q:
-                    w = _regroup_v_rows(t.packed(), nv, nk, vd)
+                    w = _regroup_v_rows(_ext_packed(t, device)[0], nv, nk, vd)
                 else:
                     w = _regroup_v_rows(_to_bf16(t), nv, nk, vd)
-                in_proj_buf.setdefault(layer, {})["z"] = (w, t.ggml_type)
+                in_proj_buf.setdefault(layer, {})["z"] = (w, _ext_qt(t))
             elif suffix == "ssm_beta.weight":
                 perm = _v_perm(nv, nk)
                 in_proj_buf.setdefault(layer, {})["b"] = (
-                    (t.packed()[perm], t.ggml_type) if dense_q else _to_bf16(t)[perm]
+                    (_ext_packed(t, device)[0][perm], _ext_qt(t)) if dense_q else _to_bf16(t)[perm]
                 )
             elif suffix == "ssm_alpha.weight":
                 perm = _v_perm(nv, nk)
                 in_proj_buf.setdefault(layer, {})["a"] = (
-                    (t.packed()[perm], t.ggml_type) if dense_q else _to_bf16(t)[perm]
+                    (_ext_packed(t, device)[0][perm], _ext_qt(t)) if dense_q else _to_bf16(t)[perm]
                 )
             elif suffix == "ssm_a":
                 # llama.cpp stores A pre-negated (-exp(A_log)); FreeToken
@@ -353,15 +387,15 @@ def iter_gguf_weights(
                     yield f"{p}.linear_attn.out_proj.weight", _regroup_v_cols(w, nv, nk, vd)
             elif suffix == "ffn_gate.weight":
                 ffn_buf.setdefault(layer, {})["gate"] = (
-                    (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+                    (_ext_packed(t, device)) if dense_q else _to_bf16(t)
                 )
             elif suffix == "ffn_up.weight":
                 ffn_buf.setdefault(layer, {})["up"] = (
-                    (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+                    (_ext_packed(t, device)) if dense_q else _to_bf16(t)
                 )
             elif suffix == "ffn_down.weight":
                 ffn_buf.setdefault(layer, {})["down"] = (
-                    (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+                    (_ext_packed(t, device)) if dense_q else _to_bf16(t)
                 )
             if layer in in_proj_buf and len(in_proj_buf[layer]) == 4:
                 yield from flush_in_proj(layer)
@@ -371,27 +405,27 @@ def iter_gguf_weights(
             # Full-attention layer
             if suffix == "attn_q.weight":
                 qkv_buf.setdefault(layer, {})["q"] = (
-                    (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+                    (_ext_packed(t, device)) if dense_q else _to_bf16(t)
                 )
             elif suffix == "attn_k.weight":
                 qkv_buf.setdefault(layer, {})["k"] = (
-                    (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+                    (_ext_packed(t, device)) if dense_q else _to_bf16(t)
                 )
             elif suffix == "attn_v.weight":
                 qkv_buf.setdefault(layer, {})["v"] = (
-                    (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+                    (_ext_packed(t, device)) if dense_q else _to_bf16(t)
                 )
             elif suffix == "ffn_gate.weight":
                 ffn_buf.setdefault(layer, {})["gate"] = (
-                    (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+                    (_ext_packed(t, device)) if dense_q else _to_bf16(t)
                 )
             elif suffix == "ffn_up.weight":
                 ffn_buf.setdefault(layer, {})["up"] = (
-                    (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+                    (_ext_packed(t, device)) if dense_q else _to_bf16(t)
                 )
             elif suffix == "ffn_down.weight":
                 ffn_buf.setdefault(layer, {})["down"] = (
-                    (t.packed(), t.ggml_type) if dense_q else _to_bf16(t)
+                    (_ext_packed(t, device)) if dense_q else _to_bf16(t)
                 )
             if layer in qkv_buf and len(qkv_buf[layer]) == 3:
                 yield from flush_qkv(layer)
