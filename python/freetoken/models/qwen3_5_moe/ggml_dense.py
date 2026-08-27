@@ -142,7 +142,81 @@ class QuantGgmlLinear(BaseOP):
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.shape[0] > _PREFILL_BF16_MIN_T:
+            fast = _prefill_bf16_matmul(self.packed, self.quant_type)
+            if fast is not None:
+                # fast is [N,K] row-major == col-major [K,N]: rocBLAS consumes
+                # the transpose without a copy
+                return x @ fast.t()
         return _kq_gemv(self.packed, x, self.quant_type, self.out_features)
+
+
+# ---------------------------------------------------------------------------
+# Prefill bf16 materialization cache (prompt-processing fast path).
+#
+# Profiled 2026-08-26: the vendored mul_mat_q4_K MMQ runs 196 ms/call at
+# [1024,5120]x[5120,17408] on gfx1100 vs 4.9 ms for rocBLAS over
+# pre-dequantized bf16 (40x), and owns >99% of prefill GPU time (the q5/q6/IQ
+# families are all fine at 1-2 ms/call). For big-M calls we lazily dequantize
+# the packed weight ONCE into a device-cached bf16 twin and route through
+# rocBLAS; the twin lives in a FIFO cache bounded by FREETOKEN_BF16_CACHE_GB
+# (weights stay resident normally — requests touch layers sequentially, so one
+# long prompt's chunks plus its decode hits re-materialize nothing).
+
+_PREFILL_BF16_MIN_T = int(
+    __import__("os").environ.get("FREETOKEN_PREFILL_BF16_MIN_T", "64")
+)
+_bf16_cache: dict[int, tuple[torch.Tensor, int]] = {}
+_bf16_bytes = 0
+
+
+def _prefill_bf16_matmul(packed: torch.Tensor, qt: int):
+    """bf16 [N,K] twin for this packed weight, or None when the type/env/
+    VRAM budget says use the quant kernels instead."""
+    import os
+
+    if os.environ.get("FREETOKEN_PREFILL_BF16", "1").strip().lower() in {
+        "0", "false", "no", "off"
+    }:
+        return None
+    if qt not in (8, 12, 13, 14, 21, 22):   # verified dequant families only
+        return None
+    key = packed.data_ptr()
+    hit = _bf16_cache.get(key)
+    if hit is not None:
+        return hit[0]
+
+    from freetoken.models.gguf.dequant import BLOCK_SHAPE, dequantize
+
+    n, rb = packed.shape
+    bnum, bsize = BLOCK_SHAPE[qt]
+    assert rb % bsize == 0
+    k = (rb // bsize) * bnum
+    need = n * k * 2
+    budget = int(
+        float(os.environ.get("FREETOKEN_BF16_CACHE_GB", "2.2")) * (1 << 30)
+    )
+    global _bf16_bytes
+    while _bf16_bytes + need > budget and _bf16_cache:
+        evict_key = next(iter(_bf16_cache))
+        _, sz = _bf16_cache.pop(evict_key)
+        _bf16_bytes -= sz
+    w = _dequant_chunked(packed, qt, n, k)
+    _bf16_cache[key] = (w, need)
+    _bf16_bytes += need
+    return w
+
+
+def _dequant_chunked(packed: torch.Tensor, qt: int, n: int, k: int) -> torch.Tensor:
+    """Row-chunked dequant to bound fp32 transients (~70MB per 4096 rows)."""
+    from freetoken.models.gguf.dequant import dequantize
+
+    out = torch.empty((n, k), dtype=torch.bfloat16, device=packed.device)
+    CH = 4096
+    for lo in range(0, n, CH):
+        hi = min(lo + CH, n)
+        out[lo:hi] = dequantize(packed[lo:hi], qt, torch.bfloat16).view(hi - lo, k)
+    return out
 
 
 __all__ = ["GgufKQuantLMHead", "QuantGGMLEmbedding", "QuantGgmlLinear"]
