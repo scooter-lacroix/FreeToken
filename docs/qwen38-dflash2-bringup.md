@@ -366,3 +366,33 @@ answering is the exception.
 DFlash2 note: incoai Qwen3.8-27B-DFlash2-Q8_0 exists for Fable trunk. NO
 Ridge-matched draft head exists — S3 needs a decision if the target stays
 Ridge (train head? use Fable pair first? switch trunk back to Fable?).
+
+## S2c decode-graphs design (parked for next session, 2026-08-27)
+
+Goal: base decode 4.7@68k → mid-high 20s; DFlash2 compounds AFTER that.
+
+Approach: reuse PiecewiseCapture but SPLIT-AWARE — two graphs, two devices:
+  near-graph  (dev0): layers 0..55 + all near-side attention/meta kernels
+  seam        (eager, outside graphs): cross_to_dev1 into PERSISTENT dev1
+              buffers (currently cross allocates fresh dev1 tensors each step
+              — must switch to fixed staging buffers the far graph reads)
+  far-graph   (dev1): layers 56..63 + trunk norm + FarHead, captured under
+              torch.cuda.device(dev1); logits cross back eagerly (already
+              pinned two-hop)
+
+Blockers closed before starting:
+- capture_seam is invoked from inside model.forward (OffloadMoELayer today);
+  Qwen3_5Model.forward needs its own capture_seam call at the layer-56
+  boundary when piecewise capture is active (gate: split_enabled()).
+- Graph pools are PER-DEVICE: PiecewiseCapture shares one pool handle —
+  extend _CaptureState to per-device pools {dev: pool}.
+- GraphCaptureBuffer must gain dev1 twins for what the far graph reads:
+  positions (rotary), fresh_state_indices, and the seam hidden buffer.
+- replay(): runner order becomes buf.copy_from → near_graph.replay →
+  seam copies (pinned D2H+H2D, eager) → far_graph.replay → logits out.
+- Memory: earlier monolithic capture OOM'd at 2.42GiB free; piecewise with
+  per-device pools + mrr=1 + memory-ratio 0.88-0.90 leaves headroom for two
+  small decode graphs (activations only; weights/KV are outside pools).
+
+Also parked in-tree: probe.py live hook (env-disabled) + kquant_gemm_wip.py
+(Triton dequant-GEMM, debug notes inline).

@@ -223,6 +223,11 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             self.draft = Qwen35MTPDraft(config)
 
     def forward(self) -> torch.Tensor:
+        import os as _os_arm
+        if (_os_arm.environ.get("FREETOKEN_DFLASH_ENGINE", "0") in {"1","true","yes"}
+                and not hasattr(self, "_live_dflash_armed")):
+            self._live_dflash_armed = True
+            self._ensure_live_dflash()
         ctx = get_global_ctx()
         output = self.model.forward(ctx.batch.input_ids)
         from freetoken.engine.layer_split import split_enabled
@@ -265,6 +270,32 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 ctx.trunk_hidden = output  # oversized eager decode
         return self._s3d_maybe_flush(ctx, self.lm_head.forward(output))
 
+    def _ensure_live_dflash(self):
+        pr = getattr(self, "_live_dflash_obj", None)
+        if pr is None:
+            from freetoken.models.dflash.probe import maybe_probe
+
+            pr = maybe_probe()
+            if pr is not None:
+                pr.ensure_target(self)
+            self._live_dflash_obj = pr
+        return pr
+
+    def _live_dflash_step(self, ctx, logits):
+        """S4 milestone-1: live draft proposal on cuda:1 (measure-only)."""
+        tap_store = getattr(self.model, "_dflash_tap_dump", None)
+        pr = self._live_dflash_obj
+        if pr is None or not tap_store:
+            return
+        try:
+            anchor = int(logits.argmax(-1).reshape(-1)[-1].item())
+            pos = int(ctx.batch.positions.reshape(-1)[-1].item()) + 1
+            _picked, report = pr.propose_and_score(tap_store, anchor, pos)
+            if report:
+                print(report, flush=True)
+        except Exception as e:                                # noqa: BLE001
+            print(f"[dflash-probe] step error {e!r}", flush=True)
+
     def _s3d_maybe_flush(self, ctx, logits):
         """S3d capture flush shared by both serving paths: on a T==1 decode
         step with taps armed, append one pickle line {position, taps[depth][H]
@@ -298,6 +329,13 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
 
             with open(dump_path, "ab") as f:
                 f.write(_p.dumps(entry))
+
+        import os as _os3
+        if (_os3.environ.get("FREETOKEN_DFLASH_ENGINE", "0") in {"1","true","yes"}
+                and hasattr(self, "_live_dflash_armed")
+                and not getattr(ctx.batch, "is_prefill", False)
+                and logits.shape[0] == 1):
+            self._live_dflash_step(ctx, logits)
         return logits
 
 
