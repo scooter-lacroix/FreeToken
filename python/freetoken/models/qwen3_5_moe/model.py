@@ -245,9 +245,9 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             with torch.cuda.device(logits.device):
                 pin.copy_(logits, non_blocking=False)
             _trace(f"head: logits staged to pinned ({logits.shape[0]} rows); crossing to {near}")
-            out = pin.to(near, non_blocking=False)
+            logits = pin.to(near, non_blocking=False)
             _trace("head: logits on near side")
-            logits = out
+            return self._s3d_maybe_flush(ctx, logits)
         # Post-norm trunk hidden (MTP diagnostics; lm_head consumes `output`,
         # so it is live every replay). `output` itself is a per-capture-level
         # pool tensor -- publish it through the same stable slice-written
@@ -263,13 +263,14 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 ctx.trunk_hidden = buf
             else:
                 ctx.trunk_hidden = output  # oversized eager decode
-        logits = self.lm_head.forward(output)
+        return self._s3d_maybe_flush(ctx, self.lm_head.forward(output))
 
-        # S3d capture flush (after every branch converged to near-side
-        # [T, vocab] logits): on a T==1 decode step with taps armed, append
-        # one pickle line {position, taps{depth:[H] bf16}, argmax}. The
-        # acceptance probe teacher-verifies proposals against these recorded
-        # greedy continuations WITHOUT re-running the trunk.
+    def _s3d_maybe_flush(self, ctx, logits):
+        """S3d capture flush shared by both serving paths: on a T==1 decode
+        step with taps armed, append one pickle line {position, taps[depth][H]
+        bf16, argmax, topk_ids/vals(64)}. The replay teacher-verifies proposals
+        against these recorded greedy continuations WITHOUT re-running the
+        trunk."""
         tap_store = getattr(self.model, "_dflash_tap_dump", None)
         import os as _os2
 
@@ -277,27 +278,26 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             tap_store is not None
             and not getattr(ctx.batch, "is_prefill", False)
             and logits.shape[0] == 1
+            and (dump_path := _os2.environ.get("FREETOKEN_DFLASH_TAP_DUMP"))
         ):
-            dump_path = _os2.environ.get("FREETOKEN_DFLASH_TAP_DUMP")
-            if dump_path:
-                entry = {
-                    "position": int(
-                        ctx.batch.positions.reshape(-1)[-1].item()
-                    ),
-                    "taps": {
-                        d: t.to(torch.bfloat16) for d, t in tap_store.items()
-                    },
-                    "argmax": int(logits.argmax(-1).reshape(-1)[-1].item()),
-                }
-                # selector-unary substitute: top-64 logits let the offline
-                # probe run proposals WITHOUT the 248320-wide trunk head
-                tk = torch.topk(logits.reshape(-1).float(), 64)
-                entry["topk_ids"] = [int(v) for v in tk.indices.tolist()]
-                entry["topk_vals"] = [float(v) for v in tk.values.tolist()]
-                import pickle as _p
+            entry = {
+                "position": int(
+                    ctx.batch.positions.reshape(-1)[-1].item()
+                ),
+                "taps": {
+                    d: t.to(torch.bfloat16) for d, t in tap_store.items()
+                },
+                "argmax": int(logits.argmax(-1).reshape(-1)[-1].item()),
+            }
+            # selector-unary substitute: top-64 logits let the offline probe
+            # run proposals WITHOUT the 248320-wide trunk head
+            tk = torch.topk(logits.reshape(-1).float(), 64)
+            entry["topk_ids"] = [int(v) for v in tk.indices.tolist()]
+            entry["topk_vals"] = [float(v) for v in tk.values.tolist()]
+            import pickle as _p
 
-                with open(dump_path, "ab") as f:
-                    f.write(_p.dumps(entry))
+            with open(dump_path, "ab") as f:
+                f.write(_p.dumps(entry))
         return logits
 
 
