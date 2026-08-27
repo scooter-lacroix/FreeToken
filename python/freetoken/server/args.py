@@ -11,6 +11,29 @@ from freetoken.scheduler import SchedulerConfig
 from freetoken.utils import init_logger
 
 
+def _sniff_tool_parser(args: ServerArgs) -> None:
+    """GGUF checkpoints ship their own chat template. When it speaks the
+    qwen3-coder XML function dialect (<function=name><parameter=k>) the
+    default 'qwen25' JSON detector mangles every tool call -- swap to
+    'qwen3_coder' unless the caller forced a specific parser. Runs at parse
+    time so EVERY process (API frontend included) sees the override."""
+    import os as _os
+
+    if getattr(args, "tool_call_parser", "") != "qwen25":
+        return
+    if _os.environ.get("FREETOKEN_TOOL_PARSER_FORCE", "").strip():
+        return
+    try:
+        from freetoken.models.gguf.reader import load_gguf_metadata
+
+        tmpl = load_gguf_metadata(args.model_path).get("tokenizer.chat_template") or ""
+    except Exception:
+        return
+    if "<parameter=" in tmpl or "<function=" in tmpl:
+        object.__setattr__(args, "tool_call_parser", "qwen3_coder")
+
+
+
 @dataclass(frozen=True)
 class ServerArgs(SchedulerConfig):
     server_host: str = "127.0.0.1"
@@ -693,6 +716,7 @@ def parse_args(
     del kwargs["tensor_parallel_size"]
 
     result = ServerArgs(**kwargs)
+    _sniff_tool_parser(result)
     logger = init_logger(__name__)
     logger.info(f"Parsed arguments:\n{result}")
     return result, run_shell

@@ -289,6 +289,31 @@ class ForwardOutput(NamedTuple):
     copy_done_event: torch.cuda.Event
 
 
+def _sniff_tool_parser(config) -> None:
+    """GGUF checkpoints carry their own chat template; when it emits the
+    qwen3-coder XML function envelope (<function=name><parameter=k>) the
+    hardcoded 'qwen25' JSON detector mangles every tool call (JSON parse
+    error spam; agents appear to stall mid-loop). Swap to the XML detector
+    whenever the served template speaks that dialect and the caller left the
+    default parser in place."""
+    import os as _os
+
+    if getattr(config, "tool_call_parser", "") != "qwen25":
+        return
+    if os.environ.get("FREETOKEN_TOOL_PARSER_FORCE", "").strip():
+        return
+    try:
+        from freetoken.models.gguf.reader import load_gguf_metadata
+
+        tmpl = load_gguf_metadata(config.model_path).get("tokenizer.chat_template", "")
+    except Exception:
+        return
+    if "<parameter=" in tmpl or "<function=" in tmpl:
+        # ServerArgs is a frozen dataclass; the object.__setattr__ escape is
+        # the established pattern for post-parse overrides here
+        object.__setattr__(config, "tool_call_parser", "qwen3_coder")
+
+
 class Engine:
     def __init__(self, config: EngineConfig):
         assert not torch.cuda.is_initialized()

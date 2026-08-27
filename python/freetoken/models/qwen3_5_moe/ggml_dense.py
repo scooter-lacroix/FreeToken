@@ -194,8 +194,13 @@ def _prefill_bf16_matmul(packed: torch.Tensor, qt: int):
     k = (rb // bsize) * bnum
     need = n * k * 2
     budget = int(
-        float(os.environ.get("FREETOKEN_BF16_CACHE_GB", "2.2")) * (1 << 30)
+        float(os.environ.get("FREETOKEN_BF16_CACHE_GB", "0")) * (1 << 30)
     )
+    if budget <= 0:
+        # no persistence: dequant per use (~20-40ms/layer) — removes the
+        # 48-layer-vs-cap eviction storms that surfaced as multi-second
+        # serving freezes
+        return _dequant_chunked(packed, qt, n, k)
     global _bf16_bytes
     while _bf16_bytes + need > budget and _bf16_cache:
         evict_key = next(iter(_bf16_cache))
