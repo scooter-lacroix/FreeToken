@@ -396,3 +396,20 @@ Blockers closed before starting:
 
 Also parked in-tree: probe.py live hook (env-disabled) + kquant_gemm_wip.py
 (Triton dequant-GEMM, debug notes inline).
+
+## S2c status at context close (2026-08-28, commit 1858a9a+)
+
+BREAKTHROUGH: both split graphs (bs 2+1) CAPTURE and server reaches ready
+(6.1 GiB free). Fix ladder: dead twin-swap flag unified, fail-fast guard on
+in-capture crossings, per-pass near-attr restore, per-(attr,shape) twin
+keying, per-segment pools (ROCm returns None pool handles), stream-paired
+open/close, split branch skips monolithic pool tail.
+
+REMAINING BLOCKER: first real request → scheduler (or tokenizer) worker
+spins 100% CPU indefinitely; GPUs ~idle; no Prefill log. Exception-swallow
+retry loop is the leading theory; py-spy needs sudo (ptrace denied).
+NEXT: one-line unguarded traceback print in the engine.forward_batch
+exception path OR scheduler receive loop, one boot, read the answer. Then
+fix + verify graph replay + depth ladder (target: base 25-29 tok/s).
+Do NOT spin a serve process at 100% CPU again — kill within one probe cycle
+(user hard rule).
