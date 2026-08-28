@@ -227,6 +227,34 @@ class Scheduler(SchedulerIOMixin):
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
         forward_input = self._schedule_next_batch()
+        # Spin diagnostic: runnable managers + a None schedule + non-blocking
+        # receive = a hot retry loop (the 100%-CPU signature). Name the gate
+        # once after a few iterations instead of spinning silently.
+        if forward_input is None and (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+        ):
+            import os as _os
+
+            n = getattr(self, "_spin_count", 0) + 1
+            self._spin_count = n
+            if n == 50:
+                print(
+                    "[sched-diag] SPIN: runnable but unschedulable — "
+                    f"prefill.runnable={self.prefill_manager.runnable} "
+                    f"decode.runnable={self.decode_manager.runnable} "
+                    f"runnable_reqs={[getattr(r, 'input_len', '?') for r in self.prefill_manager.runnable_reqs] if hasattr(self.prefill_manager, 'runnable_reqs') else 'n/a'} "
+                    f"mamba_free={getattr(self.cache_manager.linear_state_pool, 'num_free_slots', '?')}",
+                    flush=True,
+                )
+            if n == 500:
+                import faulthandler as _fh
+
+                _fh.dump_traceback()
+                self._spin_count = 50  # keep reporting every 450 iters
+        else:
+            if getattr(self, "_spin_count", 0):
+                print(f"[sched-diag] spin ended at n={self._spin_count}", flush=True)
+            self._spin_count = 0
         ongoing_data = None
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
@@ -265,6 +293,34 @@ class Scheduler(SchedulerIOMixin):
             self._execute_pending_rebuild()
 
         forward_input = self._schedule_next_batch()
+        # Spin diagnostic: runnable managers + a None schedule + non-blocking
+        # receive = a hot retry loop (the 100%-CPU signature). Name the gate
+        # once after a few iterations instead of spinning silently.
+        if forward_input is None and (
+            self.prefill_manager.runnable or self.decode_manager.runnable
+        ):
+            import os as _os
+
+            n = getattr(self, "_spin_count", 0) + 1
+            self._spin_count = n
+            if n == 50:
+                print(
+                    "[sched-diag] SPIN: runnable but unschedulable — "
+                    f"prefill.runnable={self.prefill_manager.runnable} "
+                    f"decode.runnable={self.decode_manager.runnable} "
+                    f"runnable_reqs={[getattr(r, 'input_len', '?') for r in self.prefill_manager.runnable_reqs] if hasattr(self.prefill_manager, 'runnable_reqs') else 'n/a'} "
+                    f"mamba_free={getattr(self.cache_manager.linear_state_pool, 'num_free_slots', '?')}",
+                    flush=True,
+                )
+            if n == 500:
+                import faulthandler as _fh
+
+                _fh.dump_traceback()
+                self._spin_count = 50  # keep reporting every 450 iters
+        else:
+            if getattr(self, "_spin_count", 0):
+                print(f"[sched-diag] spin ended at n={self._spin_count}", flush=True)
+            self._spin_count = 0
         ongoing_data = None
         if forward_input is not None:
             # already inside engine_stream_ctx (run_forever); restore on the engine stream
@@ -856,6 +912,10 @@ class Scheduler(SchedulerIOMixin):
         )
         if batch is None:
             return None
+        if getattr(self, "_sched_diag", None) is not None:
+            # a previously-stuck gate unblocked itself — report the recovery
+            print(f"[sched-diag] unblocked after: {self._sched_diag}", flush=True)
+            self._sched_diag = None
         forward_input = self._prepare_batch(batch)
         self._report_prompt_admissions(batch)
         return forward_input
