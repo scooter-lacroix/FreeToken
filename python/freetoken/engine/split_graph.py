@@ -62,11 +62,11 @@ class SplitGraphCapture:
     # -- segment lifecycle --------------------------------------------------
     def _open_segment(self, dev: torch.device) -> None:
         g = torch.cuda.CUDAGraph()
-        pool = None
-        plist = self.pools.get(dev)
-        if plist:
-            pool = plist[0]
-        g.capture_begin(pool=pool)
+        # per-segment pools: torch 2.13-ROCm returns None pool() handles for
+        # some graphs; sharing None across segments crashes. Two tiny pools
+        # (activations only) cost nothing.
+        self._open_stream = torch.cuda.current_stream(dev)
+        g.capture_begin(pool=None)
         self._current = g
         self._cur_dev = dev
 
@@ -76,19 +76,31 @@ class SplitGraphCapture:
 
     def _close_segment(self, name: str) -> None:
         assert self._current is not None
+        open_stream = getattr(self, "_open_stream", None)
+        if open_stream is not None:
+            torch.cuda.set_stream(open_stream)
         self._current.capture_end()
         self.graphs[name] = self._current
         dev = self._cur_dev
+        try:
+            pool_handle = self._current.pool()
+        except Exception:
+            pool_handle = None
         if dev not in self.pools:
-            self.pools[dev] = [self._current.pool()]
+            self.pools[dev] = [pool_handle] if pool_handle is not None else []
+        elif self.pools[dev] and self.pools[dev][0] is None and pool_handle is not None:
+            self.pools[dev][0] = pool_handle
         self._current = None
 
     # -- driver --------------------------------------------------------------
-    def capture(self, bs: int, fn) -> "SplitGraphCapture":
+    def capture(self, bs: int, fn, batch=None) -> "SplitGraphCapture":
         """``fn`` runs the FULL forward once (both devices + eager seam)."""
         from freetoken.engine import layer_split as ls
 
         self.bs = bs
+        if batch is not None:
+            self.bind_batch(batch)
+            ls.restore_batch_near(batch)
         assert not ls._SPLIT_CAPTURE["active"]
         ls._SPLIT_CAPTURE.update(active=True, ctx=self)
         dev0 = torch.device("cuda", 0)

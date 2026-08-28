@@ -281,6 +281,17 @@ def _stage_cross(src: torch.Tensor, dst_dev: torch.device, tag: str) -> torch.Te
     launch). The pinned two-hop is the pattern the MTP engine ran correctly
     all day. Buffers are cached per tag+shape (KBs each).
     """
+    import os as _os
+
+    if _SPLIT_CAPTURE["active"] and _os.environ.get(
+        "FREETOKEN_SPLIT_GRAPHS_ALLOW_CROSS", "0"
+    ) not in {"1", "true", "yes"}:
+        raise RuntimeError(
+            "split-graph capture: blocking device crossing inside an open "
+            f"segment (tag={tag}, src={src.device} -> {dst_dev}). Pre-cross "
+            "this tensor in the seam instead — a blocking copy inside a "
+            "capturing stream deadlocks HIP."
+        )
     pin = _pin_for(tag, src.shape, src.dtype)
     pin.copy_(src, non_blocking=False)
     return pin.to(dst_dev, non_blocking=False)
@@ -307,12 +318,14 @@ def split_capture_active() -> bool:
 def cross_seam_meta_replay(batch) -> None:
     """Refresh the fixed dev1 metadata twins from the live (near) batch so the
     far graph replays against current positions/KV indices."""
-    tw = _SPLIT_META.get("twins")
-    if not tw:
+    if not _SPLIT_META.get("twins"):
         return
-    for attr, twin in tw.items():
+    for attr in ("out_loc", "positions", "attn_metadata", "fla_metadata"):
         val = getattr(batch, attr, None)
-        if val is not None:
+        if val is None:
+            continue
+        twin = _seam_meta_twins(batch).get(attr)
+        if twin is not None:
             _copy_dev1(val, twin)
 
 
@@ -359,6 +372,26 @@ def _copy_dev1(src, dst) -> None:
             _copy_dev1(a, b)
 
 
+def _shape_sig(obj) -> tuple:
+    """Recursive shape signature of every tensor inside obj (dataclasses,
+    dicts, lists, tuples). Two objects with the same signature are
+    _copy_dev1-compatible."""
+    import torch as _t
+    import dataclasses as _dc
+
+    if _t.is_tensor(obj):
+        return ("t", tuple(obj.shape), str(obj.dtype))
+    if _dc.is_dataclass(obj) and not isinstance(obj, type):
+        return ("dc", type(obj).__name__,
+                tuple((f.name, _shape_sig(getattr(obj, f.name)))
+                      for f in _dc.fields(obj)))
+    if isinstance(obj, dict):
+        return ("dict", tuple((k, _shape_sig(v)) for k, v in obj.items()))
+    if isinstance(obj, (list, tuple)):
+        return ("seq", tuple(_shape_sig(v) for v in obj))
+    return ("leaf", repr(type(obj)))
+
+
 def _seam_meta_twins(batch) -> dict:
     """Fixed dev1 mirrors of the far side's batch metadata (created once per
     shape at capture; replays refresh via _copy_dev1)."""
@@ -374,7 +407,11 @@ def _seam_meta_twins(batch) -> dict:
         val = getattr(batch, attr, None)
         if val is None:
             continue
-        key = attr
+        # key per (attr, nested-shape-signature): bs=2 and bs=1 graphs need
+        # SEPARATE twins — _copy_dev1 copies into fixed storage, so every
+        # nested tensor shape must match exactly (cu_seqlens_q_gpu is
+        # [bs+1], indptr [bs+1], logits scratch [bs, ...] — all bs-bound).
+        key = (attr, _shape_sig(val))
         if key not in tw:
             tw[key] = _to_device_deep(_copy.deepcopy(val), d1)
         out[attr] = tw[key]
@@ -404,6 +441,21 @@ def split_tail_forward(causal_lm, output):
     with torch.cuda.device(logits.device):
         pin.copy_(logits, non_blocking=False)
     return pin.to(near, non_blocking=False)
+
+
+def restore_batch_near(batch) -> None:
+    """Move the batch's far-crossed metadata attrs back to dev0. Captures are
+    multi-pass (warmup eager + per-bs), and cross_to_dev1 mutates the batch in
+    place every pass — without this, pass N's dev1 attrs leak into pass N+1's
+    NEAR segment and near layers hit the fail-fast crossing guard."""
+    d0 = torch.device("cuda", 0)
+    for attr in ("out_loc", "positions", "attn_metadata", "fla_metadata"):
+        val = getattr(batch, attr, None)
+        if val is not None:
+            try:
+                setattr(batch, attr, _to_device_deep(val, d0))
+            except Exception:
+                pass
 
 
 def split_capture_close() -> None:
@@ -437,8 +489,10 @@ def split_capture_seam(layer_id: int) -> None:
 
 
 def capture_seam_active() -> bool:
-    """True while a (future) far-side graph capture reads the seam buffers."""
-    return _SEAM_BUF_STATE.get("capture", False)
+    """True while a split-graph capture walk is in flight (twin swap reads
+    this; unified on _SPLIT_CAPTURE — the old _SEAM_BUF_STATE flag was never
+    set, which silently disabled the twin swap during capture)."""
+    return _SPLIT_CAPTURE["active"]
 
 
 def _seam_dev1_buffers(t: int, h: int, dtype) -> dict:

@@ -125,6 +125,7 @@ class GraphRunner:
             __import__("os").environ.get("FREETOKEN_SPLIT_GRAPHS", "0")
             in {"1", "true", "yes"}
         )
+        self.split_map = {}
         self.piecewise = bool(
             self.max_graph_bs > 0
             and moe_offload_cache is not None
@@ -227,6 +228,7 @@ class GraphRunner:
                         lambda: self.buffer.logits.__setitem__(
                             slice(0, bs), model.forward()
                         ),
+                        batch=batch,
                     )
                     self.split_map[bs] = cap
                 else:
@@ -234,7 +236,9 @@ class GraphRunner:
                     with torch.cuda.graph(graph, pool=pool, stream=self.stream):
                         self.buffer.logits[:bs] = model.forward()
                 self._reset_moe_offload_cache()
-            if pool is None:
+            if self.split_graph and bs in self.split_map:
+                pass  # split graphs own their per-segment pools
+            elif pool is None:
                 pool = graph.pool()  # reuse cuda graph handle to reduce memory
             if graph is not None:
                 self.graph_map[bs] = graph
