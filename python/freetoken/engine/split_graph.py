@@ -52,21 +52,30 @@ class SplitGraphCapture:
         elif self._phase == "crossing":
             from freetoken.engine.layer_split import dev1
 
-            # switch the WALK to dev1's side stream before opening the far
-            # segment; blocking seam copies on dev0 finished on the walk
-            # stream BEFORE the near close, so no cross-stream hazard.
-            torch.cuda.set_stream(self.stream1)
-            self._open_segment(dev1())
+            # after set_device(dev1) the current stream is dev1's DEFAULT;
+            # the far layers must RUN inside the capture stream ctx (ops on
+            # the default stream are silently un-captured) — _open_segment
+            # enters both ctxs and keeps them open through split_capture_close.
+            self._open_segment(dev1(), stream=self.stream1)
             self._phase = "far"
 
     # -- segment lifecycle --------------------------------------------------
-    def _open_segment(self, dev: torch.device) -> None:
+    def _open_segment(self, dev: torch.device, stream=None) -> None:
+        # torch.cuda.graph ctx wrapper: handles side-stream capture, sync and
+        # stream pairing that raw capture_begin/capture_end misses (raw mode
+        # silently dropped kernels issued on non-captured streams — the
+        # ggml ext / fla / conv1d family — producing garbage replays).
+        # stream=None uses the device's current (near: engine stream0);
+        # far passes its dev1 side stream explicitly (dev1's current stream
+        # is the DEFAULT after set_device — graphs refuse default-stream
+        # capture).
+        self._open_stream = stream or torch.cuda.current_stream(dev)
         g = torch.cuda.CUDAGraph()
-        # per-segment pools: torch 2.13-ROCm returns None pool() handles for
-        # some graphs; sharing None across segments crashes. Two tiny pools
-        # (activations only) cost nothing.
-        self._open_stream = torch.cuda.current_stream(dev)
-        g.capture_begin(pool=None)
+        self._graph_ctx = torch.cuda.graph(g, stream=self._open_stream)
+        self._graph_ctx.__enter__()
+        # keep the CAPTURE STREAM current for every op inside this segment
+        self._stream_ctx = torch.cuda.stream(self._open_stream)
+        self._stream_ctx.__enter__()
         self._current = g
         self._cur_dev = dev
 
@@ -76,20 +85,12 @@ class SplitGraphCapture:
 
     def _close_segment(self, name: str) -> None:
         assert self._current is not None
-        open_stream = getattr(self, "_open_stream", None)
-        if open_stream is not None:
-            torch.cuda.set_stream(open_stream)
+        # torch.cuda.graphs.__exit__ calls torch.cuda.synchronize() first —
+        # an unsupported op while a capture is open on the OTHER device's
+        # stream (two-device piecewise). End the capture directly.
         self._current.capture_end()
+        self._stream_ctx.__exit__(None, None, None)
         self.graphs[name] = self._current
-        dev = self._cur_dev
-        try:
-            pool_handle = self._current.pool()
-        except Exception:
-            pool_handle = None
-        if dev not in self.pools:
-            self.pools[dev] = [pool_handle] if pool_handle is not None else []
-        elif self.pools[dev] and self.pools[dev][0] is None and pool_handle is not None:
-            self.pools[dev][0] = pool_handle
         self._current = None
 
     # -- driver --------------------------------------------------------------
@@ -117,7 +118,6 @@ class SplitGraphCapture:
                     self._close_segment("far")
                 if self.graphs.get("far") is None:
                     raise RuntimeError("split capture: far segment missing")
-                torch.cuda.set_stream(self.stream0)
         finally:
             ls._SPLIT_CAPTURE.update(active=False, ctx=None)
         return self
