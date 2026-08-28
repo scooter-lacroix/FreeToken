@@ -121,6 +121,10 @@ class GraphRunner:
         # Piecewise mode (SSD expert tier): capture segments that end at each
         # MoE layer's ensure/copy seam instead of one monolithic graph, so the
         # host-driven miss copies can run between replays (see engine/piecewise).
+        self.split_graph = (
+            __import__("os").environ.get("FREETOKEN_SPLIT_GRAPHS", "0")
+            in {"1", "true", "yes"}
+        )
         self.piecewise = bool(
             self.max_graph_bs > 0
             and moe_offload_cache is not None
@@ -128,6 +132,8 @@ class GraphRunner:
         )
         self.pw_map: Dict[int, List[torch.cuda.CUDAGraph]] = {}
         self.pw_seams: List[int] = []
+        # split-graph mode needs the model at replay (eager head tail)
+        self.model = model if self.split_graph else None
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -212,6 +218,17 @@ class GraphRunner:
                         self.pw_map[bs] = cap.graphs
                     finally:
                         cache.suppress_inline_copy = False
+                elif self.split_graph:
+                    from freetoken.engine.split_graph import SplitGraphCapture
+
+                    cap = SplitGraphCapture(self.stream)
+                    cap.capture(
+                        bs,
+                        lambda: self.buffer.logits.__setitem__(
+                            slice(0, bs), model.forward()
+                        ),
+                    )
+                    self.split_map[bs] = cap
                 else:
                     graph = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(graph, pool=pool, stream=self.stream):
@@ -233,6 +250,28 @@ class GraphRunner:
         assert self.can_use_cuda_graph(batch)
         self.buffer.copy_from(batch)
         self.attn_backend.prepare_for_replay(batch)
+        if self.split_graph and batch.padded_size in self.split_map:
+            cap = self.split_map[batch.padded_size]
+            cap.graphs["near"].replay()
+            # eager seam: near tail -> pinned -> persistent dev1 buffers, and
+            # refresh the far graph's fixed metadata twins from this batch.
+            from freetoken.engine.layer_split import (
+                cross_seam_meta_replay,
+                cross_seam_replay,
+            )
+
+            cross_seam_meta_replay(batch)
+            cross_seam_replay()
+            cap.graphs["far"].replay()
+            # eager tail (outside graphs by design): far hidden -> head ->
+            # pinned crossing -> near logits buffer. The far trunk output is
+            # whatever tensor the far graph's norm wrote (kept alive in
+            # _SPLIT_DST); run the head exactly as CausalLM.forward does.
+            from freetoken.engine.layer_split import split_tail_forward
+
+            out = split_tail_forward(self.model, cap.far_output())
+            self.buffer.logits[: batch.size] = out
+            return self.buffer.logits[: batch.size]
         if self.piecewise:
             cache = self.moe_offload_cache
             segments = self.pw_map[batch.padded_size]
@@ -268,5 +307,6 @@ class GraphRunner:
         # caller / next capture (GraphRunner._capture_graphs already runs it).
         self.graph_map = {}
         self.pw_map = {}
+        self.split_map = {}
         self.buffer = None
         gc.collect()

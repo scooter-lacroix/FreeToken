@@ -141,15 +141,24 @@ class Qwen3_5Model(BaseOP):
             # the ambient (cuda:0) context; the FAR block runs inside an
             # explicit cuda:1 context so no interior call can reset it, then
             # restores cuda:0 for the final norm + lm_head.
-            from freetoken.engine.layer_split import dev1 as _dev1, _to_device_deep
+            from freetoken.engine.layer_split import (
+                dev1 as _dev1,
+                _to_device_deep,
+                split_capture_active,
+                split_capture_seam,
+            )
 
             layers = self.layers.op_list
             for i in range(sa):
                 x, residual = layers[i].forward(x, residual)
+                if split_capture_active() and i == sa - 1:
+                    split_capture_seam(sa)  # close NEAR segment (dev0 side)
                 if _taps and i in _taps:
                     _tap(x, i)
             with torch.cuda.device(_dev1()):
                 x, residual = cross_to_dev1(get_global_ctx().batch, x, residual)
+                if split_capture_active():
+                    split_capture_seam(sa)
                 for i in range(sa, len(layers)):
                     x, residual = layers[i].forward(x, residual)
                     if _taps and i in _taps:
@@ -174,6 +183,16 @@ class Qwen3_5Model(BaseOP):
         # replays never re-run Python, so a prefill clobber persists for the
         # whole request) and prefill widths could exceed the buffer, forcing a
         # rebind that orphans the captured copy_ targets.
+        if split_enabled():
+            from freetoken.engine.layer_split import (
+                split_capture_active,
+                split_capture_close,
+                split_capture_far_output,
+            )
+
+            if split_capture_active():
+                split_capture_far_output(xn)
+                split_capture_close()
         ctx = get_global_ctx()
         if not getattr(ctx.batch, "is_prefill", False):
             buf = getattr(self, "_trunk_prenorm_buf", None)

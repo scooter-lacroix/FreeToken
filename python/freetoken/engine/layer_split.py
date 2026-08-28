@@ -295,6 +295,166 @@ def _trace(msg: str) -> None:
         print(f"[split-trace] {msg}", flush=True)
 
 
+_SEAM_BUF_STATE: dict = {}
+_SPLIT_CAPTURE: dict = {"active": False, "ctx": None}
+
+
+def split_capture_active() -> bool:
+    """True while SplitGraphCapture walks the forward (see engine/graph.py)."""
+    return _SPLIT_CAPTURE["active"]
+
+
+def cross_seam_meta_replay(batch) -> None:
+    """Refresh the fixed dev1 metadata twins from the live (near) batch so the
+    far graph replays against current positions/KV indices."""
+    tw = _SPLIT_META.get("twins")
+    if not tw:
+        return
+    for attr, twin in tw.items():
+        val = getattr(batch, attr, None)
+        if val is not None:
+            _copy_dev1(val, twin)
+
+
+def cross_seam_replay() -> None:
+    """Replay-time seam: copy the near graph's OUTPUT hidden/residual into the
+    persistent dev1 seam buffers. The near graph writes its final hidden into
+    fixed near-side seam SOURCE buffers registered at capture (the same
+    tensors cross_to_dev1 read); here we just re-run the pinned two-hop."""
+    st = _SPLIT_SRC.get("x")
+    if st is None:
+        return
+    d1 = dev1()
+    pin_x = _pin_for("x", st.shape, st.dtype)
+    pin_x.copy_(st, non_blocking=False)
+    bufs = _seam_dev1_buffers(st.shape[0], st.shape[-1], st.dtype)
+    bufs["x"][: st.shape[0]].copy_(pin_x, non_blocking=False)
+    sr = _SPLIT_SRC.get("r")
+    if sr is not None:
+        pin_r = _pin_for("r", sr.shape, sr.dtype)
+        pin_r.copy_(sr, non_blocking=False)
+        bufs["r"][: sr.shape[0]].copy_(pin_r, non_blocking=False)
+
+
+_SPLIT_META: dict = {}
+
+
+def _copy_dev1(src, dst) -> None:
+    """Deep copy tensors/containers of tensors from any device into matching
+    fixed dev1 structures (recursive for dataclasses/dicts/lists/tuples)."""
+    import dataclasses as _dc
+
+    if torch.is_tensor(src):
+        if torch.is_tensor(dst):
+            dst.copy_(src.to(dst.device, non_blocking=False), non_blocking=False)
+        return
+    if _dc.is_dataclass(src) and not isinstance(src, type):
+        for f in _dc.fields(src):
+            _copy_dev1(getattr(src, f.name), getattr(dst, f.name))
+    elif isinstance(src, dict):
+        for k, v in src.items():
+            _copy_dev1(v, dst[k])
+    elif isinstance(src, (list, tuple)):
+        for a, b in zip(src, dst):
+            _copy_dev1(a, b)
+
+
+def _seam_meta_twins(batch) -> dict:
+    """Fixed dev1 mirrors of the far side's batch metadata (created once per
+    shape at capture; replays refresh via _copy_dev1)."""
+    import copy as _copy
+    import dataclasses as _dc
+
+    d1 = dev1()
+    if "twins" not in _SPLIT_META:
+        _SPLIT_META["twins"] = {}
+    tw = _SPLIT_META["twins"]
+    out = {}
+    for attr in ("out_loc", "positions", "attn_metadata", "fla_metadata"):
+        val = getattr(batch, attr, None)
+        if val is None:
+            continue
+        key = attr
+        if key not in tw:
+            tw[key] = _to_device_deep(_copy.deepcopy(val), d1)
+        out[attr] = tw[key]
+    return out
+
+
+_SPLIT_SRC: dict = {}
+
+
+def split_capture_far_output(t: torch.Tensor) -> None:
+    """Stash the far trunk's normed output during capture (called from
+    Qwen3_5Model.forward just before split_capture_close)."""
+    ctx = _SPLIT_CAPTURE["ctx"]
+    if ctx is not None:
+        ctx.set_far_output(t)
+
+
+def split_tail_forward(causal_lm, output):
+    """Eager per-replay tail: head under far ctx, pinned logits crossing to
+    near. Mirrors CausalLM.forward's split branch exactly."""
+    from freetoken.core import get_global_ctx
+
+    with torch.cuda.device(output.device):
+        logits = causal_lm.lm_head.forward(output)
+    near = get_global_ctx().batch.input_ids.device
+    pin = _pin_for(None, logits.shape, logits.dtype)
+    with torch.cuda.device(logits.device):
+        pin.copy_(logits, non_blocking=False)
+    return pin.to(near, non_blocking=False)
+
+
+def split_capture_close() -> None:
+    """Close the far segment at the end of Qwen3_5Model.forward (before
+    CausalLM's eager head + logits crossing), and restore the batch's
+    original near-side metadata attrs — the in-place twin swap must not
+    leak into the next walk's near layers."""
+    if not _SPLIT_CAPTURE["active"]:
+        return
+    ctx = _SPLIT_CAPTURE["ctx"]
+    if ctx is not None:
+        ctx._close_if_open()
+    batch = ctx._batch if ctx is not None else None
+    orig = _SPLIT_META.get("orig", {})
+    if batch is not None and orig:
+        for attr, val in orig.items():
+            setattr(batch, attr, val)
+        _SPLIT_META["orig"] = {}
+
+
+def split_capture_seam(layer_id: int) -> None:
+    """Close the current device segment and open the next one on the OTHER
+    device. Both ends call in: near end (after layer sa-1, still on dev0) and
+    far entry (post-crossing, on dev1). Between the two calls the eager seam
+    runs OUTSIDE any graph -- the pinned two-hop cannot be captured."""
+    if not _SPLIT_CAPTURE["active"]:
+        return
+    ctx = _SPLIT_CAPTURE["ctx"]
+    if ctx is not None:
+        ctx._at_seam(layer_id)
+
+
+def capture_seam_active() -> bool:
+    """True while a (future) far-side graph capture reads the seam buffers."""
+    return _SEAM_BUF_STATE.get("capture", False)
+
+
+def _seam_dev1_buffers(t: int, h: int, dtype) -> dict:
+    """Persistent cuda:1 landing buffers for the seam hidden/residual.
+
+    Grown once to the capture width; every decode step writes through a slice
+    so a far-side CUDA graph can be captured against the fixed storage."""
+    d1 = dev1()
+    cap_t = _SEAM_BUF_STATE.get("capacity", 0)
+    if cap_t < t:
+        _SEAM_BUF_STATE["x"] = torch.empty((t, h), dtype=dtype, device=d1)
+        _SEAM_BUF_STATE["r"] = torch.empty((t, h), dtype=dtype, device=d1)
+        _SEAM_BUF_STATE["capacity"] = t
+    return _SEAM_BUF_STATE
+
+
 def cross_to_dev1(batch, x: torch.Tensor, residual: torch.Tensor | None):
     """The seam: move the hidden stream and the far side's view of the batch
     metadata to cuda:1. Mutates ``batch`` in place (single forward in flight;
@@ -319,9 +479,32 @@ def cross_to_dev1(batch, x: torch.Tensor, residual: torch.Tensor | None):
         pin_r.copy_(residual, non_blocking=False)
     _trace("seam: pin D2H done, switching device + H2D")
     torch.cuda.set_device(d1)
-    x = pin_x.to(d1, non_blocking=False)
-    if pin_r is not None:
-        residual = pin_r.to(d1, non_blocking=False)
+    if capture_seam_active():
+        _SPLIT_SRC["x"] = x
+        _SPLIT_SRC["r"] = residual
+        # metadata twins: the far graph's captured reads must land on FIXED
+        # dev1 storage; replay re-fills them from the near capture buffer.
+        tw = _seam_meta_twins(batch)
+        for k, twin in tw.items():
+            val = getattr(batch, k, None)
+            if val is not None:
+                _copy_dev1(val, twin)
+    if capture_seam_active():
+        # Graph-capture mode: the far graph was captured reading FIXED dev1
+        # seam buffers -- landing the H2D into fresh tensors would rebind x
+        # and freeze the captured channel. Write through the persistent
+        # buffers instead (grow-only, exactly like the near-side graph
+        # buffers; bs<=captured width reuses the same storage).
+        bufs = _seam_dev1_buffers(x.shape[0], x.shape[-1], x.dtype)
+        bufs["x"][: x.shape[0]].copy_(pin_x, non_blocking=False)
+        x = bufs["x"][: x.shape[0]]
+        if pin_r is not None:
+            bufs["r"][: residual.shape[0]].copy_(pin_r, non_blocking=False)
+            residual = bufs["r"][: residual.shape[0]]
+    else:
+        x = pin_x.to(d1, non_blocking=False)
+        if pin_r is not None:
+            residual = pin_r.to(d1, non_blocking=False)
     _trace("seam: x/resident on far side; crossing metadata attrs")
     # input_ids is deliberately NOT crossed: the embedding ran near-side, no
     # far consumer exists, and CausalLM.forward keys its logits-crossing
@@ -331,6 +514,14 @@ def cross_to_dev1(batch, x: torch.Tensor, residual: torch.Tensor | None):
     for attr in ("out_loc", "positions", "attn_metadata", "fla_metadata"):
         val = getattr(batch, attr, None)
         if val is not None:
+            if capture_seam_active():
+                twin = _seam_meta_twins(batch).get(attr)
+                if twin is not None:
+                    _SPLIT_META.setdefault("orig", {})[attr] = val
+                    _SPLIT_CAPTURE["ctx"].bind_batch(batch)
+                    setattr(batch, attr, twin)
+                    _trace(f"seam: {attr} -> dev1 twin (capture)")
+                    continue
             _trace(f"seam: crossing {attr}")
             try:
                 setattr(batch, attr, _to_device_deep(val, d1))
@@ -529,7 +720,17 @@ class SplitMHAKVCache:
     def store_kv(self, k, v, out_loc, layer_id: int) -> None:
         sub = self._for_layer(layer_id)
         if torch.is_tensor(out_loc) and out_loc.device != sub.device:
-            out_loc = out_loc.to(sub.device, non_blocking=True)
+            if os.environ.get("FREETOKEN_SPLIT_TRACE", ""):
+                print(
+                    f"[split-trace] store_kv cross: out_loc={out_loc.device} "
+                    f"sub={sub.device} layer={layer_id}",
+                    flush=True,
+                )
+            # cross-device index move must be capture-safe: async .to() on
+            # the legacy stream inside a capture violates HIP stream rules
+            # (hipErrorStreamCaptureImplicit). Route through the pinned
+            # staging path — small ints, blocking copies are ~10us.
+            out_loc = _stage_cross(out_loc, sub.device, tag="outloc")
         sub.store_kv(k, v, out_loc, layer_id)
 
     def rebuild(self, num_pages: int) -> None:
