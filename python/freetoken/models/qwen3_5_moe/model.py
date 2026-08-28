@@ -87,6 +87,31 @@ class Qwen3_5Model(BaseOP):
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def forward_far_eager(self, batch):
+        """S2c discriminator: run ONLY the far portion eagerly (used when the
+        near segment is graph-replayed but the far graph is under test)."""
+        from freetoken.engine.layer_split import (
+            dev1 as _dev1,
+            _SPLIT_SRC,
+            _seam_meta_twins,
+        )
+
+        # split_capture_close restored batch attrs to dev0 originals; the
+        # eager far tail needs the dev1 twins again (same as capture-time).
+        for attr, twin in _seam_meta_twins(batch).items():
+            setattr(batch, attr, twin)
+        # _SPLIT_SRC holds the NEAR-side (cuda:0) tail output — move to dev1.
+        x = _SPLIT_SRC["x"].to(_dev1(), non_blocking=False)
+        residual = _SPLIT_SRC.get("r")
+        if residual is not None:
+            residual = residual.to(_dev1(), non_blocking=False)
+        layers = self.layers.op_list
+        sa = 56
+        with torch.cuda.device(_dev1()):
+            for i in range(sa, len(layers)):
+                x, residual = layers[i].forward(x, residual)
+            xn, rn = self.norm.forward_add_residual(x, residual)
+        return xn
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens.forward(input_ids)
         residual: torch.Tensor | None = None
@@ -288,6 +313,7 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             else:
                 ctx.trunk_hidden = output  # oversized eager decode
         return self._s3d_maybe_flush(ctx, self.lm_head.forward(output))
+
 
     def _ensure_live_dflash(self):
         pr = getattr(self, "_live_dflash_obj", None)

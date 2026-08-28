@@ -337,6 +337,11 @@ def cross_seam_replay() -> None:
     st = _SPLIT_SRC.get("x")
     if st is None:
         return
+    import os as _os
+
+    if _os.environ.get("FREETOKEN_SPLIT_TRACE"):
+        h = hash(st[:, :16].float().cpu().numpy().tobytes()) & 0xFFFFFF
+        print(f"[seam-replay] src_hash={h:06x} row0[:4]={st[0,:4].tolist()}", flush=True)
     d1 = dev1()
     pin_x = _pin_for("x", st.shape, st.dtype)
     pin_x.copy_(st, non_blocking=False)

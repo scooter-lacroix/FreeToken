@@ -266,7 +266,24 @@ class GraphRunner:
 
             cross_seam_meta_replay(batch)
             cross_seam_replay()
+            import os as _ose
+
+            if _ose.environ.get("FREETOKEN_SPLIT_FAR_EAGER", "0") in {"1", "true", "yes"}:
+                out_dev1 = self.model.model.forward_far_eager(batch)
+                from freetoken.engine.layer_split import split_tail_forward
+
+                self.buffer.logits[: batch.size] = split_tail_forward(
+                    self.model, out_dev1
+                )
+                return self.buffer.logits[: batch.size]
             cap.graphs["far"].replay()
+            import os as _os
+
+            if _os.environ.get("FREETOKEN_SPLIT_TRACE"):
+                fo = cap.far_output()
+                if fo is not None:
+                    fh = hash(fo[:1, :16].float().cpu().numpy().tobytes()) & 0xFFFFFF
+                    print(f"[seam-replay] far_out_hash={fh:06x}", flush=True)
             # eager tail (outside graphs by design): far hidden -> head ->
             # pinned crossing -> near logits buffer. The far trunk output is
             # whatever tensor the far graph's norm wrote (kept alive in

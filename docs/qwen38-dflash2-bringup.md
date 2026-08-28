@@ -413,3 +413,23 @@ exception path OR scheduler receive loop, one boot, read the answer. Then
 fix + verify graph replay + depth ladder (target: base 25-29 tok/s).
 Do NOT spin a serve process at 100% CPU again — kill within one probe cycle
 (user hard rule).
+
+## S2c discriminator result (2026-08-28, ridge50-55)
+
+DECISIVE: far-eager tail fed from the NEAR GRAPH's replay output ALSO
+produces degenerate text ("#" repetition) — while seam hashes prove the near
+output CHANGES every step. Conclusion: the NEAR graph replays produce
+plausible-but-wrong hiddens. The near segment's capture is missing /
+mishandling some kernel family's work: prime suspect is a launch-stream
+mismatch (a kernel inside near layers — ggml ext GEMV/GEMM, fla chunk
+kernels, or causal_conv1d — issuing on a non-captured stream, so manual
+capture_begin on stream0 misses it; eager mode unaffected). torch.cuda.graph
+ctx wrapper handles cross-stream capture bookkeeping that raw
+capture_begin/capture_end does not — next session: capture the near segment
+via the torch.cuda.graph ctx manager (stream=self.stream0) and move the
+seam hooks to call capture_seam (piecewise.py) which is proven under that
+wrapper, rather than raw begin/end in SplitGraphCapture.
+
+Also verified this round: the earlier "spin" no longer reproduces with the
+spin-diag commit (replay ran, 3.1s/80tok = ~26 tok/s class decode at tiny
+context — the graphs DO execute fast); correctness is the only gap.
