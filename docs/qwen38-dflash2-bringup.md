@@ -433,3 +433,27 @@ wrapper, rather than raw begin/end in SplitGraphCapture.
 Also verified this round: the earlier "spin" no longer reproduces with the
 spin-diag commit (replay ran, 3.1s/80tok = ~26 tok/s class decode at tiny
 context — the graphs DO execute fast); correctness is the only gap.
+
+## S2c wrapper-capture ladder (2026-08-28, ridge56-61)
+
+Wrapper (torch.cuda.graph ctx) ladder results:
+- ridge57: far on dev1 default stream → "must be non-default" → fixed with
+  explicit stream=stream1 + stream ctx entered for the segment
+- ridge59: near open/close both on stream0 ✓ (with-block) — wrapper's
+  __exit__ calls torch.cuda.synchronize() which is ILLEGAL while the OTHER
+  device's capture is open → replaced wrapper __exit__ with direct
+  current.capture_end() (stream ctx exit after)
+- ridge61: far capture_end still fails with async StreamCaptureUnsupported
+  surfacing at end → an illegal op INSIDE the far segment is being
+  async-flagged. Far layer inventory: FarSideLinear (triton kq_gemv), FarHead,
+  GDN fla kernels, far pool store_kv/gather, conv1d, far attention reading
+  metadata TWINS (dev1 ✓). Remaining suspects: (1) triton backend's ctx
+  (TritonAttentionBackend built with device=dev0) touching dev0 scratch
+  inside far attention; (2) ctx.page_table (dev0) read by far attention path;
+  (3) fla build_fla_metadata creating a dev0 tensor from a batch attr not in
+  the twin set (e.g. reading batch.input_ids? NOT crossed deliberately!).
+
+NEXT SESSION: enumerate every tensor the far segment reads (grep far-layer
+forward paths for ctx./batch. accessors), add each to the twin set, retry.
+If all twins covered and still failing, hook HIP stream ops via
+AMD_SERIALIZE_KERNEL=3 + CUDA_LOG_FILE to name the op.
