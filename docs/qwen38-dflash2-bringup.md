@@ -457,3 +457,54 @@ NEXT SESSION: enumerate every tensor the far segment reads (grep far-layer
 forward paths for ctx./batch. accessors), add each to the twin set, retry.
 If all twins covered and still failing, hook HIP stream ops via
 AMD_SERIALIZE_KERNEL=3 + CUDA_LOG_FILE to name the op.
+
+## 2026-08-29: first-request stall class SOLVED (warmup + prefetch, 4bfafb9)
+
+**Forensics trail.** The "416.6s for a greeting" session, the 4m23s prefill->decode
+gap, and the 8.5k no-decode repro all decomposed into TWO stacked causes — plus one
+phantom:
+
+- **Phantom**: the "final-chunk -> decode transition failure" was never real. The
+  tail-chunk Req passes `can_decode` (log's `#running-req: 1` on the *previous*
+  chunk's report proves it) and is then legitimately finished by `hit_eos` on its
+  first sampled token: the model argmaxes `<|im_end|>` on degenerate repeated-pangram
+  raw prompts at >=~140 tokens. Natural prose continues perfectly (`Margaret's novel
+  was a paperback copy of The Little Prince...`). Synthetic-prompt artifact.
+- **Cause 1 — cold Triton autotune**: fla `chunk_fwd`/`chunk_delta_h` autotune keys
+  include BC (chunk count), so every novel extend length sweeps whole config grids
+  *inside the request's forward*. Measured first hits: 46s (T=575), 70s (266), 129s
+  (255), 270s (505). Identical replays 3-6s (`cache_results=True` persists winners).
+  The pre-existing engine warmup covered only [80,128,256,512,1024] — no ±1
+  shoulders, no decode step, no depth buckets.
+- **Cause 2 — page-cache eviction of the mmap'd expert banks** (checkpoint on the
+  shared HDD): the raw-socket stall sentinel caught a 135.5s probe while the worker
+  faulted **81MB at 0.6MB/s** behind concurrent desktop IO. Stalls correlate with
+  the user's disk activity, not idle time / shapes / client stack. Depth walks ran
+  disk-bound (~250 tok/s) vs ~2000+ page-cache-warm.
+
+**Fixes (all in 4bfafb9, verified on ridge67).**
+- `Scheduler._prefill_warmup` (launch.py calls it BEFORE the ready ack): 33-class
+  extend ladder (1..16, 2^k ±1, max_extend) each +1 decode step, then a chunked
+  depth walk to serving depth — through the real request path. Env:
+  `FREETOKEN_PREFILL_WARMUP=1`, `FREETOKEN_WARMUP_MAX_DEPTH`.
+- `utils/prefetch.py`: `posix_fadvise(WILLNEED)` the whole checkpoint at boot +
+  `KeepResident` re-advises every 120s (`FREETOKEN_PREFETCH_MODEL`,
+  `FREETOKEN_KEEP_RESIDENT_S`). No steady-state disk cost.
+- `scripts/stall_sentinel.py`: 45s raw-socket probes with api/worker read_bytes
+  deltas; >10s responses snapshot per-thread state+wchan+io (py-spy is
+  ptrace_scope-blocked). This is what caught cause 2.
+- Results: x14 503s->12.5s(cache filling)->~3s; x13 46->3.0; para 70->2.5; 8.5k
+  prompt end-to-end 11.4s (~750 tok/s wall incl. queue+detok); engine warmup
+  230->13s on second boot; depth walk 280->149s.
+
+**Parked: >=~50k-context HSA hardware exception.** ridge65's full-depth (73728)
+warmup walk crashed the worker at KV usage 0.68 (~52k) with
+`HSA_STATUS_ERROR_EXCEPTION` — no Python traceback (async fault). 40960 walks
+clean (ridge66/67). No traffic has ever exceeded ~40k, so this is a *new* latent
+bug on the path to the 72k target, not a regression. Next: diagnostic boot with
+`AMD_SERIALIZE_KERNEL=3` + full-depth walk to name the faulting kernel; suspects
+are the fla deep-BC grids or an autotune config that OOBs at deep context.
+
+**New host trap**: an exported `PYTHONPATH` with a trailing empty entry breaks
+uv-venv prefix detection (`sys.prefix` resolves to the base interpreter, venv
+site-packages vanishes). `env -u PYTHONPATH` for every venv-python invocation.
