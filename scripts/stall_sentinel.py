@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
-"""Stall sentinel: catch the intermittent first-request-after-idle stall in the act.
+"""Stall sentinel — passive by default: NEVER generates requests.
 
-Context (2026-08-29 forensics): occasional 46-503s delays between an HTTP
-completion POST and its scheduler Prefill batch. Never reproduced on demand;
-during stalls the scheduler shows no spin (no [sched-diag]), no CPU pin, and
-only ~12MB of worker disk reads. Raw-socket and curl probes were always fast,
-python-urllib sometimes slow -- but the stall also preceded real traffic
-(maestro 416.6s session), so it is server-relevant either way.
+Contract (user-directed, 2026-08-29): FreeToken must be silent when idle.
+Generating probe traffic keeps the server permanently "active" (it would hold
+residency pins forever and mask real idle behavior), so passive log-watching
+is the default; the request-probe mode from the original forensics is opt-in
+via --active.
 
-This watcher fires a tiny radix-cacheable completion every interval via a RAW
-socket (pure pipeline latency, no python-http client stack) and, on any
-response slower than the threshold, snapshots the API + scheduler-worker
-processes' per-thread syscall/wchan/CPU state to a timestamped file -- the
-kernel-level evidence py-spy cannot get here (ptrace_scope=1).
+Passive mode tails the server log and flags stalls: a Prefill/Decode batch
+in flight (queue or running > 0) whose NEXT batch line is >THRESHOLD seconds
+away. Active mode additionally fires a raw-socket completion every --interval
+and snapshots per-thread state + io deltas on any response over threshold
+(the evidence py-spy cannot get at ptrace_scope=1).
 
-Run: nohup python3 scripts/stall_sentinel.py >/dev/null 2>&1 &
-Stop: kill $(cat /tmp/freetoken-stall-sentinel.pid)
+Run:   nohup python3 scripts/stall_sentinel.py --log logs/<server>.log >/dev/null 2>&1 &
+Probe: python3 scripts/stall_sentinel.py --active --interval 45
+Stop:  kill $(cat /tmp/freetoken-stall-sentinel.pid)
 """
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 import time
 
 HOST, PORT = "127.0.0.1", 1919
-INTERVAL_S = 45.0
 STALL_THRESHOLD_S = 10.0
-OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "logs", "stall-sentinel")
+OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "stall-sentinel")
 PID_FILE = "/tmp/freetoken-stall-sentinel.pid"
-# fixed prompt -> radix-cached after the first probe -> measures pipeline latency
-PROMPT = "Sentinel pipeline heartbeat probe. "
+PROMPT = "Sentinel pipeline heartbeat probe. "  # radix-cacheable, tiny
 MODEL = "Qwen3.8-27B-Ridge-3.7bpw.gguf"
+BATCH_RE = re.compile(r"Prefill batch|Decode batch|#running-req: (\d+), #queue-req: (\d+)")
 
 
 def _pids():
@@ -45,40 +45,13 @@ def _pids():
     return api, worker
 
 
-def _snapshot(reason, elapsed):
-    os.makedirs(OUT_DIR, exist_ok=True)
-    path = os.path.join(OUT_DIR, f"stall-{time.strftime('%H%M%S')}-{reason}.txt")
-    api, worker = _pids()
-    with open(path, "w") as f:
-        f.write(f"stall: {elapsed:.1f}s ({reason}) at {time.ctime()}\n")
-        for name, pid in (("api", api), ("worker", worker)):
-            if not pid:
-                continue
-            f.write(f"\n===== {name} pid={pid} cpu={_cpu(pid)} =====\n")
-            for t in sorted(os.listdir(f"/proc/{pid}/task")):
-                try:
-                    comm = open(f"/proc/{pid}/task/{t}/comm").read().strip()
-                    state = open(f"/proc/{pid}/task/{t}/stat").read().split(") ", 1)[1].split()[0]
-                    wchan = open(f"/proc/{pid}/task/{t}/wchan").read().strip()
-                    f.write(f"  {t} {comm}: {state} {wchan}\n")
-                except OSError:
-                    pass
-            try:
-                io = open(f"/proc/{pid}/io").read()
-                f.write("io:\n" + io)
-            except OSError:
-                pass
-    return path
-
-
 def _io(pid):
     try:
-        d = {}
-        for line in open(f"/proc/{pid}/io"):
-            k, v = line.split(":", 1)
-            if k in ("read_bytes", "write_bytes", "rchar"):
-                d[k] = int(v.strip())
-        return d
+        return {
+            k: int(v)
+            for k, v in (line.split(":", 1) for line in open(f"/proc/{pid}/io"))
+            if k in ("read_bytes", "write_bytes", "rchar")
+        }
     except OSError:
         return {}
 
@@ -90,6 +63,37 @@ def _cpu(pid):
         ).stdout.strip()
     except Exception:
         return "?"
+
+
+def snapshot(reason, elapsed, extra=""):
+    os.makedirs(OUT_DIR, exist_ok=True)
+    path = os.path.join(OUT_DIR, f"stall-{time.strftime('%H%M%S')}-{reason}.txt")
+    api, worker = _pids()
+    with open(path, "w") as f:
+        f.write(f"stall: {elapsed:.1f}s ({reason}) at {time.ctime()} {extra}\n")
+        for name, pid in (("api", api), ("worker", worker)):
+            if not pid:
+                continue
+            f.write(f"\n===== {name} pid={pid} cpu={_cpu(pid)} =====\n")
+            try:
+                for line in open(f"/proc/{pid}/status"):
+                    if line.startswith(("VmLck", "VmRSS")):
+                        f.write(line)
+            except OSError:
+                pass
+            for t in sorted(os.listdir(f"/proc/{pid}/task")):
+                try:
+                    comm = open(f"/proc/{pid}/task/{t}/comm").read().strip()
+                    state = open(f"/proc/{pid}/task/{t}/stat").read().split(") ", 1)[1].split()[0]
+                    wchan = open(f"/proc/{pid}/task/{t}/wchan").read().strip()
+                    f.write(f"  {t} {comm}: {state} {wchan}\n")
+                except OSError:
+                    pass
+            try:
+                f.write("io:\n" + open(f"/proc/{pid}/io").read())
+            except OSError:
+                pass
+    return path
 
 
 def probe():
@@ -116,11 +120,7 @@ def probe():
     return time.time() - t0, b"200" in buf.split(b"\r\n")[0]
 
 
-def main():
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
-    print(f"sentinel up (every {INTERVAL_S}s, threshold {STALL_THRESHOLD_S}s)", flush=True)
-    prev = {}
+def run_active(interval):
     while True:
         try:
             api, worker = _pids()
@@ -128,19 +128,71 @@ def main():
             elapsed, ok = probe()
             io1 = {n: _io(p) for n, p in (("api", api), ("worker", worker)) if p}
             now = time.strftime("%H:%M:%S")
-            delta = {
-                n: (io1[n].get("read_bytes", 0) - io0[n].get("read_bytes", 0)) // (1 << 20)
+            delta = " ".join(
+                f"{n}_rd={(io1[n].get('read_bytes', 0) - io0[n].get('read_bytes', 0)) >> 20}MB"
                 for n in io0
-            }
-            tag = " ".join(f"{n}_rd={v}MB" for n, v in delta.items())
+            )
             if elapsed > STALL_THRESHOLD_S or not ok:
-                p = _snapshot(f"{elapsed:.0f}s-ok{ok}", elapsed)
-                print(f"[{now}] STALL {elapsed:.1f}s ok={ok} {tag} -> {p}", flush=True)
+                p = snapshot(f"{elapsed:.0f}s-ok{ok}", elapsed)
+                print(f"[{now}] STALL {elapsed:.1f}s ok={ok} {delta} -> {p}", flush=True)
             else:
-                print(f"[{now}] {elapsed:.2f}s {tag}", flush=True)
+                print(f"[{now}] {elapsed:.2f}s {delta}", flush=True)
         except Exception as e:
             print(f"[{time.strftime('%H:%M:%S')}] probe error: {e!r}", flush=True)
-        time.sleep(INTERVAL_S)
+        time.sleep(interval)
+
+
+def run_passive(log_path, threshold):
+    """Tail the server log; flag in-flight requests whose batch lines gap out."""
+    print(f"passive sentinel: watching {log_path} (gap >{threshold}s while in flight)",
+          flush=True)
+    fh = open(log_path, "r", errors="replace")
+    fh.seek(0, os.SEEK_END)
+    inflight_since = None  # time of the last batch line that showed work in flight
+    while True:
+        line = fh.readline()
+        if not line:
+            time.sleep(2.0)
+            if inflight_since is not None and time.time() - inflight_since > threshold:
+                p = snapshot(f"passive-{threshold:.0f}s-gap", time.time() - inflight_since,
+                             extra=f"log={log_path}")
+                print(f"[{time.strftime('%H:%M:%S')}] PASSIVE STALL: in-flight batch "
+                      f"silent >{threshold}s -> {p}", flush=True)
+                inflight_since = time.time()  # re-arm: one alert per gap
+            continue
+        m = BATCH_RE.search(line)
+        if not m:
+            continue
+        running = int(m.group(1) or 0)
+        queued = int(m.group(2) or 0)
+        if running > 0 or queued > 0:
+            if inflight_since is not None and time.time() - inflight_since > threshold:
+                p = snapshot(f"passive-{threshold:.0f}s-gap", time.time() - inflight_since,
+                             extra=f"log={log_path}")
+                print(f"[{time.strftime('%H:%M:%S')}] PASSIVE STALL: gap between "
+                      f"in-flight batch lines >{threshold}s -> {p}", flush=True)
+            inflight_since = time.time()
+        else:
+            inflight_since = None
+
+
+def main():
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+    if "--active" in sys.argv:
+        interval = (float(sys.argv[sys.argv.index("--interval") + 1])
+                    if "--interval" in sys.argv else 45.0)
+        print(f"ACTIVE sentinel: probe every {interval}s (generates traffic!)", flush=True)
+        run_active(interval)
+    else:
+        log_path = (sys.argv[sys.argv.index("--log") + 1]
+                    if "--log" in sys.argv else None)
+        threshold = (float(sys.argv[sys.argv.index("--threshold") + 1])
+                     if "--threshold" in sys.argv else 60.0)
+        if not log_path:
+            print("passive mode needs --log <server.log>", flush=True)
+            sys.exit(2)
+        run_passive(log_path, threshold)
 
 
 if __name__ == "__main__":

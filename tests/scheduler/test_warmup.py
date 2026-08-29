@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import time
+
 import pytest
 
 from freetoken.scheduler.warmup import (
@@ -117,23 +119,77 @@ def test_scheduler_warmup_failure_is_contained(monkeypatch):
     assert calls["submit"] == 1
 
 
-def test_prefetch_env_gate_and_best_effort(monkeypatch, tmp_path):
-    from freetoken.utils import prefetch
+def test_staging_serves_from_ssd_copy(monkeypatch, tmp_path):
+    from freetoken.utils import residency
 
-    monkeypatch.setenv("FREETOKEN_PREFETCH_MODEL", "0")
-    assert prefetch.prefetch_enabled() is False
-    assert prefetch.start_prefetch("/nonexistent/model.gguf") is None
+    origin = tmp_path / "origin" / "tiny.gguf"
+    origin.parent.mkdir()
+    origin.write_bytes(b"x" * 8192)
+    stage_dir = tmp_path / "stage"
+    monkeypatch.setenv("FREETOKEN_STAGING_DIR", str(stage_dir))
 
-    monkeypatch.setenv("FREETOKEN_PREFETCH_MODEL", "1")
-    assert prefetch.prefetch_enabled() is True
-    # missing file: best-effort, logs and returns without raising
+    # first call provisions the copy and serves from it
+    served = residency.resolve_staged_model(str(origin))
+    assert served == str(stage_dir / "tiny.gguf")
+    assert (stage_dir / "tiny.gguf").stat().st_size == 8192
+    assert not (stage_dir / "tiny.gguf.part").exists()  # atomic rename, no temp litter
+    # second call sees a fresh copy (size+mtime match) and skips the recopy
+    assert residency.resolve_staged_model(str(origin)) == served
+
+    # drift (size change) triggers a refresh
+    origin.write_bytes(b"y" * 4096)
+    assert residency.resolve_staged_model(str(origin)) == served
+    assert (stage_dir / "tiny.gguf").stat().st_size == 4096
+
+
+def test_staging_falls_back_to_origin(monkeypatch, tmp_path):
+    from freetoken.utils import residency
+
+    monkeypatch.setenv("FREETOKEN_SSD_STAGING", "0")
+    assert residency.resolve_staged_model("/nonexistent/m.gguf") == "/nonexistent/m.gguf"
+    monkeypatch.setenv("FREETOKEN_SSD_STAGING", "1")
+    monkeypatch.setenv("FREETOKEN_STAGING_DIR", str(tmp_path / "nope"))
+    # unreadable origin: staging must never raise
+    assert residency.resolve_staged_model("/nonexistent/m.gguf") == "/nonexistent/m.gguf"
+
+
+def test_residency_pin_unpin_and_idle_release(monkeypatch, tmp_path):
+    import mmap as _mmap
+
+    from freetoken.utils import residency
+
     f = tmp_path / "tiny.gguf"
-    f.write_bytes(b"x" * 4096)
-    size = prefetch.prefetch_model_file(str(f))
-    assert size == 4096
-    monkeypatch.setenv("FREETOKEN_KEEP_RESIDENT_S", "0")
-    keeper = prefetch.start_prefetch(str(f))
-    assert keeper is not None
-    keeper.stop()
-    keeper.join(timeout=2)
-    assert not keeper.is_alive()
+    f.write_bytes(b"z" * (1 << 20))
+    # the mapping must stay open for the thread phase: pinning works on the
+    # ranges /proc/self/maps reports for THIS process (the server keeps its
+    # GGUF mapped for the process lifetime; the test mirrors that here).
+    fh = open(f, "r+b")
+    mm = _mmap.mmap(fh.fileno(), 0)
+    try:
+        ranges = residency.mapping_ranges(str(f))
+        assert ranges, "test mapping must appear in /proc/self/maps"
+        assert residency.pin_model(str(f)) >= mm.size()
+        assert residency.unpin_model(str(f)) >= mm.size()
+
+        # the activity loop: pins while activity_fn is true, releases after grace
+        flag = {"active": False}
+        res = residency.ActivityResidency(
+            str(f), lambda: flag["active"], grace_s=0.2,
+            poll_active_s=0.1, poll_idle_s=0.1,
+        )
+        res.start()
+        flag["active"] = True
+        deadline = time.monotonic() + 5
+        while not res._pinned and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert res._pinned, "residency must pin while active"
+        flag["active"] = False
+        deadline = time.monotonic() + 5
+        while res._pinned and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not res._pinned, "residency must release after the idle grace"
+        res.stop()
+        res.join(timeout=2)
+    finally:
+        mm.close()
+        fh.close()

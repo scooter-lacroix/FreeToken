@@ -84,6 +84,17 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             lambda desc, done, total: ack_queue.put(("progress", desc, done, total))
         )
 
+    # Serve from the SSD-staged copy when one can be provisioned now: one
+    # boot-time sequential copy BEFORE the model maps it, so the worker's
+    # mapping (and therefore page pinning) lives on the SSD and refills never
+    # touch the spinning origin. Residency (pin while serving, release when
+    # idle) starts right after, still before the ready ack.
+    from freetoken.utils.residency import resolve_staged_model, start_residency
+
+    # ServerArgs is frozen; the args.py tool-parser sniff sets the precedent
+    # for object.__setattr__ here.
+    object.__setattr__(args, "model_path", resolve_staged_model(args.model_path))
+
     with torch.inference_mode():
         try:
             scheduler = Scheduler(args)
@@ -102,17 +113,15 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
             # them (and the desktop's slider bounds) by the time the gate flips. Optional +
             # best-effort: a failure here must never keep the model from serving, and older
             # consumers ignore ("meta", …).
-            # Page-cache the checkpoint BEFORE the warmup walks it: the warmup's
-            # chunked prefill reads the expert banks off disk when cold, and so does
-            # the first real request. Prefetch + keep-resident make both page-cache
-            # hits (2026-08-29: probe stalled 135s faulting 81MB behind desktop IO).
-            from freetoken.utils.prefetch import start_prefetch
-
-            start_prefetch(args.model_path)
             # Warm the prefill/decode Triton specialization space BEFORE the ready ack:
             # a first-hit extend length or KV-depth bucket would otherwise sweep whole
             # autotune grids inside a live request's forward (measured 70-270s stalls).
             # Self-contained: logs, reports progress, and never raises on failure.
+            start_residency(
+                args.model_path,
+                activity_fn=lambda: scheduler.prefill_manager.runnable
+                or scheduler.decode_manager.runnable,
+            )
             scheduler._prefill_warmup()
             try:
                 from freetoken.kvcache.cache_status import compute_cache_status_meta
