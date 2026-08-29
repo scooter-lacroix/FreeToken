@@ -66,8 +66,11 @@ def _warmup_scheduler_shell(monkeypatch, enabled: str, fail: bool = False):
     monkeypatch.setenv("FREETOKEN_PREFILL_WARMUP", enabled)
     calls = {"submit": 0, "loop": 0}
 
+    calls["lengths"] = []
+
     def fake_submit(uid, n_tokens):
         calls["submit"] += 1
+        calls["lengths"].append(n_tokens)
         if fail:
             raise RuntimeError("synthetic warmup failure")
 
@@ -193,3 +196,25 @@ def test_residency_pin_unpin_and_idle_release(monkeypatch, tmp_path):
     finally:
         mm.close()
         fh.close()
+
+
+def test_warmup_walk_respects_seq_len_boundary(monkeypatch):
+    """The walk ends with 2 decode steps; a request decoded AT position
+    max_seq_len indexes one past max_seq_len-sized buffers (rope cache) and
+    faults the GPU with an async HSA exception. Warmup requests bypass the
+    admission guard, so the walk length itself must carry the headroom."""
+    sched, calls = _warmup_scheduler_shell(monkeypatch, enabled="1")
+    monkeypatch.setenv("FREETOKEN_WARMUP_MAX_DEPTH", "73728")
+    sched._prefill_warmup()
+    walk_len = max(calls["lengths"])
+    assert walk_len <= sched.engine.max_seq_len - 4
+    # env asks for more than the cap allows -> clamped
+    assert walk_len == sched.engine.max_seq_len - 4
+
+
+def test_warmup_walk_clamped_when_env_below_cap(monkeypatch):
+    sched, calls = _warmup_scheduler_shell(monkeypatch, enabled="1")
+    monkeypatch.setenv("FREETOKEN_WARMUP_MAX_DEPTH", "40960")
+    sched._prefill_warmup()
+    walk_len = max(calls["lengths"])
+    assert walk_len == 40960

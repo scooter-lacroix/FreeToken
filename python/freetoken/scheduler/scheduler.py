@@ -387,8 +387,19 @@ class Scheduler(SchedulerIOMixin):
         if not warmup_enabled():
             return
         max_extend = self.config.max_extend_tokens
-        depth = warmup_depth(getattr(self.engine, "max_seq_len", 0))
+        # Warmup requests bypass the admission guard (they enter via add_one_req,
+        # not the guarded _process_one_msg path), so THEY must enforce the
+        # sequence-length boundary themselves: the walk ends with 2 decode steps,
+        # and decoding at position == max_seq_len indexes one past every
+        # max_seq_len-sized buffer (rope cache, positions) -> async HSA 0x1016
+        # hardware exception with no kernel attribution. Real traffic is safe —
+        # the guard clamps max_tokens — this is warmup-only.
+        seq_cap = int(getattr(self.engine, "max_seq_len", 0) or 0)
+        depth = warmup_depth(seq_cap)
+        if seq_cap:
+            depth = min(depth, seq_cap - 4)
         t_all = _time.perf_counter()
+        drained_all = True
         try:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
@@ -417,10 +428,22 @@ class Scheduler(SchedulerIOMixin):
                     self._run_warmup_loop(
                         max_iters=expected + 64, desc="compiling deep-context kernels"
                     )
-                    logger.info_rank0(
-                        f"prefill warmup: depth walk to {depth} tokens done in "
-                        f"{_time.perf_counter() - t0:.1f}s"
-                    )
+                    if self.prefill_manager.runnable or self.decode_manager.runnable:
+                        drained_all = False
+                        logger.critical_rank0(
+                            "prefill warmup: depth walk did NOT drain (admission or "
+                            "scheduling stuck); warmup requests discarded"
+                        )
+                        self.prefill_manager.pending_list.clear()
+                        self.decode_manager.running_reqs = {
+                            r for r in self.decode_manager.running_reqs
+                            if r.uid < self.WARMUP_UID_BASE
+                        }
+                    else:
+                        logger.info_rank0(
+                            f"prefill warmup: depth walk to {depth} tokens done in "
+                            f"{_time.perf_counter() - t0:.1f}s"
+                        )
         except Exception:
             import traceback
 
@@ -434,8 +457,9 @@ class Scheduler(SchedulerIOMixin):
                 if r.uid < self.WARMUP_UID_BASE
             }
         else:
+            state = "complete" if drained_all else "INCOMPLETE (see critical above)"
             logger.info_rank0(
-                f"prefill warmup complete in {_time.perf_counter() - t_all:.1f}s "
+                f"prefill warmup {state} in {_time.perf_counter() - t_all:.1f}s "
                 "(triton autotune cache warm; first requests will not stall)"
             )
 
