@@ -525,3 +525,18 @@ Final design per user contract — aggressive while serving, silent when idle:
 - Numbers, pinned+SSD: 8.5k cold 13.8s (~615 tok/s true compute; 280 was disk
   contention interleaved), cached re-serve 3.3s. Remaining TTFT lever for very
   deep prompts is pure compute (FIX 2) + the parked >=50k HSA fault.
+
+## 2026-08-29 (diag): >=50k HSA fault REPRODUCED deterministically; attribution next
+
+`scripts/hsa_deep_diag.sh 73728` (AMD_SERIALIZE_KERNEL=3 + HSA_ENABLE_ASSERTS=1):
+crash at KV usage **0.68-0.69 (~52k)** — matches ridge65's 0.68. Facts:
+- HSA_STATUS_ERROR_EXCEPTION 0x1016 (HSAIL op -> hw exception), async queue abort;
+  serialized launches did NOT name the kernel, dmesg clean (user-mode queue
+  exception, not a driver page fault).
+- Walk ran 170-184 tok/s under serialization; crash ~10 min into boot.
+- Crash is in the depth-walk prefill path only; <=40960 walks clean on every boot.
+Next probe (fresh session): rerun the walk under rocprofv2/ROCTx to name the last
+kernel before the abort; prime suspects are fla chunk intermediates scaling with
+BC (~812 chunks at 52k: A/M/state buffers) overflowing GPU1's 16GB (far side =
+8 layers + head + its KV share), or a Triton kq_gemv int32 stride overflow past
+~52k rows. Both are code-readable once the kernel is named.
