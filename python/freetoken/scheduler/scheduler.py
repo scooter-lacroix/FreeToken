@@ -31,6 +31,9 @@ from .decode import DecodeManager
 from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
 from .status import SchedulerStatusReporter
+from freetoken.utils.progress import emit_progress
+
+from .warmup import prefill_warmup_lengths, warmup_depth, warmup_enabled
 from .table import TableManager
 
 if TYPE_CHECKING:
@@ -263,7 +266,7 @@ class Scheduler(SchedulerIOMixin):
                 # cross-stream wait and before the forward reads the live slot (program order
                 # vs the prior batch's snapshot writes). Doing this on self.stream would race.
                 self._restore_linear_states(forward_input.batch)
-                ongoing_data = (forward_input, self._forward(forward_input))
+                ongoing_data = (forward_input, self._fwd_timed(forward_input))
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
         # page-table re-point and, for the paged-SWA pools, the full->swa (DSV4: full->window)
@@ -330,12 +333,118 @@ class Scheduler(SchedulerIOMixin):
         self._process_last_data(ongoing_data)
         self._flush_abort_acks()
 
+    # uids at or above this base belong to warmup requests; they can never collide with the
+    # frontend's per-process counter and are scrubbed from scheduler state on warmup failure.
+    WARMUP_UID_BASE = 1 << 60
+
+    def _submit_warmup_req(self, uid: int, n_tokens: int) -> None:
+        from freetoken.core import SamplingParams
+
+        # Plain-text vocabulary range: far from every special/control/eos id, and
+        # ignore_eos so the model cannot terminate the request before its one
+        # decode step -- that step is what compiles the decode kernels at depth.
+        ids = (torch.arange(n_tokens, dtype=torch.int32) % 24000) + 2000
+        self.prefill_manager.add_one_req(
+            UserMsg(
+                uid=uid,
+                input_ids=ids,
+                sampling_params=SamplingParams(
+                    temperature=0.0, max_tokens=2, ignore_eos=True
+                ),
+            )
+        )
+
+    def _run_warmup_loop(self, max_iters: int, desc: str | None = None) -> None:
+        for i in range(max_iters):
+            if not (self.prefill_manager.runnable or self.decode_manager.runnable):
+                return
+            if desc is not None and i % 8 == 0:
+                emit_progress(desc, i, max_iters)
+            self.normal_loop()
+        # Bound tripped: an admission gate refuses our synthetic request. Drop warmup
+        # state so run_forever does not inherit a hot spin over an unschedulable req.
+        logger.critical_rank0(
+            "prefill warmup did not drain within its iteration bound; discarding "
+            "warmup requests (first real request may still pay cold-compile cost)"
+        )
+        self.prefill_manager.pending_list.clear()
+        self.decode_manager.running_reqs = {
+            r for r in self.decode_manager.running_reqs if r.uid < self.WARMUP_UID_BASE
+        }
+
+    def _prefill_warmup(self) -> None:
+        """Compile the autotuned prefill/decode Triton kernels' specialization space
+        before the first real request (see scheduler/warmup.py for why: a first-hit
+        extend length or KV-depth bucket sweeps whole autotune grids inside the
+        request's forward -- measured 70-270s stalls, fatal against the frontend's
+        300s SSE idle limit). Runs the real request path end-to-end so admission,
+        chunking, GDN state, and the drain/free paths are exercised too; winning
+        configs persist in the on-disk triton cache, so steady-state boots pay only
+        the GPU time. Failure is never fatal: any exception logs and leaves serving
+        running (worst case the old cold-first-hit behavior)."""
+        import time as _time
+
+        if not warmup_enabled():
+            return
+        max_extend = self.config.max_extend_tokens
+        depth = warmup_depth(getattr(self.engine, "max_seq_len", 0))
+        t_all = _time.perf_counter()
+        try:
+            with self.engine_stream_ctx:
+                self.engine.stream.wait_stream(self.stream)
+                # Phase 1: one request per extend-length class. max_tokens=2 so each
+                # also runs one decode step at its (shallow) depth.
+                ladder = prefill_warmup_lengths(max_extend)
+                t0 = _time.perf_counter()
+                for i, n in enumerate(ladder):
+                    emit_progress("compiling prefill kernels", i + 1, len(ladder))
+                    self._submit_warmup_req(self.WARMUP_UID_BASE + i, n)
+                    # ladder lengths never exceed max_extend, so each is one prefill
+                    # iteration + a couple of decode iterations
+                    self._run_warmup_loop(max_iters=8)
+                logger.info_rank0(
+                    f"prefill warmup: {len(ladder)} extend-length classes up to "
+                    f"{max_extend} done in {_time.perf_counter() - t0:.1f}s"
+                )
+                # Phase 2: one chunked prefill walking the context depth buckets to
+                # the serving depth (the maestro-class first-deep-request stall),
+                # ending with a decode step at full depth.
+                if depth > max_extend:
+                    t0 = _time.perf_counter()
+                    uid = self.WARMUP_UID_BASE + len(ladder)
+                    self._submit_warmup_req(uid, depth)
+                    expected = depth // max(1, max_extend) + 8
+                    self._run_warmup_loop(
+                        max_iters=expected + 64, desc="compiling deep-context kernels"
+                    )
+                    logger.info_rank0(
+                        f"prefill warmup: depth walk to {depth} tokens done in "
+                        f"{_time.perf_counter() - t0:.1f}s"
+                    )
+        except Exception:
+            import traceback
+
+            logger.critical_rank0(
+                "prefill warmup failed (serving continues; first hits pay cold-compile): "
+                + traceback.format_exc()
+            )
+            self.prefill_manager.pending_list.clear()
+            self.decode_manager.running_reqs = {
+                r for r in self.decode_manager.running_reqs
+                if r.uid < self.WARMUP_UID_BASE
+            }
+        else:
+            logger.info_rank0(
+                f"prefill warmup complete in {_time.perf_counter() - t_all:.1f}s "
+                "(triton autotune cache warm; first requests will not stall)"
+            )
+
     @torch.inference_mode()
     def run_forever(self) -> NoReturn:
         # DSV4 (owned-KV) decode reads its per-token window/cmp/idx slot maps off the attention
         # backend's per-batch SNAPSHOT (staged in prepare_for_replay right before the replay, on
         # the same stream, like the generic out_loc copy_from), not the live slot maps -- so the
-        # next batch's allocate_paged cannot corrupt the in-flight graph replay. DSV4 overlaps.
+        # next batch's allocate_paged cannot corrupt an in-flight graph replay. DSV4 overlaps.
         if ENV.DISABLE_OVERLAP_SCHEDULING:
             with self.engine_stream_ctx:
                 self.engine.stream.wait_stream(self.stream)
@@ -390,7 +499,7 @@ class Scheduler(SchedulerIOMixin):
                 next_token = next_tokens_cpu[i]
                 req.append_host(next_token.unsqueeze(0))
                 next_token = int(next_token.item())
-                mtp_probe = getattr(self.engine, "mtp_probe", None)
+                mtp_probe = getattr(getattr(self, "engine", None), "mtp_probe", None)
                 if mtp_probe is not None and not batch.is_prefill:
                     # k=1 acceptance probe: draft predicts from (h, token);
                     # the NEXT committed token settles it. Both trunk channels
@@ -680,7 +789,7 @@ class Scheduler(SchedulerIOMixin):
         req.table_idx = -1
         # Drop the MTP probe's eager KV rows for this request before its id()
         # can be recycled by a later request.
-        mtp_probe = getattr(self.engine, "mtp_probe", None)
+        mtp_probe = getattr(getattr(self, "engine", None), "mtp_probe", None)
         if mtp_probe is not None:
             mtp_probe.reset_req(id(req))
 
@@ -943,7 +1052,34 @@ class Scheduler(SchedulerIOMixin):
         pending.clear()
         self.send_result([ErrorReplyMsg(uid=uid, error="request aborted") for uid in uids])
 
+    def _fwd_timed(self, forward_input: ForwardInput) -> ForwardOutput:
+        """Step-probe wrapper: per-decode-step wall time, logged every N steps
+        (FREETOKEN_STEP_PROBE=1, FREETOKEN_STEP_PROBE_EVERY=10)."""
+        import os as _os
+        import time as _time
+
+        import time as _t2
+
+        _w0 = _t2.perf_counter()
+        out = self._forward(forward_input)
+        if _os.environ.get("FREETOKEN_STEP_PROBE", "0") in {"1", "true", "yes"}:
+            self._step_n = getattr(self, "_step_n", 0) + 1
+            self._step_t = getattr(self, "_step_t", 0.0) + (_t2.perf_counter() - _w0)
+            every = int(_os.environ.get("FREETOKEN_STEP_PROBE_EVERY", "10"))
+            if self._step_n % every == 0:
+                print(
+                    f"[step-probe] n={self._step_n} avg="
+                    f"{self._step_t / self._step_n * 1000:.1f} ms/step",
+                    flush=True,
+                )
+        return out
+
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
+        import os as _os
+        import time as _time
+
+        _probe = _os.environ.get("FREETOKEN_STEP_PROBE", "0") in {"1", "true", "yes"}
+        _t0 = _time.perf_counter() if _probe else None
         batch, sample_args, input_mapping, output_mapping = forward_input
         batch.input_ids = self.token_pool[input_mapping]
         if self.toolcall_anchor_id is not None and not batch.is_prefill:
