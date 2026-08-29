@@ -218,3 +218,46 @@ def test_warmup_walk_clamped_when_env_below_cap(monkeypatch):
     sched._prefill_warmup()
     walk_len = max(calls["lengths"])
     assert walk_len == 40960
+
+
+def test_residency_yields_under_memory_pressure(monkeypatch, tmp_path):
+    import mmap as _mmap
+
+    from freetoken.utils import residency
+
+    f = tmp_path / "tiny.gguf"
+    f.write_bytes(b"z" * (1 << 20))
+    fh = open(f, "r+b")
+    mm = _mmap.mmap(fh.fileno(), 0)
+    try:
+        avail = {"gb": 40.0}
+        monkeypatch.setattr(residency, "mem_available_gb", lambda: avail["gb"])
+        flag = {"active": True}
+        res = residency.ActivityResidency(
+            str(f), lambda: flag["active"], grace_s=300.0,
+            poll_active_s=0.05, poll_idle_s=0.05,
+        )
+        res.start()
+        deadline = time.monotonic() + 5
+        while not res._pinned and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert res._pinned, "pins while healthy"
+
+        # pressure: availability crashes below low-water -> pins released
+        avail["gb"] = 4.0
+        deadline = time.monotonic() + 5
+        while res._pinned and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not res._pinned, "pressure must release pins even while serving"
+
+        # hysteresis: still serving, availability recovers past high-water -> re-pin
+        avail["gb"] = 40.0
+        deadline = time.monotonic() + 5
+        while not res._pinned and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert res._pinned, "re-pins after headroom recovers"
+        res.stop()
+        res.join(timeout=2)
+    finally:
+        mm.close()
+        fh.close()

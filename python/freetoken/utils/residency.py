@@ -60,6 +60,18 @@ def _env_on(name: str, default: str = "1") -> bool:
     return os.getenv(name, default) in {"1", "true", "yes", "on"}
 
 
+def mem_available_gb() -> float:
+    """MemAvailable from /proc/meminfo, GiB. 1e9 (never blocks pinning) if unreadable."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1 << 20)
+    except OSError:
+        pass
+    return 1e9
+
+
 def mapping_ranges(path: str) -> list[tuple[int, int]]:
     """(start, end) virtual ranges this process has mmapped from ``path``."""
     real = os.path.realpath(path)
@@ -228,6 +240,10 @@ class ActivityResidency(threading.Thread):
     (memory returns to the desktop) and stop touching the disk entirely.
     """
 
+    LOW_WATER_GB = float(os.getenv("FREETOKEN_PIN_MIN_AVAIL_GB", "12") or 0)
+    # re-pin only after availability recovers past low-water + hysteresis band
+    HIGH_WATER_GB = LOW_WATER_GB + 8.0
+
     def __init__(self, path: str, activity_fn, grace_s: float,
                  poll_active_s: float = 5.0, poll_idle_s: float = 30.0):
         super().__init__(daemon=True, name="model-residency")
@@ -238,6 +254,7 @@ class ActivityResidency(threading.Thread):
         self._poll_idle = poll_idle_s
         self._halt = threading.Event()
         self._pinned = False
+        self._pressured = False
 
     def run(self) -> None:
         last_active = time.monotonic()  # boot counts as active (warmup pins)
@@ -246,7 +263,22 @@ class ActivityResidency(threading.Thread):
                 if self._activity_fn():
                     last_active = time.monotonic()
                 active = (time.monotonic() - last_active) < self._grace
-                if active and not self._pinned:
+                # Memory-pressure guard: mlock'd pages are unpageable, so under
+                # system pressure the OOM killer's best target is OUR worker.
+                # Never hold pins when the box runs out of headroom — degraded
+                # refill speed always beats a killed desktop or a killed server.
+                avail = mem_available_gb()
+                if self._pinned and avail < self.LOW_WATER_GB:
+                    n = unpin_model(self._path)
+                    self._pinned = not n and bool(mapping_ranges(self._path))
+                    self._pressured = True
+                    logger.warning_rank0(
+                        f"residency: memory pressure ({avail:.1f} GiB available < "
+                        f"{self.LOW_WATER_GB:.0f} low-water), released pins; refills "
+                        "fall back to page cache/SSD"
+                    )
+                    continue
+                if active and not self._pinned and not self._pressured:
                     n = pin_model(self._path)
                     self._pinned = n > 0
                     prefetch_model_file(self._path)
@@ -256,6 +288,8 @@ class ActivityResidency(threading.Thread):
                             "of checkpoint pages (MLOCK_ONFAULT; refills pin as they "
                             "fault in)"
                         )
+                elif not self._pinned and self._pressured and avail >= self.HIGH_WATER_GB:
+                    self._pressured = False  # headroom recovered; pin on a later poll
                 elif not active and self._pinned:
                     n = unpin_model(self._path)
                     self._pinned = n == 0 and bool(mapping_ranges(self._path))
