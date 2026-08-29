@@ -540,3 +540,26 @@ kernel before the abort; prime suspects are fla chunk intermediates scaling with
 BC (~812 chunks at 52k: A/M/state buffers) overflowing GPU1's 16GB (far side =
 8 layers + head + its KV share), or a Triton kq_gemv int32 stride overflow past
 ~52k rows. Both are code-readable once the kernel is named.
+
+## 2026-08-29 (final): ">=50k HSA fault" CLOSED — warmup seq-len boundary violation (f4894e3)
+
+The bisect ladder told the story: walks to 49152/55296/58368 under max_seq_len
+73728 completed; 73728-walks crashed at walk-end (0.68x108k pool = 73.4k);
+61440-walk with max_seq_len_override=61440 crashed at 0.57x108k = 61.5k; the
+SAME 61440-walk under a 73728 cap COMPLETED (boot H). Trigger = decoding at
+position == max_seq_len: warmup submits via add_one_req, bypassing the
+admission guard that clamps input+max_tokens for real traffic — so the walk's
+2 decode steps sampled one past the rope/positions buffers (async HSA 0x1016,
+no kernel attribution, exactly matching the rocprofv2 evidence that every
+dispatched kernel COMPLETED and the abort followed a silent gap).
+
+Fix: warmup walk length = min(env, engine.max_seq_len - 4); honest INCOMPLETE
+log instead of a false success line. Regression verified: boot-C config now
+completes (61436-token walk, 0 aborts). Real traffic was never exposed.
+
+Consequences: the parked "72k blocker" never existed for serving; lift
+FREETOKEN_WARMUP_MAX_DEPTH to 73728-8 in production boots to compile
+deep-context kernels at boot. Also from this hunt: /tmp is 32GB tmpfs (the
+4.5GB rocprof trace + 11.7GB mlock pins during diagnostics likely OOM-killed
+the user's editor session) — artifacts to disk only, FREETOKEN_RESIDENCY=0 on
+diag boots.
