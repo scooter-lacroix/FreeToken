@@ -508,3 +508,20 @@ are the fla deep-BC grids or an autotune config that OOBs at deep context.
 **New host trap**: an exported `PYTHONPATH` with a trailing empty entry breaks
 uv-venv prefix detection (`sys.prefix` resolves to the base interpreter, venv
 site-packages vanishes). `env -u PYTHONPATH` for every venv-python invocation.
+
+## 2026-08-29 (later): fadvise was not enough — activity-gated residency (29e5988)
+
+The fadvise prefetch lost to real desktop load: page cache drained 24GB -> 5.6GB,
+refill faults crawled at 0.2-0.6MB/s behind video/desktop IO (sentinel: 116.7s
+probe stall, 21MB faulted; a live maestro request wedged 9+ minutes mid-prefill).
+Final design per user contract — aggressive while serving, silent when idle:
+- **SSD staging**: one boot-time copy of the checkpoint to the SN850X (95s), served
+  from there forever; refills hit NVMe even when RAM is drained. Resolution MUST
+  run before Scheduler(args) maps the file; ServerArgs is frozen (object.__setattr__).
+- **mlock2(MLOCK_ONFAULT)** while requests run + 300s idle grace; munlock past it.
+  Live-verified: VmLck 11.7GiB active -> 0 kB idle; "no background IO while idle".
+- Sentinel is passive-by-default now (active probes = permanent activity = pins
+  forever — it violated the idle contract itself).
+- Numbers, pinned+SSD: 8.5k cold 13.8s (~615 tok/s true compute; 280 was disk
+  contention interleaved), cached re-serve 3.3s. Remaining TTFT lever for very
+  deep prompts is pure compute (FIX 2) + the parked >=50k HSA fault.
