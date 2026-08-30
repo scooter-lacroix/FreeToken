@@ -585,3 +585,20 @@ levers are fla GDN tuning + chunk-size A/B, both measured work); decode at
 depth unchanged (S2c graphs + S4 DFlash2 are the levers for 60+ @ 72k);
 system contract now holds on a loaded box (no unpageable memory, bounded IO,
 pressure-yielding everything).
+
+## 2026-08-30 (wave 3): FIX 2 step 1 — chunk 2048 lands (+40% prefill); twin cache OOMs
+
+A/B on the 27B Ridge split config (gardener on, pins off, 40k warmup):
+- **chunk 2048 (keeper)**: sustained prefill 347-382 tok/s (vs 264 @1024, +40%);
+  31k prompt 126.3s wall; depth walk to 40960 in 110s (was 208-478s); final
+  chunks 742 tok/s. Warm rerun of a cached prompt: 2.5s. This is now the
+  serving recommendation: --max-extend-length 2048 --max-prefill-length 2048.
+  User maestro corroboration: first prompt 158s (was 416s), follow-up 14.1s.
+- **bf16-twin cache FREETOKEN_BF16_CACHE_GB=1024: CUDA OOM at boot** — at
+  memory_ratio 0.90 the KV+weights+banks leave only ~600MB slack on GPU0;
+  the per-use dequant (20-40ms/layer) can only be attacked after a VRAM
+  budget redesign (lower KV budget, MoE bank sizing, or dequant-free GEMV
+  path). Parked with that scope note.
+
+Remaining prefill gap to 800+: fla GDN chunk kernel tuning (BT/BK grids) and
+the dequant path. Decode to 60+: unchanged levers (S2c graphs, S4 DFlash2).
