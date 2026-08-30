@@ -563,3 +563,25 @@ deep-context kernels at boot. Also from this hunt: /tmp is 32GB tmpfs (the
 4.5GB rocprof trace + 11.7GB mlock pins during diagnostics likely OOM-killed
 the user's editor session) — artifacts to disk only, FREETOKEN_RESIDENCY=0 on
 diag boots.
+
+## 2026-08-29 (wave 2 close): OOM forensics exonerate the server; cache gardener ships (5ffb642)
+
+Kill 4 happened with the server fully UNPINNED — kernel journal shows both
+global-OOM kills targeted `rustc` builds at 11-13.5GB RSS (cargo codegen
+units). Coordination ask sent: bound cargo (CARGO_BUILD_JOBS, codegen-units).
+Posture now: mlock pins default-OFF (opt-in via FREETOKEN_RESIDENCY=1, with
+the da05987 pressure guard), warmup walk capped at 40960 unless explicitly
+raised, and the **cache gardener**: rotating 512MB fadvise(WILLNEED) windows
+over the staged checkpoint at <=34MB/s sustained — keeps the page cache warm
+with ZERO unpageable bytes, pauses under MemAvailable < 16GB.
+
+Measured (ridge72, gardener on, pins off): 8.5k novel prompt 12.9s wall
+(= the pinned config's 13.8s), late chunks at 512 tok/s (full-residency
+compute rate), one residual dip on the first request while the gardener
+catches up. Decode at ~9k depth ~16-32 tok/s steady.
+
+Scoreboard vs targets: prefill compute ~512-615 tok/s (target 800: remaining
+levers are fla GDN tuning + chunk-size A/B, both measured work); decode at
+depth unchanged (S2c graphs + S4 DFlash2 are the levers for 60+ @ 72k);
+system contract now holds on a loaded box (no unpageable memory, bounded IO,
+pressure-yielding everything).
