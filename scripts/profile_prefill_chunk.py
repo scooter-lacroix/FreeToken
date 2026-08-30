@@ -24,14 +24,13 @@ llm.generate([prompt_ids], SamplingParams(max_tokens=1, ignore_eos=True))
 print("warmup pass done", flush=True)
 
 torch.cuda.synchronize()
-from torch.profiler import profile, ProfilerActivity
 llm.pending_requests = [(prompt_ids, SamplingParams(max_tokens=1, ignore_eos=True))]
 llm.status_map = {}
 llm.counter = 0
-with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-    try:
-        llm.run_forever()
-    except Exception as e:
-        print("loop end:", repr(e), flush=True)
+t0 = time.time()
+try:
+    llm.run_forever()
+except Exception as e:
+    print("loop end:", repr(e), flush=True)
 torch.cuda.synchronize()
-print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=28), flush=True)
+print(f"pass wall: {time.time()-t0:.2f}s for 2x2048-token chunks", flush=True)

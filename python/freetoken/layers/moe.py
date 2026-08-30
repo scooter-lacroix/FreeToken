@@ -194,6 +194,38 @@ class MoELayer(BaseOP):
         return self._maybe_all_reduce(final_hidden_states)
 
 
+# Phase-wall accumulator (FREETOKEN_MOE_PHASE_LOG=1): where a prefill chunk's
+# wall time goes — router topk, expert movement (streaming/materialize), expert
+# GEMM, and the un-attributed remainder. Printed once per N prefill calls.
+_PHASE_ACC: dict[str, float] = {}
+_PHASE_CALLS = {"n": 0}
+
+
+def _phase_timed(key: str, fn, *args, **kwargs):
+    import time as _t
+
+    t0 = _t.perf_counter()
+    out = fn(*args, **kwargs)
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    _PHASE_ACC[key] = _PHASE_ACC.get(key, 0.0) + _t.perf_counter() - t0
+    return out
+
+
+def _phase_maybe_report():
+    import os as _os
+    import time as _t
+
+    if _os.environ.get("FREETOKEN_MOE_PHASE_LOG", "0") not in {"1", "true", "yes"}:
+        return
+    _PHASE_CALLS["n"] += 1
+    if _PHASE_CALLS["n"] % 2 == 0 and _PHASE_ACC:
+        parts = " ".join(f"{k}={v:.2f}s" for k, v in sorted(_PHASE_ACC.items()))
+        print(f"[moe-phase] n={_PHASE_CALLS['n']} {parts}", flush=True)
+        for k in _PHASE_ACC:
+            _PHASE_ACC[k] = 0.0
+
+
 class OffloadMoELayer(MoELayer):
     def __init__(
         self,
@@ -269,13 +301,25 @@ class OffloadMoELayer(MoELayer):
         hidden_states: torch.Tensor,
         router_logits: torch.Tensor | None = None,
     ):
-        topk_weights, topk_ids = fused_topk(
+        import os as _os
+
+        if _os.environ.get("FREETOKEN_MOE_PHASE_LOG", "0") not in {"1", "true", "yes"}:
+            topk_weights, topk_ids = fused_topk(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=self.top_k,
+                renormalize=self.renormalize,
+            )
+            return self._prefill_routed(hidden_states, topk_weights, topk_ids)
+        topk_weights, topk_ids = _phase_timed(
+            "router_topk", fused_topk,
             hidden_states=hidden_states,
             gating_output=router_logits,
             topk=self.top_k,
             renormalize=self.renormalize,
         )
-        return self._prefill_routed(hidden_states, topk_weights, topk_ids)
+        return _phase_timed("moe_move_and_gemm", self._prefill_routed,
+                            hidden_states, topk_weights, topk_ids)
 
     # ------------------------------------------------------------------
     # Data movement -- one decision tree for every quant format (the banks
@@ -409,9 +453,20 @@ class OffloadMoELayer(MoELayer):
         pass through unmapped."""
         cache = self.offload_cache
         assert cache is not None
+        import os as _os
+
+        _log = _os.environ.get("FREETOKEN_MOE_PHASE_LOG", "0") in {"1", "true", "yes"}
         if cache.prefill_overlap:
-            views = self._wait_prefill_overlap(cache)
-            out = self._expert_gemm(
+            if _log:
+                views = _phase_timed("moe_stream_wait", self._wait_prefill_overlap, cache)
+                out = _phase_timed("moe_gemm", self._expert_gemm,
+                                   cache, hidden_states, topk_weights, topk_ids,
+                                   views=views, n=self.num_experts,
+                                   alphas=cache.alphas_for_layer(self.layer_id),
+                                   is_prefill=True)
+            else:
+                views = self._wait_prefill_overlap(cache)
+                out = self._expert_gemm(
                 cache,
                 hidden_states,
                 topk_weights,
