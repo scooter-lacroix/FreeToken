@@ -259,10 +259,16 @@ def _dequant_chunked(packed: torch.Tensor, qt: int, n: int, k: int) -> torch.Ten
     ~139 GB/s vs the elementwise port's ~16 on gfx1100 -- the per-use twin
     path is the dominant prefill phase at ~30ms/layer x 65 layers).
     """
-    if qt == 12 and packed.is_cuda and k % 256 == 0:
-        from freetoken.kernel.triton.kquant_dequant import dequant_q4_k_fused
+    if packed.is_cuda and k % 256 == 0:
+        from freetoken.kernel.triton import kquant_dequant as _kdf
 
-        return dequant_q4_k_fused(packed.reshape(-1), torch.bfloat16).view(n, k)
+        flat = packed.reshape(-1)
+        if qt == 12:
+            return _kdf.dequant_q4_k_fused(flat, torch.bfloat16).view(n, k)
+        if qt == 22:
+            return _kdf.dequant_iq2_s_fused(flat, torch.bfloat16).view(n, k)
+        if qt == 21:
+            return _kdf.dequant_iq3_s_fused(flat, torch.bfloat16).view(n, k)
 
     from freetoken.models.gguf.dequant import dequantize
 

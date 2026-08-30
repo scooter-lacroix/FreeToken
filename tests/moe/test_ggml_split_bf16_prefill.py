@@ -121,3 +121,27 @@ def test_fused_q4_k_dequant_bit_exact():
     ref = dequant_q4_k(raw, torch.bfloat16).view(n, 256)
     fused = dequant_q4_k_fused(raw, torch.bfloat16)
     assert torch.equal(ref.view(torch.int16), fused.view(torch.int16))
+
+
+def test_fused_iq_dequant_bit_exact():
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    from freetoken.kernel.triton.kquant_dequant import (
+        dequant_iq2_s_fused,
+        dequant_iq3_s_fused,
+    )
+    from freetoken.models.gguf.dequant import dequant_iq2_s, dequant_iq3_s
+
+    for name, ref_fn, fused_fn, bb in [
+        ("IQ2_S", dequant_iq2_s, dequant_iq2_s_fused, 82),
+        ("IQ3_S", dequant_iq3_s, dequant_iq3_s_fused, 110),
+    ]:
+        torch.manual_seed(0)
+        raw = torch.randint(0, 256, (256, bb), dtype=torch.uint8, device="cuda")
+        raw[:, 0:2] = torch.tensor([0x00, 0x3C], dtype=torch.uint8, device="cuda")
+        ref = ref_fn(raw, torch.bfloat16).view(256, 256)
+        fused = fused_fn(raw, torch.bfloat16)
+        assert torch.equal(ref.view(torch.int16), fused.view(torch.int16)), name
