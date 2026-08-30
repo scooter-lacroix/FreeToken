@@ -124,20 +124,67 @@ def unpin_model(path: str) -> int:
     return released
 
 
-def prefetch_model_file(path: str) -> int:
-    """Asynchronously advise the kernel to populate the page cache for ``path``."""
+def prefetch_model_file(path: str, offset: int = 0, length: int = 0) -> int:
+    """Asynchronously advise WILLNEED for a range (whole file when length is 0)."""
     POSIX_FADV_WILLNEED = 3
     try:
         fd = os.open(path, os.O_RDONLY)
         try:
             size = os.fstat(fd).st_size
-            _libc().posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED)
+            _libc().posix_fadvise(
+                fd, ctypes.c_longlong(offset), ctypes.c_longlong(length or size),
+                POSIX_FADV_WILLNEED,
+            )
             return size
         finally:
             os.close(fd)
     except OSError as e:
         logger.warning_rank0(f"page-cache advice skipped for {path}: {e!r}")
         return 0
+
+
+class CacheGardener(threading.Thread):
+    """Keep the checkpoint page-cache-warm WITHOUT mlock, at a bounded rate.
+
+    Rotating ``posix_fadvise(WILLNEED)`` windows: every ``interval_s`` it advises
+    the next ``segment_gb`` slice of the file and moves on. Resident segments
+    cost nothing; evicted ones stream back at <= segment/interval (default
+    ~34 MB/s) — far below what memory-pressure subsystems (systemd-oomd PSI
+    watches) react to, and from the NVMe staging copy it fully re-warms an
+    evicted 11.7GB checkpoint in ~6 minutes. Purely advisory: under real
+    pressure the kernel evicts anyway and the gardener simply re-warms later;
+    the min_avail_gb check pauses it when the box is genuinely tight.
+    """
+
+    def __init__(self, path: str, segment_gb: float = 0.5, interval_s: float = 15.0,
+                 min_avail_gb: float = 16.0):
+        super().__init__(daemon=True, name="model-cache-gardener")
+        self._path = path
+        self._segment = int(segment_gb * (1 << 30))
+        self._interval = interval_s
+        self._min_avail = min_avail_gb
+        self._offset = 0
+        self._halt = threading.Event()
+
+    def run(self) -> None:
+        size = 0
+        try:
+            size = os.path.getsize(self._path)
+        except OSError:
+            return
+        while not self._halt.wait(self._interval):
+            try:
+                if mem_available_gb() < self._min_avail:
+                    continue
+                prefetch_model_file(self._path, self._offset, self._segment)
+                self._offset += self._segment
+                if self._offset >= size:
+                    self._offset = 0
+            except Exception as e:  # never kill the worker
+                logger.warning_rank0(f"cache gardener error (continuing): {e!r}")
+
+    def stop(self) -> None:
+        self._halt.set()
 
 
 # --------------------------------------------------------------------------
@@ -322,3 +369,12 @@ def start_residency(path: str, activity_fn) -> ActivityResidency | None:
     res = ActivityResidency(path, activity_fn, grace)
     res.start()
     return res
+
+
+def start_cache_gardener(path: str) -> CacheGardener | None:
+    """Safe-by-default warm-keeper: on unless explicitly disabled."""
+    if not _env_flag("FREETOKEN_CACHE_GARDEN", "1"):
+        return None
+    g = CacheGardener(path)
+    g.start()
+    return g

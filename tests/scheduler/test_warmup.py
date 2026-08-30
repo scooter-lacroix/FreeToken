@@ -264,3 +264,41 @@ def test_residency_yields_under_memory_pressure(monkeypatch, tmp_path):
     finally:
         mm.close()
         fh.close()
+
+
+def test_cache_gardener_rotates_and_respects_pressure(monkeypatch, tmp_path):
+    import types
+
+    from freetoken.utils import residency
+
+    f = tmp_path / "tiny.gguf"
+    f.write_bytes(b"z" * (4 << 20))
+    advised = []
+    monkeypatch.setattr(
+        residency, "prefetch_model_file",
+        lambda path, offset=0, length=0: advised.append((offset, length)) or length,
+    )
+    monkeypatch.setattr(residency, "mem_available_gb", lambda: 40.0)
+    g = residency.CacheGardener(str(f), segment_gb=1 / 1024, interval_s=0.05,
+                                min_avail_gb=16.0)
+    g.start()
+    deadline = time.monotonic() + 5
+    while len(advised) < 6 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    g.stop()
+    assert advised, "gardener must advise windows"
+    # windows advance by the segment stride and wrap around at file end
+    offs = [o for o, _ in advised]
+    assert offs[0] == 0 and 0 in offs[1:], "rotation must wrap to the file start"
+    step = offs[1] - offs[0]
+    assert step > 0 and all(l <= step for _, l in advised)
+
+    # pressure pause
+    advised.clear()
+    monkeypatch.setattr(residency, "mem_available_gb", lambda: 2.0)
+    g2 = residency.CacheGardener(str(f), segment_gb=1 / 1024, interval_s=0.05,
+                                 min_avail_gb=16.0)
+    g2.start()
+    time.sleep(0.3)
+    g2.stop()
+    assert not advised, "gardener must pause under memory pressure"

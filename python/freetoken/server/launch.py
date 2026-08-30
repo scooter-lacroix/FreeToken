@@ -89,11 +89,18 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     # mapping (and therefore page pinning) lives on the SSD and refills never
     # touch the spinning origin. Residency (pin while serving, release when
     # idle) starts right after, still before the ready ack.
-    from freetoken.utils.residency import resolve_staged_model, start_residency
+    from freetoken.utils.residency import (
+        resolve_staged_model,
+        start_cache_gardener,
+        start_residency,
+    )
 
     # ServerArgs is frozen; the args.py tool-parser sniff sets the precedent
     # for object.__setattr__ here.
     object.__setattr__(args, "model_path", resolve_staged_model(args.model_path))
+    # Bounded-rate page-cache warm-keeper: keeps the checkpoint resident without
+    # unpageable memory (the mlock path is opt-in via FREETOKEN_RESIDENCY=1).
+    start_cache_gardener(args.model_path)
 
     with torch.inference_mode():
         try:
