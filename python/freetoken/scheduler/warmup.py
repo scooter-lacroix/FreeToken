@@ -50,9 +50,16 @@ def warmup_enabled() -> bool:
     return os.getenv("FREETOKEN_PREFILL_WARMUP", "1") in {"1", "true", "yes", "on"}
 
 
+# Walks past this class were implicated (with mlock pins) in three system-level
+# OOM kills on the shared box; 40960 covers the maestro prompt class. Full-depth
+# kernel compile is opt-in on a quiet machine via FREETOKEN_WARMUP_MAX_DEPTH.
+WALK_DEPTH_DEFAULT = 40960
+
+
 def warmup_depth(max_seq_len: int) -> int:
-    """Context depth the warmup walks to (tokens). Full ``max_seq_len`` by default --
-    the deep buckets are exactly where a first-hit stall is fatal (300s SSE idle
-    limit); cap with FREETOKEN_WARMUP_MAX_DEPTH on slower or shared boots."""
+    """Context depth the warmup walks to (tokens): min(max_seq_len, env cap).
+    Unset env caps at WALK_DEPTH_DEFAULT."""
     cap = int(os.getenv("FREETOKEN_WARMUP_MAX_DEPTH", "0") or 0)
-    return min(max_seq_len, cap) if cap > 0 else max_seq_len
+    if cap <= 0:
+        cap = WALK_DEPTH_DEFAULT
+    return min(max_seq_len, cap)

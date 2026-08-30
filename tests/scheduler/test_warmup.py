@@ -54,10 +54,13 @@ def test_env_gates(monkeypatch):
     assert warmup_enabled() is True
 
     monkeypatch.delenv("FREETOKEN_WARMUP_MAX_DEPTH", raising=False)
-    assert warmup_depth(73728) == 73728
+    # unset env caps at the shared-box-safe default, never the full window
+    assert warmup_depth(73728) == 40960
+    assert warmup_depth(8192) == 8192  # never exceeds max_seq_len
     monkeypatch.setenv("FREETOKEN_WARMUP_MAX_DEPTH", "16384")
     assert warmup_depth(73728) == 16384
-    assert warmup_depth(8192) == 8192  # never exceeds max_seq_len
+    monkeypatch.setenv("FREETOKEN_WARMUP_MAX_DEPTH", "73720")
+    assert warmup_depth(73728) == 73720  # explicit opt-in reaches full depth
 
 
 def _warmup_scheduler_shell(monkeypatch, enabled: str, fail: bool = False):

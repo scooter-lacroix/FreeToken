@@ -60,6 +60,10 @@ def _env_on(name: str, default: str = "1") -> bool:
     return os.getenv(name, default) in {"1", "true", "yes", "on"}
 
 
+def _env_flag(name: str, default: str) -> bool:
+    return os.getenv(name, default) in {"1", "true", "yes", "on"}
+
+
 def mem_available_gb() -> float:
     """MemAvailable from /proc/meminfo, GiB. 1e9 (never blocks pinning) if unreadable."""
     try:
@@ -308,7 +312,11 @@ class ActivityResidency(threading.Thread):
 
 def start_residency(path: str, activity_fn) -> ActivityResidency | None:
     """Entry point. ``activity_fn`` returns True while requests are in flight."""
-    if not _env_on("FREETOKEN_RESIDENCY", "1"):
+    # DEFAULT OFF on shared machines: 11.7GB of unpageable mlock against a
+    # loaded desktop turned the worker into the OOM killer's best target and
+    # took down user sessions three times (2026-08-29). The SSD staging copy
+    # carries refill performance; pins are an opt-in for dedicated serving.
+    if not _env_flag("FREETOKEN_RESIDENCY", "0"):
         return None
     grace = float(os.getenv("FREETOKEN_IDLE_RELEASE_S", "300") or 0)
     res = ActivityResidency(path, activity_fn, grace)
