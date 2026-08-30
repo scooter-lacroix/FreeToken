@@ -602,3 +602,22 @@ A/B on the 27B Ridge split config (gardener on, pins off, 40k warmup):
 
 Remaining prefill gap to 800+: fla GDN chunk kernel tuning (BT/BK grids) and
 the dequant path. Decode to 60+: unchanged levers (S2c graphs, S4 DFlash2).
+
+## 2026-08-30 (wave 4 close): bf16 prefill gate PASSED on correctness; streaming wall confirmed sole prefill limiter
+
+A/B on real weights (identical greedy prompt, fresh boots, split56/2048):
+- Outputs **byte-identical** (239/239 chars) — the double-index fix holds; the
+  path is numerically sound end-to-end.
+- Sustained wall: 375 tok/s (6151-token novel prompt, 16.4s) — same as the MMQ
+  baseline. The GEMM win is masked exactly as the profile predicted: the chunk
+  wall is expert streaming. Smoking gun in the same run: one chunk whose layer
+  banks were already GPU-resident (identical para → same experts routed) ran
+  at **9556 tok/s** — when streaming isn't the bottleneck the bf16 path is
+  ~10x the sustained rate.
+- Config: bf16 path stays ON (FREETOKEN_MOE_BF16_PREFILL_MIN_T=64 default).
+
+Wave-5 target = the streaming wall itself: per-chunk whole-layer bank
+materialization is ~5GB/chunk (48 layers x ~110MB) through PAGEABLE staged
+copies (~1-3GB/s) = the ~3.5s/chunk floor. Levers: pinned staging buffers,
+keep-previous-chunk banks (natural text re-routes the same experts → D2D
+hits, the moe_prefill_hit_d2d flag exists), or per-chunk delta streaming.
