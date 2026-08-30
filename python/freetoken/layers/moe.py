@@ -261,6 +261,17 @@ class OffloadMoELayer(MoELayer):
         router_logits: torch.Tensor | None = None,
     ):
         ctx = get_global_ctx()
+        import os as _os
+
+        if _os.environ.get("FREETOKEN_MOE_PHASE_LOG", "0") == "PING" and not getattr(
+            OffloadMoELayer, "_pinged", False
+        ):
+            OffloadMoELayer._pinged = True
+            print(
+                f"[moe-dispatch] layer={self.layer_id} phase={ctx.batch.phase!r} "
+                f"T={hidden_states.shape[0]} cls={type(self).__name__}",
+                flush=True,
+            )
         if ctx.batch.is_prefill:
             final_hidden_states = self.prefill_forward(hidden_states, router_logits)
         else:
@@ -749,6 +760,10 @@ def make_moe_layer(
     """
     offload = is_offload_moe_backend(config.moe_backend)
     layer_cls = (offload_cls or OffloadMoELayer) if offload else (resident_cls or MoELayer)
+    import os as _os
+
+    if _os.environ.get("FREETOKEN_MOE_PHASE_LOG", "0") == "PING":
+        print(f"[moe-factory] backend={config.moe_backend!r} offload={offload} cls={layer_cls.__name__}", flush=True)
     kwargs = dict(
         num_experts=num_experts if num_experts is not None else config.num_experts,
         top_k=top_k if top_k is not None else config.num_experts_per_tok,

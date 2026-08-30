@@ -731,6 +731,16 @@ class Engine:
         # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
         # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
         layers = attach_offload_moe_cache(self.model, cache)
+        import os as _os
+
+        if _os.environ.get("FREETOKEN_MOE_PHASE_LOG", "") == "PING" and layers:
+            import inspect as _ins
+
+            print(
+                f"[moe-class] {len(layers)} layers, first={type(layers[0]).__name__} "
+                f"from {_ins.getfile(type(layers[0]))}",
+                flush=True,
+            )
         assert len(layers) == config.model_config.num_moe_layers + (1 if _draft_active else 0)
         if cache.decode_target in ("cpu", "hybrid"):
             self._init_cpu_moe_executor(config, cache, layers)

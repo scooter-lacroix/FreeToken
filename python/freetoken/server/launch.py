@@ -77,6 +77,15 @@ def _run_scheduler(args: ServerArgs, ack_queue: mp.Queue[str]) -> None:
     import torch
     from freetoken.scheduler import Scheduler
 
+    import os as _osd
+
+    if _osd.environ.get("FREETOKEN_MOE_PHASE_LOG", "") == "PING":
+        import freetoken.layers.moe as _m
+
+        print(
+            f"[moe-boot] moe.py={_m.__file__} PHASE_LOG={_osd.environ.get('FREETOKEN_MOE_PHASE_LOG')!r}",
+            flush=True,
+        )
     if args.tp_info.is_primary():
         from freetoken.utils.progress import set_progress_sink
 
