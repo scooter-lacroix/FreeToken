@@ -101,3 +101,23 @@ def test_bf16_prefill_covers_all_routes_exactly_once():
     assert out.shape == (T, H)
     assert torch.isfinite(out).all()
     assert (out != 0).any(), "all-routes-to-one-expert produced zeros"
+
+
+def test_fused_q4_k_dequant_bit_exact():
+    """Fused Triton Q4_K dequant vs the torch port, valid fp16 scales."""
+    import pytest
+
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("GPU required")
+    from freetoken.kernel.triton.kquant_dequant import dequant_q4_k_fused
+    from freetoken.models.gguf.dequant import dequant_q4_k
+
+    torch.manual_seed(0)
+    n = 512
+    raw = torch.randint(0, 256, (n, 144), dtype=torch.uint8, device="cuda")
+    raw[:, 0:2] = torch.tensor([0x00, 0x3C], dtype=torch.uint8, device="cuda")
+    raw[:, 2:4] = torch.tensor([0x00, 0x38], dtype=torch.uint8, device="cuda")
+    ref = dequant_q4_k(raw, torch.bfloat16).view(n, 256)
+    fused = dequant_q4_k_fused(raw, torch.bfloat16)
+    assert torch.equal(ref.view(torch.int16), fused.view(torch.int16))

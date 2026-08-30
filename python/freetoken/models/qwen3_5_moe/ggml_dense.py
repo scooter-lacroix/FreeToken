@@ -253,7 +253,17 @@ def _prefill_bf16_matmul(packed: torch.Tensor, qt: int):
 
 
 def _dequant_chunked(packed: torch.Tensor, qt: int, n: int, k: int) -> torch.Tensor:
-    """Row-chunked dequant to bound fp32 transients (~70MB per 4096 rows)."""
+    """Row-chunked dequant to bound fp32 transients (~70MB per 4096 rows).
+
+    Q4_K goes through the fused single-kernel Triton dequant (bit-exact,
+    ~139 GB/s vs the elementwise port's ~16 on gfx1100 -- the per-use twin
+    path is the dominant prefill phase at ~30ms/layer x 65 layers).
+    """
+    if qt == 12 and packed.is_cuda and k % 256 == 0:
+        from freetoken.kernel.triton.kquant_dequant import dequant_q4_k_fused
+
+        return dequant_q4_k_fused(packed.reshape(-1), torch.bfloat16).view(n, k)
+
     from freetoken.models.gguf.dequant import dequantize
 
     out = torch.empty((n, k), dtype=torch.bfloat16, device=packed.device)
