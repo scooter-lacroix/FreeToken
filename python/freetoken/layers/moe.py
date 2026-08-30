@@ -280,9 +280,18 @@ class OffloadMoELayer(MoELayer):
         past the router. ``topk_ids`` must be safe to mutate in place (decode
         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
         """
+        import os as _os
+
         ctx = get_global_ctx()
         if ctx.batch.is_prefill:
-            out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
+            if _os.environ.get("FREETOKEN_MOE_PHASE_LOG", "0") in {"1", "true", "yes"}:
+                out = _phase_timed(
+                    "moe_move_and_gemm", self._prefill_routed,
+                    hidden_states, topk_weights, topk_ids,
+                )
+                _phase_maybe_report()
+            else:
+                out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
         else:
             out = self._decode_routed(hidden_states, topk_weights, topk_ids)
         return self._maybe_all_reduce(out)
@@ -307,6 +316,8 @@ class OffloadMoELayer(MoELayer):
     ):
         import os as _os
 
+        if _os.environ.get("FREETOKEN_MOE_PHASE_LOG", "0") == "PING":
+            print("[moe-phase] PING prefill_forward reached", flush=True)
         if _os.environ.get("FREETOKEN_MOE_PHASE_LOG", "0") not in {"1", "true", "yes"}:
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
