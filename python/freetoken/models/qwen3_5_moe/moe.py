@@ -49,7 +49,31 @@ class _SharedExpert(BaseOP):
             self.down_proj = LinearRowParallel(intermediate_size, hidden_size, has_bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
+        import os as _os
+
+        if _os.environ.get("FREETOKEN_PHASE_TIMING", "0") not in {"1", "true", "yes"}:
+            return self.down_proj.forward(silu_and_mul(self.gate_up_proj.forward(x)))
+        import time as _tt
+
+        from freetoken.models.qwen3_5_moe.model import Qwen3_5DecoderLayer as _L
+
+        t0 = _tt.perf_counter()
+        gu = self.gate_up_proj.forward(x)
+        if gu.shape[0] > 8:
+            torch.cuda.synchronize()
+        t1 = _tt.perf_counter()
+        act = silu_and_mul(gu)
+        if gu.shape[0] > 8:
+            torch.cuda.synchronize()
+        t2 = _tt.perf_counter()
+        out = self.down_proj.forward(act)
+        if gu.shape[0] > 8:
+            torch.cuda.synchronize()
+        t3 = _tt.perf_counter()
+        _L._ph["mlp_gate_up"] = _L._ph.get("mlp_gate_up", 0.0) + t1 - t0
+        _L._ph["mlp_silu"] = _L._ph.get("mlp_silu", 0.0) + t2 - t1
+        _L._ph["mlp_down"] = _L._ph.get("mlp_down", 0.0) + t3 - t2
+        return out
 
 
 class Qwen3_5DenseMLP(_SharedExpert):

@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 
 class Qwen3_5DecoderLayer(BaseOP):
+    _ph: dict = {}
     """Pre-norm hybrid block: ``x = x + mixer(input_norm(x)); x = x + moe(post_norm(x))``,
     where the mixer is a GatedDeltaNet (linear layers) or gated attention (full layers).
     All norms are Gemma-style (1+weight)."""
@@ -58,14 +59,50 @@ class Qwen3_5DecoderLayer(BaseOP):
     def forward(self, hidden: torch.Tensor, residual: torch.Tensor | None):
         # Residual-stream form: fuse each residual-add into the next RMSNorm
         # (GemmaRMSNorm.forward_add_residual) so add + norm are one kernel per sublayer.
+        import os as _os
+
+        _pt = _os.environ.get("FREETOKEN_PHASE_TIMING", "0") in {"1", "true", "yes"}
+        if _pt:
+            import time as _tt
+
+            def _lap(key, _st=[None]):
+                torch.cuda.synchronize()
+                now = _tt.perf_counter()
+                if _st[0] is not None:
+                    Qwen3_5DecoderLayer._ph[key] = (
+                        Qwen3_5DecoderLayer._ph.get(key, 0.0) + now - _st[0]
+                    )
+                _st[0] = now
+
+            _lap(None)  # start the clock
         if residual is None:
             residual = hidden
             hidden = self.input_layernorm.forward(hidden)
         else:
             hidden, residual = self.input_layernorm.forward_add_residual(hidden, residual)
+        if _pt:
+            _lap("norm_in")
         hidden = self.linear_attn.forward(hidden) if self._is_linear else self.self_attn.forward(hidden)
+        if _pt:
+            _lap("linear_attn" if self._is_linear else "self_attn")
         hidden, residual = self.post_attention_layernorm.forward_add_residual(hidden, residual)
+        if _pt:
+            _lap("norm_mid")
         hidden = self.mlp.forward(hidden)
+        if _pt:
+            _lap("mlp")
+            Qwen3_5DecoderLayer._ph["_n"] = Qwen3_5DecoderLayer._ph.get("_n", 0) + 1
+            if Qwen3_5DecoderLayer._ph["_n"] % 128 == 0:
+                ph = {k: v for k, v in Qwen3_5DecoderLayer._ph.items() if k != "_n"}
+                tot = sum(ph.values())
+                parts = " ".join(f"{k}={v:.2f}s" for k, v in sorted(ph.items(), key=lambda kv: -kv[1]))
+                print(
+                    f"[layer-phase] n={Qwen3_5DecoderLayer._ph['_n']} total={tot:.2f}s {parts}",
+                    flush=True,
+                )
+                for k in Qwen3_5DecoderLayer._ph:
+                    if k != "_n":
+                        Qwen3_5DecoderLayer._ph[k] = 0.0
         return hidden, residual
 
 
