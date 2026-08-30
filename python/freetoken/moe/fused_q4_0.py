@@ -165,4 +165,82 @@ def fused_experts_ggml_split(
 # Back-compat alias for the Q4_0 path.
 fused_experts_gguf_q4_0 = fused_experts_ggml
 
-__all__ = ["fused_experts_ggml", "fused_experts_ggml_mixed", "fused_experts_ggml_split", "fused_experts_gguf_q4_0"]
+__all__ = [
+    "fused_experts_ggml",
+    "fused_experts_ggml_mixed",
+    "fused_experts_ggml_split",
+    "fused_experts_ggml_split_bf16_prefill",
+    "fused_experts_gguf_q4_0",
+]
+
+
+def fused_experts_ggml_split_bf16_prefill(
+    hidden_states: torch.Tensor,
+    gate_q: torch.Tensor,   # [slots, I, row_bytes(H)]
+    up_q: torch.Tensor,     # [slots, I, row_bytes(H)]
+    down_q: torch.Tensor,   # [slots, H, row_bytes(I)]
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    activation: str,
+    quant_types: tuple[int, int],
+) -> torch.Tensor:
+    """Prefill fast path for the split ggml banks: per-expert dequant + bf16
+    GEMM over sorted route groups.
+
+    The MMVQ/MMQ path runs the decode-class ``mul_mat_q4_K`` kernel at prefill
+    batch sizes -- profiled at 94% of prefill GPU time and ~1% of gfx1100 peak
+    at T=2048. Here the banks are already on-GPU (prefill materializes the
+    layer), so dequantizing each routed expert (a ~1-2MB device-local read)
+    and running rocBLAS over its sorted token group amortizes the same packed
+    bytes into a compute-bound GEMM (~30x measured per call shape).
+    """
+    from freetoken.models.gguf.dequant import dequantize
+
+    act_fn = _ACT[activation]
+    qt_gu, qt_dn = int(quant_types[0]), int(quant_types[1])
+    num_tokens, h = hidden_states.shape
+    i_size = gate_q.shape[1]
+    top_k = topk_ids.shape[1]
+    slots = gate_q.shape[0]
+
+    flat_e = topk_ids.reshape(-1)
+    order = torch.argsort(flat_e, stable=True)
+    # token per SORTED row: sorted row i serves flat position order[i], whose
+    # source token is order[i] // top_k. Group i's rows are the contiguous
+    # slice [start, start+cnt) of this mapping — index it by the slice, never
+    # by the flat positions again (double-indexing silently permutes tokens).
+    tokens = order.div(top_k, rounding_mode="floor")
+    counts = torch.bincount(flat_e, minlength=slots).tolist()
+
+    inter = torch.empty(
+        (num_tokens * top_k, i_size), dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    out = torch.empty(
+        (num_tokens * top_k, h), dtype=hidden_states.dtype,
+        device=hidden_states.device,
+    )
+    start = 0
+    for e, cnt in enumerate(counts):
+        if cnt == 0:
+            continue
+        grp = order[start:start + cnt]
+        xg = hidden_states.index_select(0, tokens[start:start + cnt])
+        w_g = dequantize(gate_q[e], qt_gu, torch.bfloat16).view(i_size, -1)
+        w_u = dequantize(up_q[e], qt_gu, torch.bfloat16).view(i_size, -1)
+        g = xg @ w_g.t()
+        u = xg @ w_u.t()
+        inter[grp] = act_fn(torch.cat([g, u], dim=-1))
+        start += cnt
+    start = 0
+    for e, cnt in enumerate(counts):
+        if cnt == 0:
+            continue
+        grp = order[start:start + cnt]
+        w_dn = dequantize(down_q[e], qt_dn, torch.bfloat16).view(h, -1)
+        out[grp] = inter[start:start + cnt] @ w_dn.t()
+        start += cnt
+    out = out.to(torch.float32) * topk_weights.reshape(-1, 1).to(torch.float32)
+    return (
+        out.reshape(num_tokens, top_k, h).to(hidden_states.dtype).sum(dim=1)
+    )

@@ -194,6 +194,10 @@ class MoELayer(BaseOP):
         return self._maybe_all_reduce(final_hidden_states)
 
 
+_MOE_BF16_PREFILL_MIN_T = int(
+    __import__("os").environ.get("FREETOKEN_MOE_BF16_PREFILL_MIN_T", "64")
+)
+
 # Phase-wall accumulator (FREETOKEN_MOE_PHASE_LOG=1): where a prefill chunk's
 # wall time goes — router topk, expert movement (streaming/materialize), expert
 # GEMM, and the un-attributed remainder. Printed once per N prefill calls.
@@ -626,6 +630,15 @@ class OffloadMoELayer(MoELayer):
             # SSD tier: unfused gate/up/down slot pools, pageable-staged copies.
             gate, up, down = views
             qt_pair = cache.ggml_quant_types[self.layer_id]
+            if is_prefill and hidden_states.shape[0] > _MOE_BF16_PREFILL_MIN_T:
+                from freetoken.moe.fused_q4_0 import (
+                    fused_experts_ggml_split_bf16_prefill,
+                )
+
+                return fused_experts_ggml_split_bf16_prefill(
+                    hidden_states, gate, up, down, topk_weights, topk_ids,
+                    self.activation, qt_pair,
+                )
             if not is_prefill and hidden_states.shape[0] <= 8:
                 from freetoken.moe.fused_q4_0 import (
                     _triton_moe_ok,
