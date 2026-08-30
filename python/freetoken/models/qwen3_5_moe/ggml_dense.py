@@ -121,6 +121,8 @@ class QuantGgmlLinear(BaseOP):
     ~200 GB/s effective over hipBLASLt GEMV).
     """
 
+    _stats: dict = {}
+
     def __init__(self, out_features: int, in_features: int):
         self.out_features = out_features
         self.in_features = in_features
@@ -142,13 +144,51 @@ class QuantGgmlLinear(BaseOP):
             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        import os as _os
+
+        _trace = _os.environ.get("FREETOKEN_QGL_TRACE", "0") == "1"
+        if _trace:
+            import time as _t
+
+            _t0 = _t.perf_counter()
+        used_bf16 = False
         if x.shape[0] > _PREFILL_BF16_MIN_T:
             fast = _prefill_bf16_matmul(self.packed, self.quant_type)
             if fast is not None:
+                used_bf16 = True
                 # fast is [N,K] row-major == col-major [K,N]: rocBLAS consumes
                 # the transpose without a copy
-                return x @ fast.t()
-        return _kq_gemv(self.packed, x, self.quant_type, self.out_features)
+                out = x @ fast.t()
+                if _trace:
+                    QuantGgmlLinear._stats[("bf16", x.shape[0])] = (
+                        QuantGgmlLinear._stats.get(("bf16", x.shape[0]), 0) + 1
+                    )
+                    QuantGgmlLinear._stats["_bf16_s"] = (
+                        QuantGgmlLinear._stats.get("_bf16_s", 0.0) + _t.perf_counter() - _t0
+                    )
+                return out
+        out = _kq_gemv(self.packed, x, self.quant_type, self.out_features)
+        if _trace:
+            QuantGgmlLinear._stats[("mmq", x.shape[0])] = (
+                QuantGgmlLinear._stats.get(("mmq", x.shape[0]), 0) + 1
+            )
+            QuantGgmlLinear._stats["_mmq_s"] = (
+                QuantGgmlLinear._stats.get("_mmq_s", 0.0) + _t.perf_counter() - _t0
+            )
+            n = sum(v for k, v in QuantGgmlLinear._stats.items() if k != "_bf16_s" and k != "_mmq_s")
+            if n % 500 == 0:
+                bf = QuantGgmlLinear._stats.get("_bf16_s", 0.0)
+                mq = QuantGgmlLinear._stats.get("_mmq_s", 0.0)
+                top = sorted(
+                    ((k, v) for k, v in QuantGgmlLinear._stats.items()
+                     if isinstance(k, tuple)),
+                    key=lambda kv: -kv[1],
+                )[:6]
+                print(
+                    f"[qgl-stats] n={n} bf16_s={bf:.1f} mmq_s={mq:.1f} top={top}",
+                    flush=True,
+                )
+        return out
 
 
 # ---------------------------------------------------------------------------
