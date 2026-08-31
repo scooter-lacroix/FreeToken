@@ -219,6 +219,14 @@ def _linear_pool_num_slots(config) -> int:
     mr = config.max_running_req
     if config.cache_type != "hybrid_radix":
         return mr + 1  # live + dummy/padding
+    import os as _os
+
+    override = int(_os.environ.get("FREETOKEN_LINEAR_STATE_CACHE_SLOTS", "0") or 0)
+    if override > 0:
+        # snapshot-cache slots beyond the 4/req working set: each holds one reusable
+        # GDN checkpoint for hybrid-radix prefix reuse (too few and every admission's
+        # evict_mamba tombstones the just-donated snapshot -> reruns re-prefill).
+        return 4 * mr + override + 1
     ratio = config.linear_state_cache_ratio
     n_cache = max(4, int(ratio * mr))
     return 4 * mr + n_cache + 1  # live + 2 ping-pong + locked committed snapshot + cache + padding
