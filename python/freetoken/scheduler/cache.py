@@ -372,39 +372,38 @@ class CacheManager:
                     req.input_ids[:L], page_indices[:L], frozen)
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
-                self._free(page_indices[free_upto : max(free_upto, prefix_len)])
+                # tree owns [0, prefix_len) after this insert; free only the request's
+                # non-donated span [free_upto, prefix_len) -- never the donated range.
+                if prefix_len > free_upto:
+                    self._free(page_indices[free_upto:prefix_len])
                 free_upto = max(free_upto, L)
             # Donate the live slot (final full-sequence state). The live state is at cached_len;
             # only attach it when cached_len is itself the page-aligned node boundary (always for
             # page_size==1). For page_size>1 a non-aligned cached_len would attach an over-advanced
             # state to a shorter prefix node -> skip the finish-donate (the ×64 prefill snapshots
             # remain as reuse points).
-            # Prompt-boundary donation: the reusable checkpoint for a future PROMPT is the
-            # state at the prompt's last token -- the live slot (prompt+generated) is a
-            # deeper key that a prompt-length query can never walk to (match truncates at
-            # the query and only walks UP), so donating it made reruns match 0 forever.
-            # Donate the LIVE slot only when the state matches the prompt boundary, i.e.
-            # generation actually consumed nothing (max_tokens fully ignored?) -- in every
-            # other case fall back to a prompt-boundary ×64 snapshot if one exists.
-            prompt_len = align_down(req.max_device_len - req.output_len, self.page_size)
-            live_state_at_prompt = req.cached_len == (
-                req.max_device_len - req.output_len + 1
-            )  # exactly one decode token drawn? then live state == prompt boundary +1... no:
-            # cached_len counts KV rows committed = prompt + generated-so-far. The live slot
-            # state is valid for cached_len tokens. It is reusable as a prompt-prefix
-            # checkpoint only if it is at a depth a future prompt would query, i.e. the
-            # prompt boundary itself. Keep it simple and correct: donate the live slot at
-            # its own boundary as before, BUT ALSO ensure a prompt-boundary ×64 snapshot
-            # exists (the chunk commits already donate those; if none survived because the
-            # request finished before any ×64 boundary, donate the live slot AT the prompt
-            # boundary only when cached_len == prompt boundary).
+            #
+            # FREE-RANGE CONTRACT (the rerun-miss bug): after insert(), the tree OWNS the
+            # pages in [0, prefix_len) -- its nodes reference them. Only the REQUEST's
+            # non-donated pages may be freed:
+            #   [free_upto, prefix_len)  -> duplicate: in the tree already (via a
+            #                               chunk-commit) AND in this row -> free
+            #   [prefix_len, old_cached) -> request-only tail not covered by the donate
+            #                               (happens when the donate truncated) -> free
+            # The old `max(free_upto, prefix_len)` form freed [free_upto, prefix_len)
+            # INCLUSIVE of the donated range when admission had no prefix (free_upto=0,
+            # prefix_len=full) -- invalidating every page the tree just received.
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
             if insert_len == req.cached_len and insert_len > 0:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
                 self.unlock(old_handle)
-                self._free(page_indices[free_upto : max(free_upto, prefix_len)])
+                # [free_upto, prefix_len): dup vs tree -> free. [prefix_len, old): request
+                # tail the donate truncated away -> free. [0, free_upto): committed by
+                # earlier chunk commits (tree-owned) -> keep.
+                self._free(page_indices[free_upto : prefix_len])
+                self._free(page_indices[prefix_len : old_handle.cached_len])
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
             else:
                 self.unlock(old_handle)
