@@ -77,23 +77,7 @@ class HybridRadixCache:
         """Match the token prefix, then truncate the reusable length to the deepest node on
         the path that still owns a LIVE snapshot (a continuation can only resume the GDN
         recurrence from a checkpointed boundary)."""
-        import os as _os
-
-        _dbg = _os.environ.get("FREETOKEN_RADIX_DEBUG", "0") == "1"
         node, _ = self._walk(input_ids)
-        if _dbg:
-            _pl = self._path_len(node)
-            chain = []
-            _cur = node
-            while not _cur.is_root():
-                chain.append(f"len={_cur.length} mv={'Y' if _cur.mamba_value is not None else 'N'} refs={_cur.ref_count}/{_cur.mamba_ref_count}")
-                _cur = _cur.parent
-            print(
-                f"[walk] query={len(input_ids)} walked_to={_pl} "
-                f"children_of_root={list(self.root.children.keys())[:4]} "
-                f"chain(root->node): {list(reversed(chain))}",
-                flush=True,
-            )
         # walk up to the deepest node whose END boundary has a live snapshot
         cur, end_len = node, self._path_len(node)
         while not cur.is_root():
@@ -112,14 +96,6 @@ class HybridRadixCache:
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, kv_indices = input_ids[:insert_len], kv_indices[:insert_len]
         node, prefix_len = self._walk(input_ids)
-        import os as _os
-
-        if _os.environ.get("FREETOKEN_RADIX_DEBUG", "1") == "1":
-            print(
-                f"[insert] insert_len={insert_len} walked_prefix={prefix_len} "
-                f"node_children_after={list(node.children.keys())[:3]}",
-                flush=True,
-            )
         if prefix_len != insert_len:
             new_node = RadixTreeNode(self.key_fn)
             new_node.set_key_value(input_ids[prefix_len:], kv_indices[prefix_len:].clone())
