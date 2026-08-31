@@ -491,19 +491,36 @@ class Scheduler(SchedulerIOMixin):
 
         batch, (_, next_tokens_cpu, copy_done) = last_data[0].batch, last_data[1]
         copy_done.synchronize()
+        import os as _os
+
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
-                    # Don't cache intermediate chunks; the full prompt is cached once when the
-                    # final chunk is processed. Caching here snapshots a handle the next chunk
-                    # already copied (overlap), so cache_req double-frees the prior chunk.
                     if req.aborted:
                         # Aborted mid-chunked-prefill while this chunk was in flight: the abort
                         # popped the pending continuation (no next chunk launches), and this
                         # drain point frees the chunk's pages/slots exactly once.
                         self._free_req_resources(req)
+                        continue
+                    # Hybrid radix: commit the chunk's ×64 snapshot + KV prefix NOW. The old
+                    # unconditional skip left chunked prefills with NO reusable snapshot below
+                    # the finish-donate depth (prompt+generated) -- identical-prompt reruns
+                    # matched 0 and re-prefilled. The commit donates the frozen slot at the
+                    # tracked boundary, re-points this request's row to the canonical pages,
+                    # and re-binds req.cache_handle; the next chunk inherits the updated
+                    # handle via try_add_one's chunked_req branch.
+                    if (
+                        _os.environ.get("FREETOKEN_CHUNK_COMMIT", "0") in {"1", "true", "yes"}
+                        and self.cache_manager.is_hybrid
+                        and req.table_idx != -1
+                    ):
+                        # KNOWN ISSUE (2026-08-31): repeated dedup re-inserts drift the
+                        # hybrid full_evictable counter (~2 pages/shared-token) and trip
+                        # check_integrity at idle. Fix the insert/evict counter accounting
+                        # before enabling by default.
+                        self.cache_manager.cache_req(req, finished=False)
                     continue
                 if req.aborted:
                     # Aborted while this final-chunk prefill / decode step was in flight: free
