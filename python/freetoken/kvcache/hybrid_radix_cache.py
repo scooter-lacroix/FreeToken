@@ -120,11 +120,13 @@ class HybridRadixCache:
                 f"node_children_after={list(node.children.keys())[:3]}",
                 flush=True,
             )
+        new_node_len = 0
         if prefix_len != insert_len:
             new_node = RadixTreeNode(self.key_fn)
             new_node.set_key_value(input_ids[prefix_len:], kv_indices[prefix_len:].clone())
             new_node.set_parent(node)
             self.full_evictable += new_node.length
+            new_node_len = new_node.length
             node = new_node
         if node.is_root():
             return prefix_len, True   # root can't hold a snapshot; report exist so caller frees it
@@ -133,6 +135,17 @@ class HybridRadixCache:
         node.mamba_value = mamba_value              # fills a fresh node or a tombstone
         if node.mamba_ref_count == 0:
             self.mamba_evictable += 1
+        import os as _os
+
+        if _os.environ.get("FREETOKEN_RADIX_DEBUG", "0") == "2":
+            real = sum(n.length for n in self._leaves() if n.ref_count == 0)
+            if real != self.full_evictable:
+                print(
+                    f"[ins-drift] new_span={new_node_len} counter={self.full_evictable} "
+                    f"actual={real} prefix_len={prefix_len} insert_len={insert_len}",
+                    flush=True,
+                )
+                self.full_evictable = real
         return prefix_len, False
 
     # ---------------------------------------------------------------- locking (dual)
@@ -210,6 +223,22 @@ class HybridRadixCache:
             else:
                 self._free_node_mamba(node, mamba)  # tombstone internal (or locked-KV) node
                 freed += 1
+        import os as _os
+
+        if _os.environ.get("FREETOKEN_RADIX_DEBUG", "0") == "2":
+            import torch as _t
+
+            real_fe = sum(n.length for n in self._leaves() if n.ref_count == 0)
+            real_mv = len(self._snapshot_nodes())
+            if real_fe != self.full_evictable or real_mv != self.mamba_evictable:
+                print(
+                    f"[evict-drift] full_evictable counter={self.full_evictable} "
+                    f"actual={real_fe} | mamba_evictable counter={self.mamba_evictable} "
+                    f"actual={real_mv} | freed={freed} kv={len(kv)} mamba={len(mamba)}",
+                    flush=True,
+                )
+                self.full_evictable = real_fe
+                self.mamba_evictable = real_mv
         return EvictResult(torch.cat(kv) if kv else self.empty, mamba)
 
     @property
