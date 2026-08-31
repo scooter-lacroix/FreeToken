@@ -381,6 +381,8 @@ class CacheManager:
             # remain as reuse points).
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
+            # finished=True only fires after the request's LAST forward drain, so the
+            # live slot's content is final here -- no decode-write corruption possible.
             if insert_len == req.cached_len and insert_len > 0:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
@@ -394,9 +396,36 @@ class CacheManager:
             return
 
         # Prefill chunk commit: donate the frozen snapshot at the tracked ×64 boundary.
+        # Paced: only donate when the snapshot cache has room, so the commit's replacement
+        # alloc never triggers evict_mamba -- un-paced, a long prompt donates at every ×64
+        # boundary (~63/request), the replacement allocs drain the pool, and evict_mamba
+        # frees+UNLINKS the oldest leaf nodes -- the tree self-prunes the prefix it just
+        # built and identical-prompt reruns match 0.
         L = req.mamba_last_track_seqlen
         if L is None:
             return  # no ×64 boundary crossed this chunk; req keeps its pages (committed later)
+        import os as _os
+
+        if _os.environ.get("FREETOKEN_RADIX_DEBUG", "0") == "1":
+            print(
+                f"[commit] uid={req.uid} L={L} pool_free={pool.num_free_slots} "
+                f"mamba_evict={self.prefix_cache.mamba_evictable_size}",
+                flush=True,
+            )
+        # Pacing gate: keep >=1 spare slot for the running req's live + commit
+        # replacement by evicting the OLDEST cached snapshot (LRU replace — this is a
+        # cache, replacement is its normal operation; skipping donations instead meant
+        # a full cache starved every future commit and reruns never matched).
+        if pool.num_free_slots < 3:
+            er = self.prefix_cache.evict_mamba(3 - pool.num_free_slots)
+            pool.free(er.mamba_slots)
+            if len(er.kv_indices):
+                # leaf evictions release their KV pages too -- return them to the page
+                # free-list here (this request owns the free region for its prefix)
+                self._free(er.kv_indices)
+            if pool.num_free_slots < 1:
+                req.mamba_last_track_seqlen = None
+                return
         if align_down(L, self.page_size) != L:
             # page_size>1 only: insert would align the key down, attaching a state that encodes
             # L tokens to a SHORTER node -- a future hit would COW-restore an over-advanced
