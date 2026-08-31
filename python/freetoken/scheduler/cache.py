@@ -90,6 +90,14 @@ class CacheManager:
         # have identical ids across images but carry different content (and KV), so a
         # match would serve the wrong image's KV. Match against the empty prefix.
         ids = req.input_ids[:0] if req.mm_embeds is not None else req.input_ids[: input_len - 1]
+        import os as _os
+
+        if _os.environ.get("FREETOKEN_RADIX_DEBUG", "0") == "1":
+            m0 = self.prefix_cache.match_prefix(ids)
+            print(
+                f"[radix-dbg] match uid={req.uid} input_len={input_len} matched={m0.cached_len}",
+                flush=True,
+            )
         if self.is_swa:
             from freetoken.kvcache.swa_radix_cache import SWACacheHandle
             m = self.prefix_cache.match_prefix(ids)
@@ -409,6 +417,23 @@ class CacheManager:
             else:
                 self.unlock(old_handle)
                 self._free(page_indices[free_upto :])
+            import os as _os
+
+            if _os.environ.get("FREETOKEN_RADIX_DEBUG", "0") == "1":
+                chain = []
+                _n = self.prefix_cache.root
+                def _walk_chain(n, depth=0):
+                    if depth > 3 or n.is_root():
+                        return
+                    for c in n.children.values():
+                        chain.append(f"[{c.length}|{'mv' if c.mamba_value is not None else '--'}|r{c.ref_count}]")
+                        _walk_chain(c, depth + 1)
+                _walk_chain(self.prefix_cache.root)
+                print(
+                    f"[radix-dbg] finish uid={req.uid} cached_len={req.cached_len} "
+                    f"keep_live={keep_live} tree: {' '.join(chain[:14])}",
+                    flush=True,
+                )
             self._free_req_slots(req, keep_live=keep_live)
             return
 
