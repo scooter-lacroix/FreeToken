@@ -286,7 +286,22 @@ class CacheManager:
         if self.is_swa:
             return self._cache_req_swa(req, finished=finished)
         if self.is_hybrid:
-            return self._cache_req_hybrid(req, finished=finished)
+            r = self._cache_req_hybrid(req, finished=finished)
+            import os as _os
+
+            if _os.environ.get("FREETOKEN_RADIX_DEBUG", "0") in {"1", "2"}:
+                pc = self.prefix_cache
+                held = self.num_pages - len(self.free_slots)
+                counted = (pc.full_evictable + pc.full_protected) // self.page_size
+                drift = held - counted
+                if abs(drift) > 64:
+                    print(
+                        f"[drift] finished={finished} uid={req.uid} held={held} "
+                        f"counted={counted} drift={drift} "
+                        f"fe={pc.full_evictable} fp={pc.full_protected}",
+                        flush=True,
+                    )
+            return r
         # ==================================== valid cache region ====================================
         # [0, req.cached_len)                       This part is valid for attention kernel read/write.
         # [0, old_handle.cached_len)                This part is in the prefix cache before prefill.
