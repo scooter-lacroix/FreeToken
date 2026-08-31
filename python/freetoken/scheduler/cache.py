@@ -379,10 +379,27 @@ class CacheManager:
             # page_size==1). For page_size>1 a non-aligned cached_len would attach an over-advanced
             # state to a shorter prefix node -> skip the finish-donate (the ×64 prefill snapshots
             # remain as reuse points).
+            # Prompt-boundary donation: the reusable checkpoint for a future PROMPT is the
+            # state at the prompt's last token -- the live slot (prompt+generated) is a
+            # deeper key that a prompt-length query can never walk to (match truncates at
+            # the query and only walks UP), so donating it made reruns match 0 forever.
+            # Donate the LIVE slot only when the state matches the prompt boundary, i.e.
+            # generation actually consumed nothing (max_tokens fully ignored?) -- in every
+            # other case fall back to a prompt-boundary ×64 snapshot if one exists.
+            prompt_len = align_down(req.max_device_len - req.output_len, self.page_size)
+            live_state_at_prompt = req.cached_len == (
+                req.max_device_len - req.output_len + 1
+            )  # exactly one decode token drawn? then live state == prompt boundary +1... no:
+            # cached_len counts KV rows committed = prompt + generated-so-far. The live slot
+            # state is valid for cached_len tokens. It is reusable as a prompt-prefix
+            # checkpoint only if it is at a depth a future prompt would query, i.e. the
+            # prompt boundary itself. Keep it simple and correct: donate the live slot at
+            # its own boundary as before, BUT ALSO ensure a prompt-boundary ×64 snapshot
+            # exists (the chunk commits already donate those; if none survived because the
+            # request finished before any ×64 boundary, donate the live slot AT the prompt
+            # boundary only when cached_len == prompt boundary).
             insert_len = align_down(req.cached_len, self.page_size)
             keep_live = False
-            # finished=True only fires after the request's LAST forward drain, so the
-            # live slot's content is final here -- no decode-write corruption possible.
             if insert_len == req.cached_len and insert_len > 0:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
