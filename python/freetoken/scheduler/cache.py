@@ -380,7 +380,8 @@ class CacheManager:
                     req.input_ids[:L], page_indices[:L], frozen)
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
-                self._free(page_indices[free_upto : max(free_upto, prefix_len)])
+                # Tree owns [0, L) post-insert (donated span + COW-shared canonical pages):
+                # NOTHING here is the request's private memory any more.
                 free_upto = max(free_upto, L)
             # Donate the live slot (final full-sequence state). The live state is at cached_len;
             # only attach it when cached_len is itself the page-aligned node boundary (always for
@@ -412,7 +413,10 @@ class CacheManager:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
                 self.unlock(old_handle)
-                self._free(page_indices[free_upto : max(free_upto, prefix_len)])
+                # FREE-RANGE: the tree owns ALL of [0, cached_len) post-donate -- its nodes
+                # reference those pages, and a COW-restored request's row was RE-POINTED to
+                # the same canonical pages (shared, not duplicate). No page frees here;
+                # eviction reclaims on demand.
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
             else:
                 self.unlock(old_handle)
@@ -432,6 +436,14 @@ class CacheManager:
                 print(
                     f"[radix-dbg] finish uid={req.uid} cached_len={req.cached_len} "
                     f"keep_live={keep_live} tree: {' '.join(chain[:14])}",
+                    flush=True,
+                )
+            import os as _os
+
+            if _os.environ.get("FREETOKEN_RADIX_DEBUG", "0") == "1":
+                print(
+                    f"[radix-dbg] finish cached_len={req.cached_len} insert_len={insert_len} "
+                    f"keep_live={keep_live}",
                     flush=True,
                 )
             self._free_req_slots(req, keep_live=keep_live)
