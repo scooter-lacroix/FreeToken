@@ -243,10 +243,12 @@ class HybridRadixCache:
 
     @property
     def full_evictable_size(self) -> int:
+        self._recount()
         return self.full_evictable
 
     @property
     def mamba_evictable_size(self) -> int:
+        self._recount()
         return self.mamba_evictable
 
     @property
@@ -254,6 +256,8 @@ class HybridRadixCache:
         """KV-page currency, for code that reads a BasePrefixCache size_info (metrics/usage).
         The GDN-snapshot currency is reported via mamba_evictable_size."""
         from .base import SizeInfo
+
+        self._recount()
         return SizeInfo(evictable_size=self.full_evictable, protected_size=self.full_protected)
 
     def check_integrity(self) -> None:
@@ -263,6 +267,35 @@ class HybridRadixCache:
             assert n.mamba_value is not None and n.mamba_ref_count >= 0 and n.ref_count >= 0
 
     # ---------------------------------------------------------------- helpers
+    def _recount(self) -> None:
+        """Exact recompute of the four accounting scalars from the tree.
+
+        The incremental maintenance drifted through the dedup/split/evict
+        interplay (COW-shared spans double-counted; mixed span/node-length
+        decompositions) and tripped check_integrity at idle, killing workers.
+        The tree is small (per-token nodes, <= a few tens of thousands) and
+        recount runs only on status/integrity reads -- O(nodes) is negligible.
+        """
+        fe = fp = me = mp = 0
+        stack = [self.root]
+        while stack:
+            n = stack.pop()
+            if n.is_root():
+                stack.extend(n.children.values())
+                continue
+            if n.ref_count > 0:
+                fp += n.length
+            else:
+                fe += n.length
+            if n.mamba_value is not None:
+                if n.mamba_ref_count > 0:
+                    mp += 1
+                else:
+                    me += 1
+            stack.extend(n.children.values())
+        self.full_evictable, self.full_protected = fe, fp
+        self.mamba_evictable, self.mamba_protected = me, mp
+
     def _free_node_mamba(self, node: RadixTreeNode, out: List[int]) -> None:
         if node.mamba_value is not None:
             out.append(node.mamba_value)
