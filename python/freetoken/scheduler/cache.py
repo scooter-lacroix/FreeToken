@@ -29,6 +29,18 @@ _SWA_EVICTION_INTERVAL = _swa_eviction_interval()
 _SWA_RETAIN_GAP = 16
 
 
+def _audit_on() -> bool:
+    """FREETOKEN_FREE_AUDIT=1 enables the page double-free / phantom-free auditor."""
+    return os.environ.get("FREETOKEN_FREE_AUDIT", "0") == "1"
+
+
+def _dbg_free(tag, tensor, lo, hi):
+    """Audit helper: log the [lo:hi) row slice a free covers (env-gated)."""
+    if _audit_on() and len(tensor) > 0:
+        v = tensor.tolist()
+        print(f"[free-site] {tag} [{lo}:{hi}) n={len(v)} first={v[0]} last={v[-1]}", flush=True)
+
+
 class CacheManager:
     def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                  linear_state_pool=None, swa_pool=None, sliding_window_size=None):
@@ -362,6 +374,11 @@ class CacheManager:
         (final full-sequence state, zero-copy since the req is done) and free the req's slots."""
         from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
 
+        if _audit_on():
+            if self._audit_state is None:
+                self._audit_state = {"live": set(), "hits": 0}
+            self._audit_state["uid"] = f"{req.uid}/{int(finished)}"
+
         pool = self.linear_state_pool
         old_handle = req.cache_handle
         page_indices = self.page_table[req.table_idx, : req.cached_len]
@@ -381,13 +398,11 @@ class CacheManager:
             # is this request's dup to free. The frozen slot is consumed either way (taken by
             # the tree or freed here) and both ping-pong refs are dropped before
             # _free_req_slots so nothing double-frees.
-            # Free floor: mamba_commit_upto is the deepest boundary the TREE owns via this
-            # request's own chunk commits (advanced below / in the commit path). Pages in
-            # [commit watermark, prefix_len) are true dups of OTHER nodes; pages below the
-            # watermark are shared with this request's own donated nodes and must NEVER be
-            # freed (the old old_handle.cached_len floor double-freed them every commit --
-            # the ~75k-pages/request phantom free-list inflation).
-            free_upto = max(old_handle.cached_len, getattr(req, "mamba_commit_upto", 0) or 0)
+            # NO dedup free in the finish branches either: every insert's prefix_len is a
+            # boundary of LIVE tree nodes, so [0, prefix_len) is tree-owned by construction
+            # (admission-canonical pages or this request's own donations). The old
+            # old_handle.cached_len-floored frees double-freed tree-protected pages on every
+            # commit/finish -- the ~75k-pages/request phantom ledger inflation.
             L = req.mamba_last_track_seqlen
             if (
                 L is not None
@@ -401,8 +416,8 @@ class CacheManager:
                     req.input_ids[:L], page_indices[:L], frozen)
                 pool.free([s for s in req.mamba_ping_pong if mamba_exist or s != frozen])
                 req.mamba_ping_pong = None
-                self._free(page_indices[free_upto : max(free_upto, prefix_len)])
-                free_upto = max(free_upto, L)
+                # no dedup free: [0, prefix_len) is tree-owned by the same argument as the
+                # commit path (prefix_len is a live-node boundary)
             # Donate the live slot (final full-sequence state). The live state is at cached_len;
             # only attach it when cached_len is itself the page-aligned node boundary (always for
             # page_size==1). For page_size>1 a non-aligned cached_len would attach an over-advanced
@@ -433,11 +448,12 @@ class CacheManager:
                 prefix_len, mamba_exist = self.prefix_cache.insert(
                     req.input_ids[:insert_len], page_indices[:insert_len], req.linear_slot_idx)
                 self.unlock(old_handle)
-                self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
             else:
+                # page-unaligned finish (page_size>1): the tail beyond the insert boundary is
+                # this request's exclusive pages -- safe to free.
                 self.unlock(old_handle)
-                self._free(page_indices[free_upto : req.cached_len])
+                self._free(page_indices[insert_len : req.cached_len])
             import os as _os
 
             if _os.environ.get("FREETOKEN_RADIX_DEBUG", "0") == "1":
@@ -529,19 +545,26 @@ class CacheManager:
             replacement = pool.alloc(1)[0]
         prefix_len, mamba_exist = self.prefix_cache.insert(
             req.input_ids[:L], page_indices[:L], frozen)
-        # Dedup floor: only spans beyond this request's own committed watermark can be true
-        # dups of other nodes; below it the tree owns THIS request's donated pages.
-        _wm = max(old_handle.cached_len, getattr(req, "mamba_commit_upto", 0) or 0)
-        self._free(page_indices[_wm : max(_wm, prefix_len)])
-        req.mamba_commit_upto = L
-        # Dedup: the tree already owned [_wm, prefix_len) with canonical
-        # pages, and the free above returned this request's own duplicates while its page-table
-        # row still names them -- re-point the row at the tree's canonical pages. The req's
-        # handle stays the ADMISSION handle (locked once, released once at finish).
-        if prefix_len > _wm:
-            m = self.prefix_cache.match_prefix(req.input_ids[:L])
-            self.page_table[req.table_idx, _wm : prefix_len].copy_(
-                m.kv_indices[_wm : prefix_len])
+        # NO dedup free here, by construction: prefix_len (the insert's walked boundary) is a
+        # boundary of LIVE tree nodes, so [0, prefix_len) is fully tree-owned -- either
+        # canonical pages this request matched at admission, or its own earlier commits'
+        # donations. Freeing any of it double-frees tree-protected pages (the ~1-prompt-per-
+        # request phantom ledger inflation). The genuinely-dup case cannot arise under serial
+        # serving (mr=1: nobody else inserts our token range mid-flight); under concurrency a
+        # dup'd extension page would leak until evict -- the safe side. The row re-point below
+        # still keeps the attention backend on canonical pages when insert dedups.
+        m = self.prefix_cache.match_prefix(req.input_ids[:L])
+        _admit_len = old_handle.cached_len
+        if prefix_len > _admit_len:
+            self.page_table[req.table_idx, _admit_len : prefix_len].copy_(
+                m.kv_indices[_admit_len : prefix_len])
+        # Deliberately NO lock here. A per-commit lock cannot be balanced under overlap
+        # scheduling (the next chunk's Req is built BEFORE this chunk's commit runs, so any
+        # req-carried "previous lock" handle reads stale and every commit leaks a ref -- the
+        # 9-slot GDN pool wedges within two requests). Protection of the fresh donation comes
+        # from reserve-first (no evict can run mid-commit) plus LRU order: evict_mamba reclaims
+        # the OLDEST snapshots first, so the latest committed boundary -- the one a rerun
+        # matches -- is the last to go, and the finish donation extends it.
         if not mamba_exist:                                # tree took `frozen`; install replacement
             if replacement is None:
                 self.ensure_mamba_slots(1)
@@ -732,16 +755,23 @@ class CacheManager:
             # when the region exits. A commit that re-points the row in between (the dedup
             # re-point, the SWA one) would otherwise rewrite the pending free list underneath us
             # and return the tree's canonical pages instead of the request's duplicates.
+            if _audit_on():
+                import traceback as _tb
+
+                lazy_free_tags.append(
+                    " <- ".join(f.name for f in _tb.extract_stack()[:-1][-4:])
+                )
             lazy_free_list.append(indices[:: self.page_size].clone())
 
         lazy_free_list: List[torch.Tensor] = []
+        lazy_free_tags: List[str] = []
         try:
             self._free = lazy_free
             yield
         finally:
             del self._free
-            for _pending in lazy_free_list:
-                self._audit_pages(_pending, "free")
+            for _pending, _tag in zip(lazy_free_list, lazy_free_tags):
+                self._audit_pages(_pending, "free", tag=_tag)
             self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
@@ -775,38 +805,49 @@ class CacheManager:
 
     _audit_state: dict | None = None
 
-    def _audit_pages(self, indices: torch.Tensor, site: str) -> None:
+    def _audit_pages(self, indices: torch.Tensor, site: str, tag: str = "?") -> None:
         """Env-gated double-free / phantom-page auditor (FREETOKEN_FREE_AUDIT=1). Tracks every
         page the allocator has handed out and flags frees of pages that are not currently
-        live (already freed, or never allocated -- the phantom free-list inflation class)."""
-        import os as _os
-
-        if _os.environ.get("FREETOKEN_FREE_AUDIT", "0") != "1":
+        live (already freed, or never allocated -- the phantom free-list inflation class).
+        Deferred (lazy) frees carry the defer-time caller tag; direct frees report their
+        stack at the dead-run start."""
+        if not _audit_on():
             return
         if self._audit_state is None:
             self._audit_state = {"live": set(), "hits": 0}
         st = self._audit_state
         if st["hits"] >= 24:
             return
-        for p in indices[:: self.page_size].tolist():
+        ids = indices[:: self.page_size].tolist()
+        for p in ids:
             if site == "alloc":
                 if p in st["live"]:
                     st["hits"] += 1
-                    print(f"[audit] ALLOC of live page {p} at {st.get('tag','?')}", flush=True)
+                    print(f"[audit] ALLOC of live page {p} at {tag}", flush=True)
                 st["live"].add(p)
             elif site == "evict":
                 if p not in st["live"]:
                     st["hits"] += 1
-                    print(f"[audit] EVICT of dead page {p} at {st.get('tag','?')}", flush=True)
+                    print(f"[audit] EVICT of dead page {p} at {tag}", flush=True)
                 st["live"].discard(p)
             else:
                 if p not in st["live"]:
                     if st.get("last_dead") != p - 1:  # name each dead-run's caller once
                         import traceback as _tb
 
-                        _tag = " <- ".join(f.name for f in _tb.extract_stack()[:-1][-5:])
+                        _stack = tag if tag != "?" else (
+                            " <- ".join(f.name for f in _tb.extract_stack()[:-1][-5:])
+                        )
                         st["hits"] += 1
-                        print(f"[audit] FREE dead-run start {p} via {_tag}", flush=True)
+                        st["runs"] = st.get("runs", {})
+                        key = (_stack, p // 4096)
+                        st["runs"][key] = st["runs"].get(key, 0) + 1
+                        n = len(ids)
+                        print(
+                            f"[audit] FREE dead-run n={n} [{ids[0]}..{ids[-1]}] start {p} "
+                            f"via {_stack}",
+                            flush=True,
+                        )
                     st["last_dead"] = p
                 else:
                     st["last_dead"] = None

@@ -162,18 +162,27 @@ def test_hybrid_later_commit_never_frees_its_own_donated_pages():
     r.linear_slot_idx = pool.alloc(1)[0]
     r.mamba_ping_pong = tuple(pool.alloc(2))
     r.mamba_next_track_idx = 1
-    r.mamba_commit_upto = 0  # production init lives in PrefillAdder._add_one_req (fresh admit)
 
     baseline = len(cm.free_slots)
     with cm.lazy_free_region():
         for boundary in (10, 20, 30):          # three successive fresh-extending commits
             r.mamba_last_track_seqlen = boundary
             cm.cache_req(r, finished=False)
-            assert r.mamba_commit_upto == boundary
             assert len(cm.free_slots) == baseline, (
                 f"commit@{boundary} freed pages the tree now owns "
                 f"(ledger {baseline} -> {len(cm.free_slots)})"
             )
+        # NO commit-time locks: [0, prefix_len) is tree-owned by construction, so the commit
+        # must neither free nor lock anything. Everything stays evictable (protected == 0);
+        # rerun reuse relies on LRU order sparing the newest snapshot, not on locks (a
+        # per-commit lock cannot be balanced under overlap scheduling -- each chunk's Req is
+        # built before the previous chunk's commit runs).
+        assert cm.prefix_cache.full_protected == 0, "commit left protected tokens (lock leak)"
 
+    # finish releases the admission handle; the finish donation extends reuse 30 -> 32.
+    with cm.lazy_free_region():
+        cm.cache_req(r, finished=True)
     m = cm.prefix_cache.match_prefix(torch.tensor(ids, dtype=torch.int32))
-    assert m.cached_len == 30 and m.mamba_value is not None  # deepest committed boundary
+    assert m.cached_len == 32 and m.mamba_value is not None  # finish donate extended 30 -> 32
+    live = cm.prefix_cache.full_protected
+    assert live == 0, f"finish left {live} protected tokens (lock leak)"
