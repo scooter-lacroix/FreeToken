@@ -55,3 +55,37 @@ mostly FIXED-overhead × per-step syncs, not attention math — graphs attack it
 Honest verdict: 60 at 72k needs ALL stacked levers landed and tuned — the
 graphs lever is the long pole (earlier capture attempt OOM'd; must capture
 near-piece + far-piece separately around the seam).
+
+## Re-baseline 2026-09-01 (ridge178, single-GPU 7900XTX, post radix-cache + ledger fixes)
+
+Method: incremental prefix via radix cache (delta prefill per step), 96 forced decode
+steps (ignore_eos), sustained rate = server's last 40-step gen-throughput line.
+
+| depth | tok/s | | depth | tok/s |
+|---|---|---|---|---|
+| 0.08k | 29.0 | | 33.8k | 9.7 |
+| 2.9k | 25.3 | | 36.6k | 9.2 |
+| 5.7k | 19.2 | | 39.3k | 8.3 |
+| 8.5k | 19.9 | | 41.8k | 8.3 |
+| 11.3k | 17.4 | | 44.2k | 7.8 |
+| 14.1k | 15.8 | | 46.7k | 7.5 |
+| 16.9k | 14.5 | | 49.2k | 7.1 |
+| 19.7k | 13.8 | | 51.6k | 7.0 |
+| 22.5k | 12.1 | | 54.1k | 7.0 |
+| 25.3k | 11.5 | | 56.6k | 6.6 |
+| 28.1k | 10.8 | | 59.0k | 6.6 |
+| 30.9k | 10.2 | | 61.4k | 6.3 |
+| | | | 63.9k | 6.1 |
+| | | | 66.3k | 5.9 |
+
+vs 08-27 eager baseline (12.3 @ 4k -> 4.7 @ 68k): mid-range +50-100%, deep end +26%.
+Extrapolated 72k ~ 5.5. Practical prompt ceiling this config: ~66.3k (admission 400
+above ~68.8k; num_pages 67527, kv_reserve 2048).
+
+Config note: serving is SINGLE-GPU now (tp=1, CUDA_VISIBLE_DEVICES=1 = 7900 XTX in HIP
+enumeration). The 2-GPU split56 seam (near/far pieces, dev twins) is historical -- S2c
+graph work = plain single-device capture of the decode step (cuda_graph_max_bs>=1),
+no seam machinery. Old split-only failure modes (stream mismatch across devices,
+far-segment dev0 scratch) do not apply; what remains is ROCm capture legality of the
+vendored ggml/fla launches (capture under torch.cuda.graph, graphs OFF today:
+cuda_graph_max_bs=0).
