@@ -139,6 +139,18 @@ class LinearStatePool:
         self.conv_states[:, slots] = 0
         self.recurrent_states[:, slots] = 0
 
+    def snapshot_slot(self, slot: int):
+        """S4 spec-verify: clone ALL layers' conv + recurrent state for one slot
+        (~38 MB) -- taken before a verify forward and, per accepted position,
+        from the driver's per-position log for partial-accept rollback."""
+        return (self.conv_states[:, slot].clone(),
+                self.recurrent_states[:, slot].clone())
+
+    def restore_slot(self, slot: int, snap) -> None:
+        conv, rec = snap
+        self.conv_states[:, slot].copy_(conv)
+        self.recurrent_states[:, slot].copy_(rec)
+
     def copy_from(self, src: int, dst: int) -> None:
         """Copy a whole-sequence snapshot (conv + recurrent, all layers) from slot ``src`` to
         ``dst``. Used for COW-on-restore (donated snapshot -> fresh live slot)."""

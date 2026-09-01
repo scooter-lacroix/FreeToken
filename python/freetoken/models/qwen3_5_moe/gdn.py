@@ -201,6 +201,46 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         z = z.reshape(total, self.num_v_heads, self.head_v_dim)
         li = pool.local_index(self.layer_id)
 
+        if getattr(batch, "is_verify", False):
+            # S4 spec-verify: k rows of ONE request through the decode kernel
+            # SEQUENTIALLY (the in-place state slot chains row j -> j+1), with a
+            # per-position all-layer state snapshot written to ctx.spec_state_log
+            # after each row (the driver allocates [k] slots of full-slot clones;
+            # partial accept restores log[a+1] -- state at the last committed
+            # token). Projections / norm / out_proj stay batched over the k rows.
+            from freetoken.models.qwen3_5_moe.gdn_kernels import (
+                gdn_decode_fla as _gdn_decode_fla,
+            )
+
+            proj = self.in_proj.forward(hidden_states)
+            conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
+            li = pool.local_index(self.layer_id)
+            slot = int(fla.cache_indices[0])
+            idx1 = fla.cache_indices[:1]
+            cu1 = torch.arange(0, 2, dtype=torch.int32, device=hidden_states.device)
+            state_log = getattr(ctx, "spec_state_log", None)
+            outs = []
+            for j in range(total):
+                mixed = self._conv_decode(conv_in[j : j + 1], idx1, pool)
+                qf, kf, vf = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1)
+                q = qf.reshape(1, 1, self.num_k_heads, self.head_k_dim).to(dtype)
+                k = kf.reshape(1, 1, self.num_k_heads, self.head_k_dim).to(dtype)
+                v = vf.reshape(1, 1, self.num_v_heads, self.head_v_dim).to(dtype)
+                core = _gdn_decode_fla(
+                    q, k, v, a[j : j + 1], b[j : j + 1],
+                    A_log=self.A_log, dt_bias=self.dt_bias,
+                    state_source=pool.recurrent_states[li], indices=idx1,
+                    cu_seqlens=cu1, scale=self.head_k_dim ** -0.5,
+                )
+                outs.append(core.reshape(-1))
+                if state_log is not None:
+                    state_log[j][0][li] = pool.conv_states[li, slot]
+                    state_log[j][1][li] = pool.recurrent_states[li, slot]
+            core_out = torch.stack(outs, dim=0).reshape(-1, self.head_v_dim)
+            z2 = z.reshape(-1, self.head_v_dim)
+            out = self.norm.forward(core_out, z2).reshape(total, -1)
+            return self.out_proj.forward(out)
+
         if batch.is_decode:
             # Fused fla decode kernel: gating + in-kernel l2norm + recurrent update +
             # per-request state read/write-by-index, all in one kernel (no gather/scatter,
