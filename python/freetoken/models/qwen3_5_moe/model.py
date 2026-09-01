@@ -232,8 +232,10 @@ class Qwen3_5Model(BaseOP):
                     torch.cuda.synchronize()
                     print("[split-dbg] far trunk norm complete", flush=True)
         else:
-            for layer in self.layers.op_list:
+            for i, layer in enumerate(self.layers.op_list):
                 x, residual = layer.forward(x, residual)
+                if _taps and i in _taps:
+                    _tap(x, i)
             xn, rn = self.norm.forward_add_residual(x, residual)
         # Pre-final-norm trunk residual for the MTP head (llama.cpp feeds the
         # trunk's final residual to nextn hnorm). ONE stable buffer written by
@@ -418,7 +420,110 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
                 and not getattr(ctx.batch, "is_prefill", False)
                 and logits.shape[0] == 1):
             self._live_dflash_step(ctx, logits)
+        if (_os3.environ.get("FREETOKEN_SPEC_SMOKE", "0") in {"1","true","yes"}
+                and not getattr(ctx.batch, "is_prefill", False)
+                and logits.shape[0] == 1):
+            self._s4_smoke_step(ctx, logits)
         return logits
+
+    def _s4_smoke_step(self, ctx, logits):
+        """S4 live smoke (measure-only): the DFlashService on the SECOND GPU proposes a
+        k=8 chain after every convergent decode step, using the SAME inputs the S3d
+        replay consumed (taps, position, anchor argmax, trunk top-64). Pending chains are
+       scored against the real emitted stream -> live acceptance stats. Serving output is
+        untouched; the FIRST exception disables the smoke (the old probe's per-step crash
+        class must never reach serving)."""
+        if getattr(self, "_s4_svc", None) is None:
+            if getattr(self, "_s4_smoke_failed", False):
+                return
+            try:
+                from freetoken.models.dflash.service import get_service
+
+                svc = get_service(k=8)
+                if svc is None:
+                    self._s4_smoke_failed = True
+                    return
+                self._s4_svc = svc
+                self._s4_pending = []
+                self._s4_done = []
+                self._s4_n = 0
+                emb = self.model.embed_tokens
+                from freetoken.kernel.gguf import ggml_dequantize
+                import torch as _t
+
+                mid = _t.tensor([248070], device=emb.packed.device)
+                self._s4_mask_row = ggml_dequantize(
+                    emb.packed[mid].contiguous(), int(emb.quant_type), 1,
+                    int(emb.embedding_dim)).to(_t.bfloat16).reshape(-1)
+                print("[s4-smoke] service armed (k=8)", flush=True)
+            except Exception as e:                              # noqa: BLE001
+                print(f"[s4-smoke] arm FAILED (disabled): {e!r}", flush=True)
+                self._s4_smoke_failed = True
+                return
+        try:
+            import torch as _t
+
+            svc = self._s4_svc
+            row = logits.reshape(-1).float()
+            y = int(row.argmax().item())
+            tk = _t.topk(row, 64)
+            pos = int(ctx.batch.positions.reshape(-1)[-1].item())
+            tap_store = getattr(self.model, "_dflash_tap_dump", None) or {}
+            emb = self.model.embed_tokens
+            from freetoken.kernel.gguf import ggml_dequantize
+
+            aid = _t.tensor([y], device=emb.packed.device)
+            emb_row = ggml_dequantize(
+                emb.packed[aid].contiguous(), int(emb.quant_type), 1,
+                int(emb.embedding_dim)).to(_t.bfloat16).reshape(-1)
+            picked = svc.propose(
+                y, pos, tap_store, tk.indices, tk.values,
+                embed_row=emb_row, mask_row=self._s4_mask_row)
+            if self._s4_n < 3 and __import__("os").environ.get(
+                    "FREETOKEN_SPEC_SMOKE_DEBUG", "0") in {"1", "true", "yes"}:
+                tn = {d: float(t.float().norm()) for d, t in tap_store.items()}
+                print(
+                    f"[s4-dbg] n={self._s4_n} pos={pos} y={y} "
+                    f"top5={tk.indices[:5].tolist()} vals5={[round(v,2) for v in tk.values[:5].tolist()]} "
+                    f"pick={picked[:4]} tapnorms={ {d: round(v,1) for d,v in tn.items()} } "
+                    f"tapsizes={ {d: tuple(t.shape) for d,t in list(tap_store.items())[:2]} }",
+                    flush=True,
+                )
+            # Tool contract (dflash_acceptance.py): chain from step s checks
+            # picks[j] against argmax_{s+j}, starting with j=0 = THIS step's own
+            # emission (the anchor). Evaluate pick[0] at creation, then extend.
+            still = []
+            for ent in self._s4_pending:
+                hit = ent[0][ent[1]] == y
+                if hit:
+                    ent[1] += 1
+                if not hit or ent[1] >= len(ent[0]):
+                    self._s4_done.append(ent[1])
+                else:
+                    still.append(ent)
+            m0 = 1 if picked[0] == y else 0
+            if m0 == 0 or m0 >= len(picked):
+                self._s4_done.append(m0)
+            else:
+                still.append([picked, m0])
+            self._s4_pending = still
+            self._s4_n += 1
+            ev = int(__import__("os").environ.get("FREETOKEN_SPEC_SMOKE_EVERY", "200"))
+            if self._s4_n % ev == 0 and self._s4_done:
+                import statistics as st
+
+                m = st.mean(self._s4_done[-ev * 2:])
+                p0 = sum(v > 0 for v in self._s4_done[-ev * 2:]) / min(
+                    len(self._s4_done), ev * 2)
+                print(
+                    f"[s4-smoke] n={self._s4_n} meanAcc={m:.3f} P(acc>0)={p0:.3f} "
+                    f"E[tok/vfy]={1 + m:.2f} draftMs={svc.ms / max(svc.n_propose, 1):.1f}",
+                    flush=True,
+                )
+        except Exception as e:                                  # noqa: BLE001
+            print(f"[s4-smoke] disabled after error: {e!r}", flush=True)
+            self._s4_svc = None
+            self._s4_smoke_failed = True
 
 
 __all__ = ["Qwen3_5MoEForCausalLM"]
