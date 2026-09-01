@@ -17,7 +17,8 @@ setsid env -u PYTHONPATH CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}" FREET
   "$HOME/.mlstack/venvs/freetoken/bin/ft" serve \
   --model /mnt/HDD-2/Models/empero-ai/Qwen3.8-27B-Ridge-GGUF/Qwen3.8-27B-Ridge-3.7bpw.gguf \
   --port 1919 --max-seq-len-override 73728 --kv-reserve-tokens 2048 --max-extend-length 2048 \
-  --max-running-requests 1 --page-size 1 --cache-type radix --memory-ratio 0.9 "$@" \
+  --max-running-requests 1 --page-size 1 --cache-type radix --memory-ratio 0.9 \
+  --cuda-graph-max-bs 1 "$@" \
   > "$LOG" 2>&1 < /dev/null &
 echo "BOOTED $!"
 for i in $(seq 1 45); do
