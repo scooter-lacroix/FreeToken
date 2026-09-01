@@ -13,11 +13,11 @@ for attempt in 1 2 3 4 5 6; do
 done
 rm -f ~/.cache/torch_extensions/*/freetoken_gguf_kernels/lock 2>/dev/null
 cd /home/scooter/Documents/Product/Stan-s-ML-Stack/Fork/FreeToken || exit 1
-setsid env -u PYTHONPATH CUDA_VISIBLE_DEVICES=1 FREETOKEN_FREE_AUDIT="${FREETOKEN_FREE_AUDIT:-0}" \
+setsid env -u PYTHONPATH CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}" FREETOKEN_FREE_AUDIT="${FREETOKEN_FREE_AUDIT:-0}" PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-}" \
   "$HOME/.mlstack/venvs/freetoken/bin/ft" serve \
   --model /mnt/HDD-2/Models/empero-ai/Qwen3.8-27B-Ridge-GGUF/Qwen3.8-27B-Ridge-3.7bpw.gguf \
   --port 1919 --max-seq-len-override 73728 --kv-reserve-tokens 2048 --max-extend-length 2048 \
-  --max-running-requests 1 --page-size 1 --cache-type radix --memory-ratio 0.9 \
+  --max-running-requests 1 --page-size 1 --cache-type radix --memory-ratio 0.9 "$@" \
   > "$LOG" 2>&1 < /dev/null &
 echo "BOOTED $!"
 for i in $(seq 1 45); do

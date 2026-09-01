@@ -213,6 +213,8 @@ def dequant_q5_k(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 
 _KMASK_IQ = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], dtype=torch.uint8)
 
+_IQ_DEQUANT_BLOCK = 32768  # 32k blocks x 256 f32 = 32MB temp per stage
+
 
 def dequant_iq2_s(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
     """IQ2_S: 256-elem block = fp16 d + 64B grid indices/signs + 8B high index
@@ -227,6 +229,14 @@ def dequant_iq2_s(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 
     raw = raw.reshape(-1, 82)
     n = raw.shape[0]
+    if n > _IQ_DEQUANT_BLOCK:
+        # The [n,8,4,8] f32 temporaries below scale with n (n*256*4B each) -- process in
+        # blocks so a 16GB rank can load the FFN shards without spiking several hundred MB
+        # per tensor. Bit-exact: the math is per-block independent.
+        return torch.cat([
+            dequant_iq2_s(raw[i : i + _IQ_DEQUANT_BLOCK].reshape(-1), out_dtype)
+            for i in range(0, n, _IQ_DEQUANT_BLOCK)
+        ])
     d = _f16_scales(raw, 0, 2)  # [n,1]
     qs = raw[:, 2:66]
     qh = raw[:, 66:74].to(torch.int32)  # [n,8]
@@ -261,6 +271,11 @@ def dequant_iq3_s(raw: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
 
     raw = raw.reshape(-1, 110)
     n = raw.shape[0]
+    if n > _IQ_DEQUANT_BLOCK:
+        return torch.cat([
+            dequant_iq3_s(raw[i : i + _IQ_DEQUANT_BLOCK].reshape(-1), out_dtype)
+            for i in range(0, n, _IQ_DEQUANT_BLOCK)
+        ])
     d = _f16_scales(raw, 0, 2)  # [n,1]
     qs = raw[:, 2:66].reshape(n, 8, 4, 2).to(torch.int32)  # [n,ib,il,{g1,g2}]
     qh = raw[:, 66:74].to(torch.int32)  # [n,8]
