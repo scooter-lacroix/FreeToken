@@ -369,7 +369,7 @@ class CacheManager:
         if req.mm_embeds is not None:
             self.unlock(old_handle)
             if finished:
-                self._free(page_indices[old_handle.cached_len :])
+                self._free(page_indices[old_handle.cached_len : req.cached_len])
                 self._free_req_slots(req)
             return
 
@@ -381,7 +381,13 @@ class CacheManager:
             # is this request's dup to free. The frozen slot is consumed either way (taken by
             # the tree or freed here) and both ping-pong refs are dropped before
             # _free_req_slots so nothing double-frees.
-            free_upto = old_handle.cached_len
+            # Free floor: mamba_commit_upto is the deepest boundary the TREE owns via this
+            # request's own chunk commits (advanced below / in the commit path). Pages in
+            # [commit watermark, prefix_len) are true dups of OTHER nodes; pages below the
+            # watermark are shared with this request's own donated nodes and must NEVER be
+            # freed (the old old_handle.cached_len floor double-freed them every commit --
+            # the ~75k-pages/request phantom free-list inflation).
+            free_upto = max(old_handle.cached_len, getattr(req, "mamba_commit_upto", 0) or 0)
             L = req.mamba_last_track_seqlen
             if (
                 L is not None
@@ -431,17 +437,19 @@ class CacheManager:
                 keep_live = not mamba_exist           # tree now owns linear_slot_idx
             else:
                 self.unlock(old_handle)
-                self._free(page_indices[free_upto :])
+                self._free(page_indices[free_upto : req.cached_len])
             import os as _os
 
             if _os.environ.get("FREETOKEN_RADIX_DEBUG", "0") == "1":
                 chain = []
-                _n = self.prefix_cache.root
                 def _walk_chain(n, depth=0):
-                    if depth > 3 or n.is_root():
+                    if depth > 3:
                         return
                     for c in n.children.values():
-                        chain.append(f"[{c.length}|{'mv' if c.mamba_value is not None else '--'}|r{c.ref_count}]")
+                        chain.append(
+                            f"[{c.length}|{'mv' if c.mamba_value is not None else '--'}"
+                            f"|r{c.ref_count}/m{c.mamba_ref_count}]"
+                        )
                         _walk_chain(c, depth + 1)
                 _walk_chain(self.prefix_cache.root)
                 print(
@@ -481,6 +489,25 @@ class CacheManager:
                 # free-list here (this request owns the free region for its prefix)
                 self._free(er.kv_indices)
             if pool.num_free_slots < 1:
+                if _os.environ.get("FREETOKEN_RADIX_DEBUG", "0") == "1":
+                    snap = []
+                    _stack = [self.prefix_cache.root]
+                    while _stack:
+                        _n = _stack.pop()
+                        if _n.is_root():
+                            _stack.extend(_n.children.values())
+                            continue
+                        if _n.mamba_value is not None:
+                            snap.append(
+                                f"[len={_n.length} mr={_n.mamba_ref_count} kr={_n.ref_count}"
+                                f"{'L' if _n.is_leaf() else ''}]"
+                            )
+                        _stack.extend(_n.children.values())
+                    print(
+                        f"[wedge] uid={req.uid} pool_free={pool.num_free_slots}/"
+                        f"{getattr(pool, '_num_slots', '?')} snapshots: {' '.join(snap)}",
+                        flush=True,
+                    )
                 req.mamba_last_track_seqlen = None
                 return
         if align_down(L, self.page_size) != L:
@@ -491,26 +518,39 @@ class CacheManager:
             return
         frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
         frozen = req.mamba_ping_pong[frozen_idx]
+        # Reserve the replacement slot BEFORE the donation: the pacing gate above guarantees
+        # >=1 free slot, insert() itself never allocates, so the post-insert alloc can no
+        # longer trigger evict_mamba-under-us. (The previous design re-pointed+locked the
+        # req's handle onto every committed node to get the same safety -- one lock per
+        # commit, and the finish path only releases the LAST one; the stale locks pinned
+        # snapshots until the 9-slot pool wedged and reruns stopped matching.)
+        replacement = None
+        if pool.num_free_slots >= 1:
+            replacement = pool.alloc(1)[0]
         prefix_len, mamba_exist = self.prefix_cache.insert(
             req.input_ids[:L], page_indices[:L], frozen)
-        self.unlock(old_handle)
-        self._free(page_indices[old_handle.cached_len : prefix_len])
-        # Lock the committed snapshot node FIRST: the replacement-slot alloc below can trigger
-        # evict_mamba (via ensure_mamba_slots), which would otherwise reclaim this still-unlocked
-        # just-donated node -- freeing its KV pages under the still-decoding request.
-        m = self.prefix_cache.match_prefix(req.input_ids[:L])
-        # Same re-point as the generic path: the dedup free above returned this request's own
-        # pages for [old_handle.cached_len, prefix_len) while its row still named them.
-        if prefix_len > old_handle.cached_len:
-            self.page_table[req.table_idx, old_handle.cached_len : prefix_len].copy_(
-                m.kv_indices[old_handle.cached_len : prefix_len])
-        req.cache_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
-        self.lock(req.cache_handle)
-        if not mamba_exist:                                # tree took `frozen`; replace it
-            self.ensure_mamba_slots(1)
+        # Dedup floor: only spans beyond this request's own committed watermark can be true
+        # dups of other nodes; below it the tree owns THIS request's donated pages.
+        _wm = max(old_handle.cached_len, getattr(req, "mamba_commit_upto", 0) or 0)
+        self._free(page_indices[_wm : max(_wm, prefix_len)])
+        req.mamba_commit_upto = L
+        # Dedup: the tree already owned [_wm, prefix_len) with canonical
+        # pages, and the free above returned this request's own duplicates while its page-table
+        # row still names them -- re-point the row at the tree's canonical pages. The req's
+        # handle stays the ADMISSION handle (locked once, released once at finish).
+        if prefix_len > _wm:
+            m = self.prefix_cache.match_prefix(req.input_ids[:L])
+            self.page_table[req.table_idx, _wm : prefix_len].copy_(
+                m.kv_indices[_wm : prefix_len])
+        if not mamba_exist:                                # tree took `frozen`; install replacement
+            if replacement is None:
+                self.ensure_mamba_slots(1)
+                replacement = pool.alloc(1)[0]
             pp = list(req.mamba_ping_pong)
-            pp[frozen_idx] = pool.alloc(1)[0]
+            pp[frozen_idx] = replacement
             req.mamba_ping_pong = tuple(pp)
+        elif replacement is not None:
+            pool.free([replacement])
         req.mamba_last_track_seqlen = None
 
     def _cache_req_swa(self, req: Req, *, finished: bool) -> None:
@@ -700,13 +740,15 @@ class CacheManager:
             yield
         finally:
             del self._free
+            for _pending in lazy_free_list:
+                self._audit_pages(_pending, "free")
             self.free_slots = torch.cat([self.free_slots] + lazy_free_list)
 
     def _allocate(self, needed_pages: int) -> torch.Tensor:
         if needed_pages > (free_pages := len(self.free_slots)):
             need = (needed_pages - free_pages) * self.page_size
             if self.is_swa:
-                # Evicting KV leaf nodes drops their swa slots too -> return both pools.
+                # Evicting KV leaf nodes drops their GDN snapshots too -> return both pools.
                 ev = self.prefix_cache.evict_full(need)
                 evicted = ev.kv_indices
                 self._free_swa(ev.swa_indices)
@@ -718,15 +760,57 @@ class CacheManager:
                     self.linear_state_pool.free(er.mamba_slots)
             else:
                 evicted = self.prefix_cache.evict(need)
+            self._audit_pages(evicted, "evict")
             self.free_slots = torch.cat([self.free_slots, evicted[:: self.page_size]])
             assert len(self.free_slots) >= needed_pages, "Eviction did not free enough space."
         allocated = self.free_slots[:needed_pages]
         self.free_slots = self.free_slots[needed_pages:]
+        self._audit_pages(allocated, "alloc")
         return allocated
 
     def _free(self, indices: torch.Tensor) -> None:
         if len(indices) > 0:
+            self._audit_pages(indices, "free")
             self.free_slots = torch.cat([self.free_slots, indices[:: self.page_size]])
+
+    _audit_state: dict | None = None
+
+    def _audit_pages(self, indices: torch.Tensor, site: str) -> None:
+        """Env-gated double-free / phantom-page auditor (FREETOKEN_FREE_AUDIT=1). Tracks every
+        page the allocator has handed out and flags frees of pages that are not currently
+        live (already freed, or never allocated -- the phantom free-list inflation class)."""
+        import os as _os
+
+        if _os.environ.get("FREETOKEN_FREE_AUDIT", "0") != "1":
+            return
+        if self._audit_state is None:
+            self._audit_state = {"live": set(), "hits": 0}
+        st = self._audit_state
+        if st["hits"] >= 24:
+            return
+        for p in indices[:: self.page_size].tolist():
+            if site == "alloc":
+                if p in st["live"]:
+                    st["hits"] += 1
+                    print(f"[audit] ALLOC of live page {p} at {st.get('tag','?')}", flush=True)
+                st["live"].add(p)
+            elif site == "evict":
+                if p not in st["live"]:
+                    st["hits"] += 1
+                    print(f"[audit] EVICT of dead page {p} at {st.get('tag','?')}", flush=True)
+                st["live"].discard(p)
+            else:
+                if p not in st["live"]:
+                    if st.get("last_dead") != p - 1:  # name each dead-run's caller once
+                        import traceback as _tb
+
+                        _tag = " <- ".join(f.name for f in _tb.extract_stack()[:-1][-5:])
+                        st["hits"] += 1
+                        print(f"[audit] FREE dead-run start {p} via {_tag}", flush=True)
+                    st["last_dead"] = p
+                else:
+                    st["last_dead"] = None
+                    st["live"].discard(p)
 
     def _page_to_token(self, pages: torch.Tensor) -> torch.Tensor:
         if self.page_size == 1:

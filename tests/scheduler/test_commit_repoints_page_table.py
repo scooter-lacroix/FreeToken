@@ -140,3 +140,40 @@ def test_radix_subspan_commit_repoints_only_the_deduped_slice():
     canonical = d.cache_handle.get_matched_indices()
     assert page_table[2, : d.cache_handle.cached_len].tolist() == canonical[: d.cache_handle.cached_len].tolist()
     cm.check_integrity()
+
+
+def test_hybrid_later_commit_never_frees_its_own_donated_pages():
+    """The 2026-08-31 phantom: every chunk commit after the first freed
+    [admission_depth, prefix_len) -- pages the request's OWN earlier commits had already
+    donated to the tree. The dedup floor must track the request's commit watermark
+    (mamba_commit_upto), not its admission match depth: frees stay empty for a
+    fresh-extending request, and the page ledger does not inflate per commit."""
+    g = LinearGatedDeltaGroupConfig(
+        name="linear", layer_ids=(0,), num_key_heads=2, num_value_heads=4,
+        key_head_dim=16, value_head_dim=16, conv_kernel_dim=4, output_gate=True,
+    )
+    pool = LinearStatePool(group=g, num_slots=16, dtype=torch.bfloat16,
+                           device=torch.device("cpu"), tp_size=1)
+    page_table = torch.zeros(4, 64, dtype=torch.int32)
+    cm = CacheManager(64, 1, page_table, "hybrid_radix", linear_state_pool=pool)
+
+    ids = list(range(1, 33))
+    r = _admit(cm, page_table, 0, ids, cm.match_req(_pend(ids)).cuda_handle)
+    r.linear_slot_idx = pool.alloc(1)[0]
+    r.mamba_ping_pong = tuple(pool.alloc(2))
+    r.mamba_next_track_idx = 1
+    r.mamba_commit_upto = 0  # production init lives in PrefillAdder._add_one_req (fresh admit)
+
+    baseline = len(cm.free_slots)
+    with cm.lazy_free_region():
+        for boundary in (10, 20, 30):          # three successive fresh-extending commits
+            r.mamba_last_track_seqlen = boundary
+            cm.cache_req(r, finished=False)
+            assert r.mamba_commit_upto == boundary
+            assert len(cm.free_slots) == baseline, (
+                f"commit@{boundary} freed pages the tree now owns "
+                f"(ledger {baseline} -> {len(cm.free_slots)})"
+            )
+
+    m = cm.prefix_cache.match_prefix(torch.tensor(ids, dtype=torch.int32))
+    assert m.cached_len == 30 and m.mamba_value is not None  # deepest committed boundary

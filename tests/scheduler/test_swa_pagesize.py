@@ -153,11 +153,16 @@ def test_hybrid_chunk_donate_skips_unaligned_boundary(ps):
     assert req.mamba_ping_pong == pp_before          # frozen slot NOT replaced -> no donate
     assert req.cache_handle is h                     # handle NOT re-pointed -> donate skipped
 
-    # Aligned boundary on the same request: the donate goes through.
+    # Aligned boundary on the same request: the donate goes through. The handle STAYS the
+    # admission handle (locked once at match, released once at finish -- the old per-commit
+    # lock/re-point leaked a ref on every committed node until the 9-slot GDN pool wedged);
+    # the donation itself is verified on the tree.
     req.mamba_last_track_seqlen = 2 * ps
     cm.cache_req(req, finished=False)
-    assert req.cache_handle is not h                 # re-matched + locked on the committed node
-    assert req.cache_handle.cached_len == 2 * ps
+    assert req.cache_handle is h                     # admission handle retained, no re-point
+    assert req.mamba_ping_pong != pp_before          # frozen slot replaced after the donation
+    m = cm.prefix_cache.match_prefix(req.input_ids[: 2 * ps])
+    assert m.cached_len == 2 * ps and m.mamba_value is not None
 
 
 def test_finish_retains_prompt_window_under_pressure():

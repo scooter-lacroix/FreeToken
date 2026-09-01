@@ -186,6 +186,14 @@ class PrefillAdder:
         req.mamba_next_track_idx = next_track_idx
         req.mamba_restore_src = restore_src
         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
+        # Deepest boundary the tree owns via this request's own chunk commits (dedup-free floor
+        # in CacheManager._cache_req_hybrid). Fresh admits start at the admission match depth;
+        # continuations carry the prior chunk's watermark.
+        req.mamba_commit_upto = (
+            prior.mamba_commit_upto
+            if (prior := pending_req.chunked_req) is not None
+            else cache_handle.cached_len
+        )
         return req
 
     def try_add_one(self, pending_req: PendingReq) -> Req | None:

@@ -509,17 +509,17 @@ class Scheduler(SchedulerIOMixin):
                     # the finish-donate depth (prompt+generated) -- identical-prompt reruns
                     # matched 0 and re-prefilled. The commit donates the frozen slot at the
                     # tracked boundary, re-points this request's row to the canonical pages,
-                    # and re-binds req.cache_handle; the next chunk inherits the updated
-                    # handle via try_add_one's chunked_req branch.
+                    # Default ON (2026-09-01): chunk commits are what make identical-prompt
+                    # reruns hit the radix cache (probe pair 15s -> 3.1s). The lock-per-commit
+                    # and stale-floor double-free that wedged the 9-slot GDN pool are fixed in
+                    # CacheManager._cache_req_hybrid (reserve-first commit + mamba_commit_upto
+                    # dedup floor); counters are derived via _recount at read time. Set =0 to
+                    # fall back to finish-donate-only caching.
                     if (
-                        _os.environ.get("FREETOKEN_CHUNK_COMMIT", "0") in {"1", "true", "yes"}
+                        _os.environ.get("FREETOKEN_CHUNK_COMMIT", "1") in {"1", "true", "yes"}
                         and self.cache_manager.is_hybrid
                         and req.table_idx != -1
                     ):
-                        # KNOWN ISSUE (2026-08-31): repeated dedup re-inserts drift the
-                        # hybrid full_evictable counter (~2 pages/shared-token) and trip
-                        # check_integrity at idle. Fix the insert/evict counter accounting
-                        # before enabling by default.
                         self.cache_manager.cache_req(req, finished=False)
                     continue
                 if req.aborted:
