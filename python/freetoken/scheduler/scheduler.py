@@ -229,6 +229,10 @@ class Scheduler(SchedulerIOMixin):
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
+        if self._spec_step():
+            self._flush_abort_acks()
+            return
+
         forward_input = self._schedule_next_batch()
         # Spin diagnostic: runnable managers + a None schedule + non-blocking
         # receive = a hot retry loop (the 100%-CPU signature). Name the gate
@@ -295,6 +299,10 @@ class Scheduler(SchedulerIOMixin):
         ):
             self._execute_pending_rebuild()
 
+        if self._spec_step():
+            self._flush_abort_acks()
+            return
+
         forward_input = self._schedule_next_batch()
         # Spin diagnostic: runnable managers + a None schedule + non-blocking
         # receive = a hot retry loop (the 100%-CPU signature). Name the gate
@@ -335,6 +343,228 @@ class Scheduler(SchedulerIOMixin):
 
     # uids at or above this base belong to warmup requests; they can never collide with the
     # frontend's per-process counter and are scrubbed from scheduler state on warmup failure.
+    # ---------------------------------------------------------------- S4 spec decode
+    def _spec_step(self) -> bool:
+        """One DFlash2 speculative verify step for the single greedy running request
+        (FREETOKEN_SPEC_K): extend forward over z = [anchor, picks[1..k-1]], per-row
+        argmax longest-prefix accept + bonus, KV crop, GDN state restore from the
+        per-position log on partial accept, all committed tokens detokenized."""
+        import os as _os
+
+        k = int(_os.environ.get("FREETOKEN_SPEC_K", "0") or 0)
+        if not (
+            k > 0
+            and self.cache_manager.is_hybrid
+            and not self.prefill_manager.runnable
+            and len(self.decode_manager.running_reqs) == 1
+        ):
+            return False
+        req = next(iter(self.decode_manager.running_reqs))
+        if req.uid >= self.WARMUP_UID_BASE or req.table_idx == -1 or req.aborted:
+            return False
+        sp = req.sampling_params
+        if (sp.temperature or 0.0) != 0.0 or req.linear_slot_idx is None:
+            return False
+        if getattr(self, "_spec_failed", False):
+            return False
+        try:
+            return self._spec_step_inner(req, k)
+        except Exception as e:                              # noqa: BLE001
+            import traceback as _tb
+
+            print("[spec] DISABLED after error: " + repr(e) + "\n"
+                  + "".join(_tb.format_exception(e)), flush=True)
+            self._spec_failed = True
+            return False
+
+    def _spec_arm(self, k: int):
+        from freetoken.models.dflash.service import get_service
+
+        svc = get_service(k=k)
+        assert svc is not None, "draft service unavailable (needs 2 visible GPUs)"
+        self._spec_svc = svc
+        self._spec_state = {"pending": None, "log": None, "slot": None}
+        print(f"[spec] armed k={k}", flush=True)
+
+    def _spec_propose(self, anchor: int, position: int, taps_row, row_logits):
+        import torch as _t
+
+        from freetoken.core import get_global_ctx
+
+        gctx = get_global_ctx()
+        row = row_logits.reshape(-1).float()
+        tv, ti = _t.topk(row, 64)
+        emb_row, mask_row = gctx.spec_embed(int(anchor))
+        return self._spec_svc.propose(
+            int(anchor), int(position), taps_row, ti, tv,
+            embed_row=emb_row, mask_row=mask_row)
+
+    def _spec_pending_from_last_row(self, req):
+        """First step after prefill: anchor/taps from the FINAL prefill row."""
+        from freetoken.core import get_global_ctx
+
+        gctx = get_global_ctx()
+        logits = getattr(gctx, "spec_logits", None)
+        taps = getattr(gctx, "spec_taps", None) or {}
+        if logits is None or logits.shape[0] == 0 or not taps:
+            return None
+        L = req.cached_len
+        row_logits = logits[logits.shape[0] - 1]
+        anchor = int(row_logits.reshape(-1).argmax().item())
+        taps_row = {d: t[t.shape[0] - 1] for d, t in taps.items()}
+        return {"anchor": anchor, "position": L - 1,
+                "picks": self._spec_propose(anchor, L - 1, taps_row, row_logits)}
+
+    def _spec_step_inner(self, req, k: int) -> bool:
+        import torch as _t
+
+        from freetoken.attention.linear import FLAMetadata
+        from freetoken.core import Batch, Req, get_global_ctx
+
+        if getattr(self, "_spec_svc", None) is None:
+            self._spec_arm(k)
+        st = self._spec_state
+        if st["pending"] is None:
+            st["pending"] = self._spec_pending_from_last_row(req)
+            print(f"[spec-dbg] pending={st['pending'] is not None}", flush=True)
+            if st["pending"] is None:
+                return False  # taps not armed -> normal decode
+        from freetoken.message.tokenizer import DetokenizeMsg
+
+        gctx = get_global_ctx()
+        pool = self.cache_manager.linear_state_pool
+        slot = req.linear_slot_idx
+        L = req.cached_len
+        pend = st["pending"]
+        z = [int(pend["anchor"])] + [int(x) for x in pend["picks"][1:k]]
+        kn = len(z)
+        z_dev = _t.tensor(z, dtype=_t.int32)
+
+        vreq = Req(input_ids=_t.cat([req.input_ids, z_dev]),
+                   table_idx=req.table_idx, cached_len=L, output_len=req.output_len,
+                   uid=req.uid, sampling_params=req.sampling_params,
+                   cache_handle=req.cache_handle)
+        vreq.device_len = L + kn
+        vreq.linear_slot_idx = slot
+        self.token_pool[vreq.table_idx, L : L + kn].copy_(z_dev)
+        import time as _time
+
+        _t0 = _time.perf_counter()
+        vbatch = Batch(reqs=[vreq], phase="prefill")
+        forward_input = self._prepare_batch(vbatch)
+        self._spec_t_prepare = getattr(self, "_spec_t_prepare", 0.0) + _time.perf_counter() - _t0
+        vbatch.is_verify = True
+        vbatch.fla_metadata = FLAMetadata(
+            cu_seqlens=_t.arange(0, 2, dtype=_t.int32, device=self.device),
+            cache_indices=_t.tensor([slot], dtype=_t.int32, device=self.device),
+            has_initial_state=None, fresh_state_indices=None)
+        if st["log"] is None or st["slot"] != slot or len(st["log"]) < kn:
+            conv0, rec0 = pool.conv_states[:, slot], pool.recurrent_states[:, slot]
+            st["log"] = [(_t.zeros_like(conv0), _t.zeros_like(rec0)) for _ in range(kn)]
+            st["slot"] = slot
+        gctx.spec_state_log = st["log"]
+        print("[spec-dbg] pre-fwd", flush=True)
+        _t1 = _time.perf_counter()
+        with self.engine_stream_ctx:  # engine asserts its stream is current
+            self._restore_linear_states(vbatch)
+            self._forward(forward_input)
+            # The verify forward's outputs (logits, taps) live on the engine stream;
+            # host-side reads below (.tolist, topk, cross-device tap copies) run in the
+            # ambient/default context -- on ROCm a blocking read of another stream's
+            # tensor deadlocks. Sync the engine stream while we still own its context.
+            self.engine.stream.synchronize()
+        gctx.spec_state_log = None
+        print("[spec-dbg] post-fwd", flush=True)
+        _t2 = _time.perf_counter()
+        self._spec_t_fwd = getattr(self, "_spec_t_fwd", 0.0) + (_t2 - _t1)
+
+        print("[spec-dbg] reading logits", flush=True)
+        logits = gctx.spec_logits                 # [kn, V]
+        taps = gctx.spec_taps or {}
+        _tshape = next(iter(taps.values())).shape if taps else None
+        print(f"[spec-dbg] logits={tuple(logits.shape)} taps0={_tshape} kn={kn} L={L} uid={req.uid}", flush=True)
+        rows = [int(x) for x in logits.argmax(-1).reshape(-1).tolist()]
+        a = 0
+        while a < kn - 1 and rows[a] == z[a + 1]:
+            a += 1
+        bonus = rows[a]
+        committed = a + 1                          # z[0..a] get KV
+        self.cache_manager._free(
+            self.cache_manager.page_table[req.table_idx, L + committed : L + kn])
+        if committed < kn:
+            pool.restore_slot(slot, st["log"][committed - 1])
+        req.cached_len = req.device_len = L + committed
+
+        reply = []
+        finished = False
+        for i, tok in enumerate(z[:committed]):
+            if i > 0:
+                req.append_host(_t.tensor([tok], dtype=_t.int32))
+            fin = self._spec_emit_fin(req, tok)
+            if fin is not None:
+                finished = True
+                if i + 1 < committed:
+                    self.cache_manager._free(self.cache_manager.page_table[
+                        req.table_idx, L + i + 1 : L + committed])
+                    pool.restore_slot(slot, st["log"][i])
+                    req.cached_len = req.device_len = L + i + 1
+                reply.append(self._spec_msg(req, tok, fin))
+                break
+            self._spec_toolcall_anchor(req, tok)
+            reply.append(self._spec_msg(req, tok, None))
+        if not finished:
+            req.append_host(_t.tensor([bonus], dtype=_t.int32))
+            fin = self._spec_emit_fin(req, bonus)
+            if fin is not None:
+                finished = True
+                reply.append(self._spec_msg(req, bonus, fin))
+            else:
+                self._spec_toolcall_anchor(req, bonus)
+                reply.append(self._spec_msg(req, bonus, None))
+                _t3 = _time.perf_counter()
+                st["pending"] = {
+                    "anchor": bonus, "position": L + a,
+                    "picks": self._spec_propose(
+                        bonus, L + a, {d: t[a] for d, t in taps.items()}, logits[a]),
+                }
+                self._spec_t_prop = getattr(self, "_spec_t_prop", 0.0) + _time.perf_counter() - _t3
+        if finished:
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+            self.finished_reqs.add(req)
+            st["pending"] = None
+        self.send_result(reply)
+        self._flush_abort_acks()
+        self._spec_n = getattr(self, "_spec_n", 0) + 1
+        if self._spec_n % 25 == 0:
+            n = self._spec_n
+            print(f"[spec-timing] n={n} prep={self._spec_t_prepare/n*1000:.0f}ms "
+                  f"fwd={self._spec_t_fwd/n*1000:.0f}ms prop={self._spec_t_prop/n*1000:.0f}ms",
+                  flush=True)
+        return True
+
+    def _spec_emit_fin(self, req, tok):
+        hit_length = not req.can_decode
+        hit_eos = (not req.sampling_params.ignore_eos) and tok in self.eos_token_ids
+        matched = (self._match_stop_str(req)
+                   if not hit_eos and req.sampling_params.stop_strs else None)
+        if hit_length or hit_eos or matched is not None:
+            return ("stop" if (hit_eos or matched is not None) else "length", matched)
+        return None
+
+    def _spec_msg(self, req, tok, fin):
+        from freetoken.message.tokenizer import DetokenizeMsg
+
+        return DetokenizeMsg(
+            uid=req.uid, next_token=int(tok), finished=fin is not None,
+            finish_reason=(fin[0] if fin is not None else None),
+            matched_stop=(fin[1] if fin is not None else None),
+            stop_strs=req.sampling_params.stop_strs or None)
+
+    def _spec_toolcall_anchor(self, req, tok):
+        if tok == self.toolcall_anchor_id and req.toolcall_anchor_len is None:
+            req.toolcall_anchor_len = req.input_ids.numel()
+
     WARMUP_UID_BASE = 1 << 60
 
     def _submit_warmup_req(self, uid: int, n_tokens: int) -> None:

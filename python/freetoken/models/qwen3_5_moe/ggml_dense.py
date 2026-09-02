@@ -77,7 +77,9 @@ class GgufKQuantLMHead(BaseOP):
 
         # tolerate contexts without an active batch (the eager MTP probe)
         batch = getattr(get_global_ctx(), "_batch", None)
-        if batch is not None and batch.is_prefill:
+        if batch is not None and batch.is_prefill and not getattr(batch, "is_verify", False):
+            # spec-verify needs EVERY row's logits (per-row argmax accept), not just
+            # each request's last row
             indices = batch.attn_metadata.get_last_indices(batch.size)
             x = x[indices].contiguous()
         fn = ggml_mul_mat_vec_a8 if x.shape[0] <= 8 else ggml_mul_mat_a8

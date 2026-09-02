@@ -381,6 +381,30 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
             print(f"[dflash-probe] step error {e!r}", flush=True)
 
     def _s3d_maybe_flush(self, ctx, logits):
+        # S4 spec-driver bridge: the scheduler-side verify loop (FREETOKEN_SPEC_K)
+        # reads the last forward's full logits + tap store + an embedding-row
+        # callable from the ctx. Refs only -- no copies, no device traffic.
+        try:
+            ctx.spec_logits = logits
+            ctx.spec_taps = getattr(self.model, "_dflash_tap_dump", None)
+            if getattr(ctx, "spec_embed", None) is None:
+                emb = self.model.embed_tokens
+
+                def _rows(ids):
+                    import torch as _t
+
+                    from freetoken.kernel.gguf import ggml_dequantize
+
+                    idx = _t.tensor(ids, device=emb.packed.device)
+                    out = ggml_dequantize(
+                        emb.packed[idx].contiguous(), int(emb.quant_type),
+                        len(ids), int(emb.embedding_dim))
+                    return out.to(_t.bfloat16)
+
+                _mask_row = _rows([248070])[0]
+                ctx.spec_embed = lambda aid: (_rows([aid])[0], _mask_row)
+        except Exception:                                  # noqa: BLE001
+            pass
         """S3d capture flush shared by both serving paths: on a T==1 decode
         step with taps armed, append one pickle line {position, taps[depth][H]
         bf16, argmax, topk_ids/vals(64)}. The replay teacher-verifies proposals
@@ -434,6 +458,10 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         untouched; the FIRST exception disables the smoke (the old probe's per-step crash
         class must never reach serving)."""
         if getattr(self, "_s4_svc", None) is None:
+            import os as _os0
+
+            if _os0.environ.get("FREETOKEN_SPEC_K", "0").strip() not in {"", "0"}:
+                return  # the scheduler verify driver owns proposals
             if getattr(self, "_s4_smoke_failed", False):
                 return
             try:

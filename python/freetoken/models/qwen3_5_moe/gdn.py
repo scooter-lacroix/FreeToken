@@ -212,8 +212,20 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                 gdn_decode_fla as _gdn_decode_fla,
             )
 
-            proj = self.in_proj.forward(hidden_states)
-            conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
+            if self._fp8:
+                qkvz = self.in_proj_qkvz.forward(hidden_states)
+                conv_in, z = torch.split(qkvz, [self.conv_dim, self.value_dim], dim=-1)
+                ba = self.in_proj_ba.forward(hidden_states)
+                b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
+            elif getattr(self, "_in_proj_kquant", False):
+                conv_in = self.in_proj_qkv.forward(hidden_states)
+                z = self.in_proj_z.forward(hidden_states)
+                ba = self.in_proj_ba.forward(hidden_states)
+                b, a = torch.split(ba, [self.num_v_heads, self.num_v_heads], dim=-1)
+            else:
+                proj = self.in_proj.forward(hidden_states)
+                conv_in, z, b, a = torch.split(proj, self._in_proj_split, dim=-1)
+            z = z.reshape(total, self.num_v_heads, self.head_v_dim)
             li = pool.local_index(self.layer_id)
             slot = int(fla.cache_indices[0])
             idx1 = fla.cache_indices[:1]
