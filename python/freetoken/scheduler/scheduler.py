@@ -527,12 +527,11 @@ class Scheduler(SchedulerIOMixin):
                 self.cache_manager.page_table[req.table_idx, L : L + kn])
             emit = z[pre : a + 1] + [bonus]
         for tok in emit:
-            if not req.can_decode:               # budget exhausted BEFORE the append
-                finished = True                  # (append_host asserts at the cap)
+            if req.input_ids.numel() >= req.max_device_len:   # budget BEFORE append
+                finished = True                                # (append_host asserts at cap)
                 reply.append(self._spec_msg(req, tok, ("length", None)))
                 break
             req.append_host(_t.tensor([tok], dtype=_t.int32))
-            req.device_len = req.input_ids.numel()   # keep can_decode honest in spec mode
             fin = self._spec_emit_fin(req, tok)
             if fin is not None:
                 finished = True
@@ -739,7 +738,6 @@ class Scheduler(SchedulerIOMixin):
         for i, tok in enumerate(z[1:committed], start=1):
             if i > 0:
                 req.append_host(_t.tensor([tok], dtype=_t.int32))
-            req.device_len = req.input_ids.numel()   # keep can_decode honest in spec mode
             fin = self._spec_emit_fin(req, tok)
             if fin is not None:
                 finished = True
