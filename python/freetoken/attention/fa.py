@@ -89,9 +89,49 @@ class FlashAttentionBackend(BaseAttnBackend):
         cached_lens = [req.cached_len for req in reqs]
         max_seqlen_k = max(seqlens_k)
         max_seqlen_q = max(seqlens_q)
-        CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
-
         device = self.kvcache.device
+
+        # DECODE FAST PATH on persistent buffers: the old per-step pinned
+        # allocations + torch.stack of page-table rows measured 17-25ms/step of
+        # HOST time at 2.5k context (the decode wall after graphs landed).
+        # Allocate once, fill in place, copy the (single) row device-side.
+        if max_seqlen_q == 1 and self.page_size == 1:
+            bufs = getattr(self, "_decode_meta_bufs", None)
+            if bufs is None or bufs[0].shape[0] < padded_size or bufs[2].shape[0] < max_seqlen_k:
+                cap_bs = max(padded_size, 64)
+                cap_len = max(max_seqlen_k, 8192)
+                cap_len = ((cap_len + 8191) // 8192) * 8192
+                pin_sl = torch.empty(cap_bs, dtype=torch.int32, pin_memory=True)
+                dev_sl = torch.empty(cap_bs, dtype=torch.int32, device=device)
+                pin_cu = torch.empty(cap_bs + 1, dtype=torch.int32, pin_memory=True)
+                dev_cu = torch.empty(cap_bs + 1, dtype=torch.int32, device=device)
+                dev_q = torch.empty(cap_bs + 1, dtype=torch.int32, device=device)
+                dev_row = torch.empty(cap_len, dtype=torch.int32, device=device)
+                dev_q.copy_(torch.arange(0, cap_bs + 1, dtype=torch.int32,
+                                          device=device))
+                bufs = (pin_sl, dev_sl, dev_row, pin_cu, dev_cu, dev_q)
+                self._decode_meta_bufs = bufs
+            pin_sl, dev_sl, dev_row, pin_cu, dev_cu, dev_q = bufs
+            pin_sl[:padded_size].copy_(
+                torch.tensor(seqlens_k, dtype=torch.int32))
+            dev_sl[:padded_size].copy_(pin_sl[:padded_size], non_blocking=True)
+            pin_cu[0] = 0
+            torch.cumsum(pin_sl[:padded_size], dim=0, out=pin_cu[1 : padded_size + 1])
+            dev_cu[: padded_size + 1].copy_(pin_cu[: padded_size + 1], non_blocking=True)
+            row = reqs[0].table_idx
+            pt = get_global_ctx().page_table
+            dev_row[:max_seqlen_k].copy_(pt[row, :max_seqlen_k])
+            batch.attn_metadata = FAMetadata(
+                cu_seqlens_k=dev_cu[: padded_size + 1],
+                cu_seqlens_q=dev_q[: padded_size + 1],
+                cache_seqlens=dev_sl[:padded_size],
+                max_seqlen_k=max_seqlen_k,
+                max_seqlen_q=max_seqlen_q,
+                page_table=dev_row[:max_seqlen_k].unsqueeze(0),
+            )
+            return
+
+        CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
         cache_seqlens = torch.tensor(seqlens_k, **CPU_KWARGS)
         cache_seqlens = cache_seqlens.to(device, non_blocking=True)
         cu_seqlens_k = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)

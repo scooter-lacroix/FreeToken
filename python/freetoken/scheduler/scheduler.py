@@ -263,11 +263,31 @@ class Scheduler(SchedulerIOMixin):
         # still-pending output write -- corrupting tokens (e.g. dropping an image
         # placeholder, which the multimodal merge then rejects).
         self.stream.wait_stream(self.engine.stream)
+        import os as _tos
+        import time as _tt
+
+        _lt = _tos.environ.get("FREETOKEN_LOOP_TIMING", "0") == "1"
+        if _lt:
+            _t0 = _tt.perf_counter()
+        if _lt:
+            self._lt_msgs = getattr(self, "_lt_msgs", 0.0) + _tt.perf_counter() - _t0
+            _ta = _tt.perf_counter()
         if self._spec_step():
             self._flush_abort_acks()
             return
 
-        forward_input = self._schedule_next_batch()
+        batch = (
+            self.prefill_manager.schedule_next_batch(self.prefill_budget)
+            or self.decode_manager.schedule_next_batch()
+        )
+        if _lt:
+            self._lt_pick = getattr(self, "_lt_pick", 0.0) + _tt.perf_counter() - _ta
+            _tb = _tt.perf_counter()
+        forward_input = self._prepare_batch(batch) if batch is not None else None
+        if _lt:
+            self._lt_prep = getattr(self, "_lt_prep", 0.0) + _tt.perf_counter() - _tb
+            self._lt_sched = getattr(self, "_lt_sched", 0.0) + _tt.perf_counter() - _t0
+            _t1 = _tt.perf_counter()
         # Spin diagnostic: runnable managers + a None schedule + non-blocking
         # receive = a hot retry loop (the 100%-CPU signature). Name the gate
         # once after a few iterations instead of spinning silently.
@@ -297,6 +317,8 @@ class Scheduler(SchedulerIOMixin):
                 print(f"[sched-diag] spin ended at n={self._spin_count}", flush=True)
             self._spin_count = 0
         ongoing_data = None
+        if _lt:
+            _t2 = _tt.perf_counter()
         if forward_input is not None:
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
@@ -305,6 +327,9 @@ class Scheduler(SchedulerIOMixin):
                 # vs the prior batch's snapshot writes). Doing this on self.stream would race.
                 self._restore_linear_states(forward_input.batch)
                 ongoing_data = (forward_input, self._fwd_timed(forward_input))
+            if _lt:
+                self._lt_fwd = getattr(self, "_lt_fwd", 0.0) + _tt.perf_counter() - _t1
+                _t2 = _tt.perf_counter()
 
         # The drain issues GPU-visible writes to state the batch just launched still reads: the
         # page-table re-point and, for the paged-SWA pools, the full->swa (DSV4: full->window)
@@ -313,6 +338,15 @@ class Scheduler(SchedulerIOMixin):
         # in-flight forward. copy_done only covers batch N; order against N+1 explicitly.
         self.stream.wait_stream(self.engine.stream)
         self._process_last_data(last_data)
+        if _lt:
+            self._lt_drain = getattr(self, "_lt_drain", 0.0) + _tt.perf_counter() - _t2
+            self._lt_n = getattr(self, "_lt_n", 0) + 1
+            if self._lt_n % 200 == 0:
+                n = self._lt_n
+                print(f"[loop-timing] n={n} msgs={self._lt_msgs/n*1000:.1f}ms "
+                      f"pick={self._lt_pick/n*1000:.1f}ms prep={self._lt_prep/n*1000:.1f}ms "
+                      f"fwd={self._lt_fwd/n*1000:.1f}ms drain={self._lt_drain/n*1000:.1f}ms",
+                      flush=True)
         self._flush_abort_acks()
         return ongoing_data
 
@@ -1250,7 +1284,15 @@ class Scheduler(SchedulerIOMixin):
             logger.warning(f"could not log cache geometry: {e!r}")
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        import os as _os, time as _t
+
+        _pt = _os.environ.get("FREETOKEN_PREP_TIMING", "0") == "1"
+        if _pt:
+            _m = {}
+            _t0 = _t.perf_counter()
         self.engine.graph_runner.pad_batch(batch)
+        if _pt:
+            _m["pad"] = _t.perf_counter() - _t0; _t0 = _t.perf_counter()
         self._forward_iter += 1
         if batch.is_decode:
             # Free each decoding request's now-out-of-window SWA slots BEFORE the alloc below,
@@ -1267,13 +1309,19 @@ class Scheduler(SchedulerIOMixin):
             self.cache_manager.free_swa_out_of_window_extend(batch.reqs)
         # Polymorphic page allocation: DSV4 allocates window pages + cmp/idx blocks into its
         # slot maps; the generic manager allocates KV pages into the page table.
+        if _pt:
+            _m["swa"] = _t.perf_counter() - _t0; _t0 = _t.perf_counter()
         self.cache_manager.allocate_paged(batch.reqs)
+        if _pt:
+            _m["alloc"] = _t.perf_counter() - _t0; _t0 = _t.perf_counter()
         if batch.is_prefill:
             self._gather_multimodal(batch)
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
         batch.out_loc = self.engine.page_table[input_mapping]
+        if _pt:
+            _m["mappings"] = _t.perf_counter() - _t0; _t0 = _t.perf_counter()
         if self.engine.linear_state_pool is not None:
             if batch.is_decode:
                 # GPU GDN-state slot (one per padded request) for the decode gather/scatter;
@@ -1300,7 +1348,21 @@ class Scheduler(SchedulerIOMixin):
             # This batch's padded per-row page-table rows. Backends that snapshot the table for
             # a captured replay (DSV4) read them in prepare_metadata / prepare_for_replay.
             batch.active_table_idx = input_mapping[0].view(-1)
+        if _pt:
+            _m["fla"] = _t.perf_counter() - _t0; _t0 = _t.perf_counter()
         self.engine.attn_backend.prepare_metadata(batch)
+        if _pt:
+            _m["attn"] = _t.perf_counter() - _t0; _t0 = _t.perf_counter()
+            self._pt_n = getattr(self, "_pt_n", 0) + 1
+            acc = getattr(self, "_pt_acc", None)
+            if acc is None:
+                acc = {}; self._pt_acc = acc
+            for k2, v2 in _m.items():
+                acc[k2] = acc.get(k2, 0.0) + v2
+            if self._pt_n % 200 == 0:
+                print("[prep-timing] n=" + str(self._pt_n) + " " +
+                      " ".join(f"{k2}={v2/self._pt_n*1000:.1f}ms" for k2, v2 in acc.items()),
+                      flush=True)
         return ForwardInput(
             batch=batch,
             sample_args=self.engine.sampler.prepare(batch),

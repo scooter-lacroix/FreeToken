@@ -226,9 +226,30 @@ class TritonAttentionBackend(BaseAttnBackend):
         cached_lens = [req.cached_len for req in reqs]
         num_query_tokens = sum(seqlens_q)
         is_decode = max(seqlens_q) == 1
-        prefix_lens = torch.tensor(cached_lens, dtype=torch.int32, device=device)
 
-        indptr = torch.tensor([0] + seqlens_k, dtype=torch.int32, device=device).cumsum_(0)
+        # Persistent pinned staging for the tiny per-step host->device metadata:
+        # `torch.tensor(list, device=cuda)` is a PAGEABLE copy, which stages through
+        # the driver and synchronizes against in-flight device work -- measured
+        # 17-26ms/step of hidden graph-wait in the decode loop (the host wall after
+        # graphs landed). Pinned + non_blocking enqueues without any wait.
+        bufs = getattr(self, "_meta_bufs", None)
+        cap = max(64, padded_size + 1)
+        if bufs is None or bufs[0].shape[0] < cap:
+            pin_a = torch.empty(cap, dtype=torch.int32, pin_memory=True)
+            dev_a = torch.empty(cap, dtype=torch.int32, device=device)
+            pin_b = torch.empty(cap, dtype=torch.int32, pin_memory=True)
+            dev_b = torch.empty(cap, dtype=torch.int32, device=device)
+            bufs = (pin_a, dev_a, pin_b, dev_b)
+            self._meta_bufs = bufs
+        pin_a, dev_a, pin_b, dev_b = bufs
+        pin_a[:padded_size].copy_(torch.tensor(cached_lens, dtype=torch.int32))
+        dev_a[:padded_size].copy_(pin_a[:padded_size], non_blocking=True)
+        prefix_lens = dev_a[:padded_size]
+        pin_b[0] = 0
+        torch.cumsum(torch.tensor(seqlens_k, dtype=torch.int32), dim=0,
+                     out=pin_b[1 : padded_size + 1])
+        dev_b[: padded_size + 1].copy_(pin_b[: padded_size + 1], non_blocking=True)
+        indptr = dev_b[: padded_size + 1]
         if is_decode:
             cu_seqlens_q_gpu = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
         elif all(l == 0 for l in cached_lens):

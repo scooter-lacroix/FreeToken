@@ -1081,7 +1081,23 @@ class Engine:
 
         batch_logits = logits[: batch.size]
         next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)
-        next_tokens_cpu = next_tokens_gpu.to("cpu", non_blocking=True)
+        # Pinned DOUBLE-buffered readback: a pageable `.to("cpu")` allocates a
+        # staged destination and BLOCKS until the forward's GPU work completes,
+        # serializing the whole step loop (the graph can never run ahead).
+        # Pinned + non_blocking enqueues the D2H; the drain's copy_done event
+        # provides the ordering before the buffer is read. Two buffers so the
+        # N+1 forward can overwrite the other slot while drain N is pending.
+        n = next_tokens_gpu.numel()
+        pins = getattr(self, "_ntok_pins", None)
+        if pins is None or pins[0].numel() < n:
+            pins = (torch.empty(n, dtype=torch.int32, pin_memory=True),
+                    torch.empty(n, dtype=torch.int32, pin_memory=True))
+            self._ntok_pins = pins
+            self._ntok_idx = 0
+        self._ntok_idx ^= 1
+        pin = pins[self._ntok_idx]
+        pin[:n].copy_(next_tokens_gpu.reshape(-1), non_blocking=True)
+        next_tokens_cpu = pin[:n]
         copy_done_event = torch.cuda.Event()
         copy_done_event.record(self.stream)
         return ForwardOutput(next_tokens_gpu, next_tokens_cpu, copy_done_event)
