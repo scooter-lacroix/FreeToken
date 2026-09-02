@@ -517,9 +517,11 @@ class Scheduler(SchedulerIOMixin):
         self.token_pool[vreq.table_idx, L : L + kn].copy_(z_dev)
         import time as _time
 
+        print("[sd] vreq built", flush=True)
         _t0 = _time.perf_counter()
         vbatch = Batch(reqs=[vreq], phase="prefill")
         forward_input = self._prepare_batch(vbatch)
+        print("[sd] prepared", flush=True)
         self._spec_t_prepare = getattr(self, "_spec_t_prepare", 0.0) + _time.perf_counter() - _t0
         vbatch.is_verify = True
         vbatch.fla_metadata = FLAMetadata(
@@ -531,31 +533,35 @@ class Scheduler(SchedulerIOMixin):
             st["log"] = [(_t.zeros_like(conv0), _t.zeros_like(rec0)) for _ in range(kn)]
             st["slot"] = slot
         gctx.spec_state_log = st["log"]
-        print("[spec-dbg] pre-fwd", flush=True)
+        print("[sd] fwd enter", flush=True)
         _t1 = _time.perf_counter()
         with self.engine_stream_ctx:  # engine asserts its stream is current
             self._restore_linear_states(vbatch)
             self._forward(forward_input)
-            # The verify forward's outputs (logits, taps) live on the engine stream;
-            # host-side reads below (.tolist, topk, cross-device tap copies) run in the
-            # ambient/default context -- on ROCm a blocking read of another stream's
-            # tensor deadlocks. Sync the engine stream while we still own its context.
+            print("[sd] fwd done", flush=True)
+            # ALL host consumption of the verify forward's outputs happens INSIDE
+            # the engine-stream context after an explicit sync: per-row argmax +
+            # top-64 launch here and the small results are read via .tolist() while
+            # the stream is ours. Reading engine-stream tensors from the ambient
+            # context deadlocks on ROCm (the original post-forward stall).
             self.engine.stream.synchronize()
+            print("[sd] synced", flush=True)
+            logits = gctx.spec_logits
+            rows = [int(v) for v in logits.argmax(-1).reshape(-1).tolist()]
+            tk = torch.topk(logits.float(), 64, dim=-1)
+            tk_ids = tk.indices.tolist()
+            tk_vals = tk.values.tolist()
+            print("[sd] rows+topk read", flush=True)
         gctx.spec_state_log = None
-        print("[spec-dbg] post-fwd", flush=True)
         _t2 = _time.perf_counter()
         self._spec_t_fwd = getattr(self, "_spec_t_fwd", 0.0) + (_t2 - _t1)
 
-        print("[spec-dbg] reading logits", flush=True)
-        logits = gctx.spec_logits                 # [kn, V]
         taps = gctx.spec_taps or {}
-        _tshape = next(iter(taps.values())).shape if taps else None
-        print(f"[spec-dbg] logits={tuple(logits.shape)} taps0={_tshape} kn={kn} L={L} uid={req.uid}", flush=True)
-        rows = [int(x) for x in logits.argmax(-1).reshape(-1).tolist()]
         a = 0
         while a < kn - 1 and rows[a] == z[a + 1]:
             a += 1
         bonus = rows[a]
+        print(f"[sd] a={a}", flush=True)
         committed = a + 1                          # z[0..a] get KV
         self.cache_manager._free(
             self.cache_manager.page_table[req.table_idx, L + committed : L + kn])
@@ -590,10 +596,15 @@ class Scheduler(SchedulerIOMixin):
                 self._spec_toolcall_anchor(req, bonus)
                 reply.append(self._spec_msg(req, bonus, None))
                 _t3 = _time.perf_counter()
+                taps_row = {d: t[a] for d, t in taps.items()}
+                emb_row, mask_row = gctx.spec_embed(bonus)
                 st["pending"] = {
                     "anchor": bonus, "position": L + a,
-                    "picks": self._spec_propose(
-                        bonus, L + a, {d: t[a] for d, t in taps.items()}, logits[a]),
+                    "picks": self._spec_svc.propose(
+                        bonus, L + a, taps_row,
+                        torch.tensor(tk_ids[a]),
+                        torch.tensor(tk_vals[a], dtype=torch.float32),
+                        embed_row=emb_row, mask_row=mask_row),
                 }
                 self._spec_t_prop = getattr(self, "_spec_t_prop", 0.0) + _time.perf_counter() - _t3
         if finished:

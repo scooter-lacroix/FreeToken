@@ -231,6 +231,74 @@ def kq_gemv_iq2s(w: torch.Tensor, x: torch.Tensor, quant_type: int) -> torch.Ten
     return y
 
 
+@triton.jit
+def _kq_gemv_q6k(
+    w_ptr, x_ptr, y_ptr, K,
+    N, rb,
+    BLOCK_N: tl.constexpr,
+):
+    """Q6_K GEMV: 210-byte 256-elem superblocks (128B ql nibbles | 64B qh
+    2-bits | 16 int8 sub-scales | fp16 d). Two 128-elem halves; per half, 32
+    lanes produce four quads (lo/hi nibbles of ql[l], ql[l+32] + 2 qh bits)."""
+    pid = tl.program_id(0)
+    t = tl.program_id(1)
+    rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    rmask = rows < N
+    nblk = K // 256
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    l = tl.arange(0, 32)
+
+    for kb in range(nblk):
+        b = rows.to(tl.int64) * rb + kb * 210
+        d_lo = tl.load(w_ptr + b + 208).to(tl.int32)
+        d_hi = tl.load(w_ptr + b + 209).to(tl.int32)
+        d = (d_lo | (d_hi << 8)).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+
+        for h in tl.static_range(2):
+            a = tl.load(w_ptr + b[:, None] + h * 64 + l[None, :],
+                        mask=rmask[:, None], other=0).to(tl.int32)
+            b2 = tl.load(w_ptr + b[:, None] + h * 64 + 32 + l[None, :],
+                         mask=rmask[:, None], other=0).to(tl.int32)
+            hb = tl.load(w_ptr + b[:, None] + 128 + h * 32 + l[None, :],
+                         mask=rmask[:, None], other=0).to(tl.int32)
+            q1 = ((a & 0x0F) | ((hb & 3) << 4)) - 32
+            q2 = ((b2 & 0x0F) | (((hb >> 2) & 3) << 4)) - 32
+            q3 = ((a >> 4) | (((hb >> 4) & 3) << 4)) - 32
+            q4 = ((b2 >> 4) | (((hb >> 6) & 3) << 4)) - 32
+            scb = b[:, None] + 192 + h * 8 + (l // 16)[None, :]
+            s1 = tl.load(w_ptr + scb, mask=rmask[:, None], other=0).to(tl.int8).to(tl.float32)
+            s2 = tl.load(w_ptr + scb + 2, mask=rmask[:, None], other=0).to(tl.int8).to(tl.float32)
+            s3 = tl.load(w_ptr + scb + 4, mask=rmask[:, None], other=0).to(tl.int8).to(tl.float32)
+            s4 = tl.load(w_ptr + scb + 6, mask=rmask[:, None], other=0).to(tl.int8).to(tl.float32)
+            xb = kb * 256 + h * 128
+            x1 = tl.load(x_ptr + t.to(tl.int64) * K + xb + l[None, :]).to(tl.float32)
+            x2 = tl.load(x_ptr + t.to(tl.int64) * K + xb + 32 + l[None, :]).to(tl.float32)
+            x3 = tl.load(x_ptr + t.to(tl.int64) * K + xb + 64 + l[None, :]).to(tl.float32)
+            x4 = tl.load(x_ptr + t.to(tl.int64) * K + xb + 96 + l[None, :]).to(tl.float32)
+            acc += tl.sum(
+                d[:, None] * (s1 * q1.to(tl.float32) * x1
+                              + s2 * q2.to(tl.float32) * x2
+                              + s3 * q3.to(tl.float32) * x3
+                              + s4 * q4.to(tl.float32) * x4), axis=1)
+
+    tl.store(y_ptr + t.to(tl.int64) * N + rows, acc.to(tl.bfloat16), mask=rmask)
+
+
+def kq_gemv_q6k(w: torch.Tensor, x: torch.Tensor, quant_type: int) -> torch.Tensor:
+    assert quant_type == 14, "Triton path currently covers Q6_K"
+    N = w.shape[0]
+    K = (w.shape[1] // 210) * 256
+    T = x.shape[0]
+    y = torch.empty(T, N, dtype=torch.bfloat16, device=x.device)
+    if N >= 16384:
+        BN, W = 64, 16
+    else:
+        BN, W = 32, 8
+    _kq_gemv_q6k[(triton.cdiv(N, BN), T)](w, x, y, K, N, w.shape[1],
+                                          BLOCK_N=BN, num_warps=W)
+    return y
+
+
 def kq_gemv(w: torch.Tensor, x: torch.Tensor, quant_type: int) -> torch.Tensor:
     """Dense GEMV over Q4_K-packed rows (``w`` [N, 144*K/256] uint8, ``x`` [T,K])."""
     assert quant_type == 12, "Triton path currently covers Q4_K"
@@ -238,12 +306,12 @@ def kq_gemv(w: torch.Tensor, x: torch.Tensor, quant_type: int) -> torch.Tensor:
     K = (w.shape[1] // 144) * 256
     T = x.shape[0]
     y = torch.empty(T, N, dtype=torch.bfloat16, device=x.device)
-    # gfx1100-tuned (real-weight bench): [6144,5120] 591GB/s @ (64,16) vs 362 @ (16,8);
-    # [10240,5120] 527 @ (32,8) vs 360. Split on N so both weight classes get their best.
-    if N >= 8192:
-        BN, W = 32, 8
-    else:
+    # gfx1100-swept (idle-card clocks, wide grid): [17408,5120] (64,16)=899GB/s,
+    # [10240,5120] (32,8)=791, [6144,5120] (32,8)=761.
+    if N >= 16384:
         BN, W = 64, 16
+    else:
+        BN, W = 32, 8
     grid = (triton.cdiv(N, BN), T)
     _kq_gemv_q4k[grid](w, x, y, K, N, w.shape[1], BLOCK_N=BN, num_warps=W)
     return y

@@ -109,6 +109,12 @@ def _kq_gemv(w, x, quant_type: int, out_features: int):
     from freetoken.kernel.gguf import ggml_mul_mat_a8, ggml_mul_mat_vec_a8
 
     if x.shape[0] <= 8:
+        if quant_type == 14 and out_features * 256 <= w.shape[1] * 210 * 4096:
+            # Q6_K Triton GEMV (real-weight parity ~bf16 rounding; ~578GB/s vs the
+            # vendored vec kernel's ~500 at [5120,6144]) — same guard shape as Q4_K.
+            from freetoken.kernel.triton.kquant_linear import kq_gemv_q6k
+
+            return kq_gemv_q6k(w, x, quant_type)
         return ggml_mul_mat_vec_a8(w, x, quant_type, out_features)
     return ggml_mul_mat_a8(w, x, quant_type, out_features)
 
