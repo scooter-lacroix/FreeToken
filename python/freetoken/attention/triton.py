@@ -87,7 +87,15 @@ class TritonAttentionBackend(BaseAttnBackend):
         self.capture: TritonCaptureData | None = None
         self.capture_bs: List[int] = []
         self.max_graph_bs = 0
-        self.max_kv_splits = 8
+        # Flash-decode split parallelism: the stage1 grid is (bs, q-head-blocks,
+        # splits). At 8 the whole-machine occupancy on gfx1100 (96 CUs) was
+        # ~64 programs -> the context scan ran at ~30GB/s effective (5.7ms/step
+        # at 2.5k ctx; the deep-context killer). 128 fills the machine for
+        # bs=1 (8 head-blocks x 128 = 1024 programs); empty splits early-exit
+        # on short contexts. Scratch: [bs, heads, 128, head_dim] fp32 ~ 6MB.
+        import os as _os
+
+        self.max_kv_splits = int(_os.environ.get("FREETOKEN_MAX_KV_SPLITS", "128"))
         self.prefill_tile_min_q = 128
         self.num_q_heads = int(getattr(config, "num_qo_heads", 1))
         kv_groups = getattr(config, "kv_cache_group_specs", lambda: ())()
