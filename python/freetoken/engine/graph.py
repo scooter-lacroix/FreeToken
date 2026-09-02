@@ -65,6 +65,112 @@ class GraphCaptureBuffer:
             self.table_idx[_slice] = batch.linear_table_idx
 
 
+class VerifyGraphRunner:
+    """S4 spec-verify forward as ONE CUDA graph: the k-row extend (attention
+    over the full context + sequential GDN per-position state logging + taps +
+    full-row lm_head) is a FIXED shape every step, so the ~530 eager launches
+    collapse to one replay. Inputs land in persistent buffers before replay;
+    logits / taps / per-position GDN state come out of captured buffers after
+    an explicit sync."""
+
+    def __init__(self, k: int, max_seq_len: int, vocab_size: int, hidden: int,
+                 device: torch.device, tap_layers):
+        self.k = k
+        self.device = device
+        self.input_ids = torch.zeros(k, dtype=torch.int32, device=device)
+        self.positions = torch.zeros(k, dtype=torch.int32, device=device)
+        self.out_loc = torch.zeros(k, dtype=torch.int32, device=device)
+        self.cu_q = torch.tensor([0, k], dtype=torch.int32, device=device)
+        self.kv_indptr = torch.zeros(2, dtype=torch.int32, device=device)
+        self.prefix_lens = torch.zeros(1, dtype=torch.int32, device=device)
+        self.indices = torch.zeros(max_seq_len + k + 64, dtype=torch.int32, device=device)
+        self.linear_idx = torch.zeros(1, dtype=torch.int32, device=device)
+        self.q_to_req = torch.zeros(k, dtype=torch.int32, device=device)
+        self.logits_out = torch.empty(k, vocab_size, dtype=torch.bfloat16, device=device)
+        self.taps = {d: torch.zeros(k, hidden, dtype=torch.bfloat16, device=device)
+                     for d in tap_layers}
+        # per-position GDN snapshots: k pairs of full-slot columns, written by the
+        # captured verify branch (restore log[a] on partial accept)
+        self.graph = None
+
+    def capture(self, attn_backend, model, dummy_req):
+        import torch
+
+        from freetoken.core import Batch, Context, get_global_ctx
+        from freetoken.attention.linear import FLAMetadata
+        from freetoken.attention.triton import TritonMetadata
+        from freetoken.kvcache.linear_state_pool import LinearStatePool
+
+        pool = get_global_ctx().linear_state_pool
+        n_layers = pool.conv_states.shape[0]
+        self.state_log = [
+            (torch.zeros_like(pool.conv_states[:, 0]),
+             torch.zeros_like(pool.recurrent_states[:, 0]))
+            for _ in range(self.k)
+        ]
+
+        batch = Batch(reqs=[dummy_req], phase="prefill")
+        batch.padded_reqs = batch.reqs
+        batch.is_verify = True
+        batch.input_ids = self.input_ids
+        batch.positions = self.positions
+        batch.out_loc = self.out_loc
+        batch.linear_table_idx = self.linear_idx
+        batch.fla_metadata = FLAMetadata(
+            cu_seqlens=torch.arange(0, 2, dtype=torch.int32, device=self.device),
+            cache_indices=self.linear_idx,
+        )
+        batch.attn_metadata = TritonMetadata(
+            cu_seqlens_q_gpu=self.cu_q,
+            indptr=self.kv_indptr,
+            indices=self.indices,
+            q_to_req=self.q_to_req,
+            q_positions=self.positions,
+            is_decode=False,
+            prefix_lens=self.prefix_lens,
+            max_q_len=self.k,
+            swa_indices=None,
+        )
+        gctx = get_global_ctx()
+        gctx.spec_tap_dev = self.taps
+        gctx.spec_state_log = self.state_log
+        gctx.spec_logits = self.logits_out  # the flush stash points here at capture
+
+        with torch.cuda.device(self.device):
+            side = torch.cuda.Stream()
+            with torch.cuda.stream(side):
+                for _ in range(2):
+                    with gctx.forward_batch(batch):
+                        model.forward()
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=side):
+                with gctx.forward_batch(batch):
+                    model.forward()
+            torch.cuda.synchronize()
+        self.graph = graph
+        gctx.spec_tap_dev = None
+        gctx.spec_state_log = None
+
+    @torch.inference_mode()
+    def replay_step(self, *, z_ids, slot: int, L: int, page_row, stream):
+        """Stage one verify block and replay. ``page_row`` is the request's
+        page-table row (device, int32); positions are L..L+k-1."""
+        import torch
+
+        k = self.k
+        self.input_ids.copy_(z_ids, non_blocking=False)
+        self.positions.copy_(torch.arange(L, L + k, dtype=torch.int32,
+                                          device=self.device))
+        self.out_loc.copy_(page_row[L : L + k])
+        self.indices[: L + k].copy_(page_row[: L + k])
+        self.kv_indptr[0].zero_()
+        self.kv_indptr[1].fill_(L + k)
+        self.prefix_lens[0].fill_(L)
+        self.linear_idx[0].fill_(slot)
+        self.graph.replay()
+
+
 def _determine_cuda_graph_bs(
     cuda_graph_bs: List[int] | None,
     cuda_graph_max_bs: int | None,
@@ -135,6 +241,7 @@ class GraphRunner:
         self.pw_seams: List[int] = []
         # split-graph mode needs the model at replay (eager head tail)
         self.model = model if self.split_graph else None
+        self.max_seq_len = max_seq_len
         self._capture_graphs(max_seq_len, vocab_size, model)
 
     def _reset_moe_offload_cache(self) -> None:
@@ -149,7 +256,14 @@ class GraphRunner:
         # graphs-disabled early return so that config gets the phase too.
         emit_progress("Capturing CUDA graphs / warming up", 0, 0)
         self.graph_map: Dict[int, torch.cuda.CUDAGraph] = {}
+        self.verify_runner = None
         if self.max_graph_bs == 0:
+            # decode graphs disabled, but the S4 verify graph is independent
+            import os as _os
+
+            _k = int(_os.environ.get("FREETOKEN_SPEC_K", "0") or 0)
+            if _k > 0:
+                self._capture_verify(_k, model)
             return logger.info_rank0("CUDA graph is disabled.")
 
         self.attn_backend.init_capture_graph(max_seq_len=max_seq_len, bs_list=self.graph_bs_list)
@@ -246,6 +360,27 @@ class GraphRunner:
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+
+    def _capture_verify(self, k: int, model) -> None:
+        import json as _json
+        import os as _os
+
+        from freetoken.engine.graph import VerifyGraphRunner
+
+        tap_layers = _json.loads(_os.environ.get("FREETOKEN_DFLASH_TAP_LAYERS", "[6, 20, 34, 48, 62]"))
+        _cfg = getattr(model, "config", None)
+        hidden = int(getattr(_cfg, "hidden_size", 0) or 5120)
+        vocab = int(getattr(_cfg, "vocab_size", 0) or 248320)
+        vr = VerifyGraphRunner(k, self.max_seq_len, vocab, hidden, self.device, tap_layers)
+        vr.capture(self.attn_backend, model, self.dummy_req)
+        self.verify_runner = vr
+        logger.info_rank0(f"verify graph captured (k={k})")
+
+        # S4 verify graph: independent of the decode bs graphs; capture when armed
+        import os as _os2
+
+        if int(_os2.environ.get("FREETOKEN_SPEC_K", "0") or 0) > 0 and self.verify_runner is None:
+            self._capture_verify(int(_os2.environ.get("FREETOKEN_SPEC_K", "8")), model)
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs

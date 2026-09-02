@@ -30,10 +30,17 @@ def gdn_prefill_chunk_fla(
     transposed vs ``state_source``'s ``[K, V]``. Used by the hybrid-radix track-checkpoint path."""
     from freetoken.kernel.fla import chunk_gated_delta_rule
 
+    # stable int64 twin: a fresh .to() per call defeats the downstream
+    # @tensor_cache (prepare_chunk_indices keys on the tensor object) and its
+    # .tolist() syncs — illegal inside the verify-graph capture.
+    cu64 = getattr(cu_seqlens, "_ft_cu64", None)
+    if cu64 is None or cu64.dtype != torch.int64 or cu64.device != cu_seqlens.device:
+        cu64 = cu_seqlens.to(torch.int64)
+        object.__setattr__(cu_seqlens, "_ft_cu64", cu64)
     o, _, h = chunk_gated_delta_rule(
         q=q, k=k, v=v, g=g, beta=beta, scale=scale,
         initial_state=state_source, initial_state_indices=indices.to(torch.int32),
-        cu_seqlens=cu_seqlens.to(torch.int64), head_first=False,
+        cu_seqlens=cu64, head_first=False,
         use_qk_l2norm_in_kernel=True,
     )
     if return_h:

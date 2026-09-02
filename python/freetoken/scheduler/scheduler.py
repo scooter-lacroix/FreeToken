@@ -420,6 +420,8 @@ class Scheduler(SchedulerIOMixin):
         import os as _os
 
         k = int(_os.environ.get("FREETOKEN_SPEC_K", "0") or 0)
+        if k <= 0:
+            return False
         running = self.decode_manager.running_reqs
         n_real = sum(1 for r in running if r.uid < self.WARMUP_UID_BASE)
         has_warmup = len(running) - n_real > 0
@@ -451,6 +453,126 @@ class Scheduler(SchedulerIOMixin):
                   + "".join(_tb.format_exception(e)), flush=True)
             self._spec_failed = True
             return False
+
+    def _spec_replay_step(self, req, vr, st, gctx, z, z_dev, L, kn, slot):
+        """Graphed verify: allocate the block's pages, stage the capture buffers,
+        ONE replay, consume in-stream (argmax/topk), then the shared accept/
+        crop/restore/emit/propose tail."""
+        import time as _time
+
+        import torch as _t
+
+        pool = self.cache_manager.linear_state_pool
+        vreq_device_len = L + kn
+        # page allocation via a minimal transient (host bookkeeping only)
+        from freetoken.core import Req
+
+        # The transient must carry L+kn host ids so allocate_paged reserves the
+        # WHOLE block (req.input_ids holds only L..L+1; slicing it short silently
+        # allocated 1 page while the replay writes k rows).
+        _ids = req.input_ids
+        if _ids.numel() < vreq_device_len:
+            _ids = _t.cat([_ids, _t.zeros(vreq_device_len - _ids.numel(), dtype=_t.int32)])
+        _alloc_req = Req(input_ids=_ids, table_idx=req.table_idx,
+                         cached_len=L, output_len=0, uid=req.uid + self.WARMUP_UID_BASE,
+                         sampling_params=req.sampling_params, cache_handle=req.cache_handle)
+        self.cache_manager.allocate_paged([_alloc_req])
+
+        self._spec_entry_snap = pool.snapshot_slot(slot)
+        _t1 = _time.perf_counter()
+        with self.engine_stream_ctx:
+            self._spec_t_stage = getattr(self, "_spec_t_stage", 0.0) + (_time.perf_counter() - _t1)
+            _tr0 = _time.perf_counter()
+            vr.replay_step(
+                z_ids=z_dev.to(self.device), slot=slot, L=L,
+                page_row=self.cache_manager.page_table[req.table_idx],
+                stream=self.engine.stream)
+            self.engine.stream.synchronize()
+            logits = vr.logits_out
+            rows = [int(v) for v in logits.argmax(-1).reshape(-1).tolist()]
+            tk = _t.topk(logits.float(), 64, dim=-1)
+            tk_ids = tk.indices.tolist()
+            tk_vals = tk.values.tolist()
+            self._spec_t_replay = getattr(self, "_spec_t_replay", 0.0) + (_time.perf_counter() - _tr0)
+        self._spec_t_fwd = getattr(self, "_spec_t_fwd", 0.0) + (_time.perf_counter() - _t1)
+        self._spec_n_vr = getattr(self, "_spec_n_vr", 0) + 1
+        taps = vr.taps
+
+        # Retry-block protocol: on partial accept (a < kn-1) revert the GDN
+        # slot to the ENTRY snapshot and keep cached_len at L — the next block
+        # re-extends positions L.. with the accepted rows as its prefix (their
+        # KV rows recompute identically; determinism makes the prefix re-accept,
+        # so progress >= 1 token/step is guaranteed). Full accept keeps the
+        # graph's final state and advances cached_len past the block. No
+        # per-position state log needed at all.
+        a = 0
+        while a < kn - 1 and rows[a] == z[a + 1]:
+            a += 1
+        bonus = rows[a]
+        full = a == kn - 1
+        entry_snap = self._spec_entry_snap
+
+        reply = []
+        finished = False
+        if full:
+            req.cached_len = req.device_len = L + kn
+            emit = z[1:] + [bonus]                      # k tokens
+        else:
+            pool.restore_slot(slot, entry_snap)
+            self.cache_manager._free(
+                self.cache_manager.page_table[req.table_idx, L : L + kn])
+            emit = z[1 : a + 1] + [bonus]               # a+1 tokens
+        for tok in emit:
+            req.append_host(_t.tensor([tok], dtype=_t.int32))
+            fin = self._spec_emit_fin(req, tok)
+            if fin is not None:
+                finished = True
+                if not full:
+                    # EOS mid-emission on a partial block: the committed KV is
+                    # only through this token; crop this step's rewrite rows.
+                    self.cache_manager._free(self.cache_manager.page_table[
+                        req.table_idx, L : L + kn]) if False else None
+                reply.append(self._spec_msg(req, tok, fin))
+                break
+            self._spec_toolcall_anchor(req, tok)
+            reply.append(self._spec_msg(req, tok, None))
+        if not finished:
+            self.token_pool[req.table_idx, req.cached_len] = _t.tensor(
+                [bonus], dtype=_t.int32, device=self.device)
+            _t3 = _time.perf_counter()
+            taps_row = {d: t[a] for d, t in taps.items()}
+            emb_row, mask_row = gctx.spec_embed(bonus)
+            picks = self._spec_svc.propose(
+                bonus, L + a, taps_row,
+                torch.tensor(tk_ids[a]),
+                torch.tensor(tk_vals[a], dtype=torch.float32),
+                embed_row=emb_row, mask_row=mask_row)
+            self._spec_t_prop = getattr(self, "_spec_t_prop", 0.0) + _time.perf_counter() - _t3
+            if full:
+                nxt = [bonus] + picks[1:]
+            else:
+                keep = z[: a + 1]                       # accepted prefix re-extends
+                nxt = keep + [bonus] + picks[1 : kn - a - 1]
+            st["pending"] = {"anchor": bonus, "position": L + a, "z": nxt[:kn]}
+        else:
+            if not full:
+                # finished mid-partial-block: crop to emitted depth is implicit
+                # (this step's pages were freed above); cached_len unchanged.
+                pass
+            self.decode_manager.remove_req(req)
+            self._free_req_resources(req)
+            self.finished_reqs.add(req)
+            st["pending"] = None
+        self.send_result(reply)
+        self._flush_abort_acks()
+        self._spec_n = getattr(self, "_spec_n", 0) + 1
+        if self._spec_n % 25 == 0:
+            n = self._spec_n
+            print(f"[spec-timing] n={n} fwd={self._spec_t_fwd/n*1000:.0f}ms "
+                  f"replay={getattr(self, '_spec_t_replay', 0.0)/n*1000:.0f}ms "
+                  f"prop={self._spec_t_prop/n*1000:.0f}ms vr_n={getattr(self, '_spec_n_vr', 0)}",
+                  flush=True)
+        return True
 
     def _spec_arm(self, k: int):
         from freetoken.models.dflash.service import get_service
@@ -510,8 +632,14 @@ class Scheduler(SchedulerIOMixin):
         slot = req.linear_slot_idx
         L = req.cached_len
         pend = st["pending"]
-        z = [int(pend["anchor"])] + [int(x) for x in pend["picks"][1:k]]
+        if "z" in pend:
+            z = [int(x) for x in pend["z"]]
+        else:
+            z = [int(pend["anchor"])] + [int(x) for x in pend["picks"][1:k]]
         kn = len(z)
+        _vr_k = getattr(getattr(self.engine.graph_runner, "verify_runner", None), "k", 0)
+        if _vr_k and kn < _vr_k:
+            z = z + [z[-1]] * (_vr_k - kn)      # pad short retry blocks to the fixed shape
         z_dev = _t.tensor(z, dtype=_t.int32)
 
         # z[0] (the pending bonus) was ALREADY appended to req.input_ids at the
@@ -538,6 +666,10 @@ class Scheduler(SchedulerIOMixin):
         vreq.linear_slot_idx = slot
         self.token_pool[vreq.table_idx, L : L + kn].copy_(z_dev)
         import time as _time
+
+        vr = getattr(self.engine.graph_runner, "verify_runner", None)
+        if vr is not None and kn == vr.k:
+            return self._spec_replay_step(req, vr, st, gctx, z, z_dev, L, kn, slot)
 
         _t0 = _time.perf_counter()
         vbatch = Batch(reqs=[vreq], phase="prefill")

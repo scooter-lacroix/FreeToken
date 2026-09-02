@@ -108,7 +108,16 @@ def _kq_gemv(w, x, quant_type: int, out_features: int):
         return kq_gemv(w, x, quant_type)
     from freetoken.kernel.gguf import ggml_mul_mat_a8, ggml_mul_mat_vec_a8
 
-    if x.shape[0] <= 8:
+    # Spec-verify batches (T=k>1): the vec kernel re-reads the weight matrix PER
+    # TOKEN (8x bytes); the GEMM path reads weights once for the whole block.
+    _verify = False
+    try:
+        from freetoken.core import get_global_ctx as _gctx
+
+        _verify = getattr(getattr(_gctx(), "batch", None), "is_verify", False)
+    except Exception:                                   # noqa: BLE001
+        pass
+    if x.shape[0] <= 8 and not (_verify and x.shape[0] > 1):
         if quant_type == 14 and out_features * 256 <= w.shape[1] * 210 * 4096:
             # Q6_K Triton GEMV (real-weight parity ~bf16 rounding; ~578GB/s vs the
             # vendored vec kernel's ~500 at [5120,6144]) — same guard shape as Q4_K.

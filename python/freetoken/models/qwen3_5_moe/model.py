@@ -181,6 +181,13 @@ class Qwen3_5Model(BaseOP):
             ``.to("cpu")`` from inside the far device context hard-faults this
             HIP stack; pinned-staging copy is what the lm_head logits crossing
             already proves safe."""
+            _vb = getattr(get_global_ctx(), "spec_tap_dev", None)
+            if _vb is not None and getattr(get_global_ctx().batch, "is_verify", False):
+                buf = _vb.get(depth)
+                if buf is not None and hidden.shape[0] <= buf.shape[0]:
+                    buf[: hidden.shape[0]].copy_(hidden)
+                    store[depth] = buf  # device ref; host consumers run post-sync
+                    return
             pins = getattr(self, "_dflash_tap_pins", None)
             if pins is None:
                 pins = {}

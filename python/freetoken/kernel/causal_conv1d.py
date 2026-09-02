@@ -22,6 +22,8 @@ def causal_conv1d_varlen(
     cu_seqlens: torch.Tensor,   # [batch+1] int32 prefix sums of per-request lengths
     cache_indices: torch.Tensor,    # [batch] int32 slot id per request
     has_initial_state: torch.Tensor,  # [batch] bool (carry conv state across chunks)
+    batch: int | None = None,
+    max_seq_len: int | None = None,
 ) -> torch.Tensor:
     """Varlen (prefill) depthwise causal conv with silu; writes silu(conv) into ``x``
     in place and refreshes ``conv_states[cache_indices]`` with each request's tail."""
@@ -33,7 +35,8 @@ def causal_conv1d_varlen(
         )
 
         return triton_causal_conv1d_varlen(
-            x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state
+            x, weight, conv_states, cu_seqlens, cache_indices, has_initial_state,
+            batch=batch, max_seq_len=max_seq_len,
         )
 
     from sgl_kernel import causal_conv1d_fwd
