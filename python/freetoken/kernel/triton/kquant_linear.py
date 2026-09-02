@@ -83,6 +83,154 @@ def _kq_gemv_q4k(
     tl.store(y_ptr + t.to(tl.int64) * N + rows, acc.to(tl.bfloat16), mask=rmask)
 
 
+@triton.jit
+def _kq_gemv_iq3s(
+    w_ptr, x_ptr, y_ptr, tbl_ptr, K,
+    N, rb,
+    BLOCK_N: tl.constexpr,
+):
+    """IQ3_S GEMV: 110-byte 256-elem superblocks (fp16 d | 64B qs | 8B qh |
+    32B signs | 4B nibble scales). Lane q = 4*ib + il covers 8 consecutive
+    columns (base 8q); two 9-bit grid indices per lane gather 4 signed values
+    each from the [512,4] iq3xs table (2 KB -> L1)."""
+    pid = tl.program_id(0)
+    t = tl.program_id(1)
+    rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    rmask = rows < N
+    nblk = K // 256
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    q = tl.arange(0, 32)                    # lane = 4*ib + il
+    ib = q // 4
+    il = q % 4
+    sh1 = 8 - 2 * il                        # idx1 high-bit shifts
+    sh2 = 7 - 2 * il
+    km = 1 << tl.arange(0, 4)               # sign bits 1,2,4,8 (g1) / 16..128 (g2)
+
+    for kb in range(nblk):
+        b = rows.to(tl.int64) * rb + kb * 110
+        d_lo = tl.load(w_ptr + b).to(tl.int32)
+        d_hi = tl.load(w_ptr + b + 1).to(tl.int32)
+        d = (d_lo | (d_hi << 8)).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+
+        g1b = tl.load(w_ptr + b[:, None] + 2 + 2 * q[None, :],
+                      mask=rmask[:, None], other=0).to(tl.int32)
+        g2b = tl.load(w_ptr + b[:, None] + 3 + 2 * q[None, :],
+                      mask=rmask[:, None], other=0).to(tl.int32)
+        qhb = tl.load(w_ptr + b[:, None] + 66 + ib[None, :],
+                      mask=rmask[:, None], other=0).to(tl.int32)
+        idx1 = g1b | ((qhb << sh1[None, :]) & 0x100)
+        idx2 = g2b | ((qhb << sh2[None, :]) & 0x100)
+
+        sc = tl.load(w_ptr + b[:, None] + 106 + (ib[None, :] // 2),
+                     mask=rmask[:, None], other=0).to(tl.int32)
+        nib = (sc >> (4 * (ib[None, :] % 2))) & 0xF
+        d_eff = d[:, None] * (0.5 + nib.to(tl.float32)) * 0.5   # [BN,32]
+
+        sgn = tl.load(w_ptr + b[:, None] + 74 + q[None, :],
+                      mask=rmask[:, None], other=0).to(tl.int32)
+
+        xb = kb * 256 + 8 * q               # column base per lane
+        for k in tl.static_range(4):
+            g1 = tl.load(tbl_ptr + idx1 * 4 + k, mask=rmask[:, None], other=0
+                         ).to(tl.int8).to(tl.float32)
+            g2 = tl.load(tbl_ptr + idx2 * 4 + k, mask=rmask[:, None], other=0
+                         ).to(tl.int8).to(tl.float32)
+            s1 = tl.where((sgn & (1 << k)) != 0, -1.0, 1.0)
+            s2 = tl.where((sgn & (16 << k)) != 0, -1.0, 1.0)
+            x1 = tl.load(x_ptr + t.to(tl.int64) * K + xb[None, :] + k).to(tl.float32)
+            x2 = tl.load(x_ptr + t.to(tl.int64) * K + xb[None, :] + 4 + k).to(tl.float32)
+            acc += tl.sum(d_eff * (g1 * s1 * x1 + g2 * s2 * x2), axis=1)
+
+    tl.store(y_ptr + t.to(tl.int64) * N + rows, acc.to(tl.bfloat16), mask=rmask)
+
+
+def kq_gemv_iq3s(w: torch.Tensor, x: torch.Tensor, quant_type: int) -> torch.Tensor:
+    assert w.shape[1] * 256 % 110 == 0, "Triton path currently covers IQ3_S (110B blocks)"
+    from freetoken.models.gguf._iq_tables import iq3xs_grid_u8
+
+    N = w.shape[0]
+    K = (w.shape[1] // 110) * 256
+    T = x.shape[0]
+    y = torch.empty(T, N, dtype=torch.bfloat16, device=x.device)
+    tbl = iq3xs_grid_u8().to(x.device, non_blocking=True)
+    if N >= 8192:
+        BN, W = 32, 8
+    else:
+        BN, W = 64, 16
+    grid = (triton.cdiv(N, BN), T)
+    _kq_gemv_iq3s[grid](w, x, y, tbl, K, N, w.shape[1], BLOCK_N=BN, num_warps=W)
+    return y
+
+
+@triton.jit
+def _kq_gemv_iq2s(
+    w_ptr, x_ptr, y_ptr, tbl_ptr, K,
+    N, rb,
+    BLOCK_N: tl.constexpr,
+):
+    """IQ2_S GEMV: 82-byte 256-elem superblocks (fp16 d | 64B qs | 8B qh |
+    8B nibble scales). Lane q = 4*ib + il covers 8 consecutive columns (base
+    8q); ONE 10-bit grid index per lane gathers 8 signed values from the
+    [1024,8] iq2s table (8 KB -> L1). Sign bits: qs[32+q] & (1<<k)."""
+    pid = tl.program_id(0)
+    t = tl.program_id(1)
+    rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    rmask = rows < N
+    nblk = K // 256
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+
+    q = tl.arange(0, 32)                    # lane = 4*ib + il
+    il = q % 4
+    shifts = 8 - 2 * il                     # per-lane qh shift
+
+    for kb in range(nblk):
+        b = rows.to(tl.int64) * rb + kb * 82
+        d_lo = tl.load(w_ptr + b).to(tl.int32)
+        d_hi = tl.load(w_ptr + b + 1).to(tl.int32)
+        d = (d_lo | (d_hi << 8)).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+
+        qs_lo = tl.load(w_ptr + b[:, None] + 2 + q[None, :],
+                        mask=rmask[:, None], other=0).to(tl.int32)
+        sgn = tl.load(w_ptr + b[:, None] + 34 + q[None, :],
+                      mask=rmask[:, None], other=0).to(tl.int32)
+        qhb = tl.load(w_ptr + b[:, None] + 66 + (q[None, :] // 4),
+                      mask=rmask[:, None], other=0).to(tl.int32)
+        idx = qs_lo | ((qhb << shifts[None, :]) & 0x300)
+
+        sc = tl.load(w_ptr + b[:, None] + 74 + (q[None, :] // 4),
+                     mask=rmask[:, None], other=0).to(tl.int32)
+        nib = (sc >> (4 * (il[None, :] // 2))) & 0xF
+        d_eff = d[:, None] * (0.5 + nib.to(tl.float32)) * 0.25   # [BN,32]
+
+        xb = kb * 256 + 8 * q
+        for k in tl.static_range(8):
+            gv = tl.load(tbl_ptr + idx * 8 + k, mask=rmask[:, None], other=0
+                         ).to(tl.int8).to(tl.float32)
+            s1 = tl.where((sgn & (1 << k)) != 0, -1.0, 1.0)
+            xv = tl.load(x_ptr + t.to(tl.int64) * K + xb[None, :] + k).to(tl.float32)
+            acc += tl.sum(d_eff * gv * s1 * xv, axis=1)
+
+    tl.store(y_ptr + t.to(tl.int64) * N + rows, acc.to(tl.bfloat16), mask=rmask)
+
+
+def kq_gemv_iq2s(w: torch.Tensor, x: torch.Tensor, quant_type: int) -> torch.Tensor:
+    from freetoken.models.gguf._iq_tables import iq2s_grid_u8
+
+    N = w.shape[0]
+    K = (w.shape[1] // 82) * 256
+    T = x.shape[0]
+    y = torch.empty(T, N, dtype=torch.bfloat16, device=x.device)
+    tbl = iq2s_grid_u8().to(x.device, non_blocking=True)
+    if N >= 8192:
+        BN, W = 32, 8
+    else:
+        BN, W = 64, 16
+    grid = (triton.cdiv(N, BN), T)
+    _kq_gemv_iq2s[grid](w, x, y, tbl, K, N, w.shape[1], BLOCK_N=BN, num_warps=W)
+    return y
+
+
 def kq_gemv(w: torch.Tensor, x: torch.Tensor, quant_type: int) -> torch.Tensor:
     """Dense GEMV over Q4_K-packed rows (``w`` [N, 144*K/256] uint8, ``x`` [T,K])."""
     assert quant_type == 12, "Triton path currently covers Q4_K"
