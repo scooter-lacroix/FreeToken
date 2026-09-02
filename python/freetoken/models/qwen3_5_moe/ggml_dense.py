@@ -96,9 +96,21 @@ def _kq_gemv(w, x, quant_type: int, out_features: int):
     """
     import os
 
+    # verify batches (T=k>1) MUST take the GEMM path below: the Triton GEMV's
+    # grid is (row-blocks, T) — each (block, token) program re-reads its weight
+    # block, so T=8 multiplies the weight bytes 8x (measured 400us/call x272 =
+    # 109ms of a 174ms graphed verify step).
+    _verify_batch = False
+    try:
+        from freetoken.core import get_global_ctx as _gctx
+
+        _verify_batch = getattr(getattr(_gctx(), "batch", None), "is_verify", False)
+    except Exception:                                   # noqa: BLE001
+        pass
     if (
         quant_type == 12
         and x.shape[0] <= 8
+        and not (_verify_batch and x.shape[0] > 1)
         and out_features >= 2048
         and os.environ.get("FREETOKEN_TRITON_KQ", "1").strip().lower()
         not in {"0", "false", "no", "off"}

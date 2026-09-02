@@ -514,16 +514,25 @@ class Scheduler(SchedulerIOMixin):
 
         reply = []
         finished = False
+        # rows [0, pre) of this block are already in input_ids (prior bonus +
+        # retry-prefix appends); only emit genuinely new tokens so input_ids
+        # grows exactly with the output budget (append_host caps at max_device_len)
+        pre = int(st["pending"].get("pre", 1))
         if full:
             req.cached_len = req.device_len = L + kn
-            emit = z[1:] + [bonus]                      # k tokens
+            emit = z[pre:] + [bonus] if pre < kn else [bonus]
         else:
             pool.restore_slot(slot, entry_snap)
             self.cache_manager._free(
                 self.cache_manager.page_table[req.table_idx, L : L + kn])
-            emit = z[1 : a + 1] + [bonus]               # a+1 tokens
+            emit = z[pre : a + 1] + [bonus]
         for tok in emit:
+            if not req.can_decode:               # budget exhausted BEFORE the append
+                finished = True                  # (append_host asserts at the cap)
+                reply.append(self._spec_msg(req, tok, ("length", None)))
+                break
             req.append_host(_t.tensor([tok], dtype=_t.int32))
+            req.device_len = req.input_ids.numel()   # keep can_decode honest in spec mode
             fin = self._spec_emit_fin(req, tok)
             if fin is not None:
                 finished = True
@@ -537,7 +546,7 @@ class Scheduler(SchedulerIOMixin):
             self._spec_toolcall_anchor(req, tok)
             reply.append(self._spec_msg(req, tok, None))
         if not finished:
-            self.token_pool[req.table_idx, req.cached_len] = _t.tensor(
+            self.token_pool[req.table_idx, L + a + 1] = _t.tensor(
                 [bonus], dtype=_t.int32, device=self.device)
             _t3 = _time.perf_counter()
             taps_row = {d: t[a] for d, t in taps.items()}
@@ -550,10 +559,12 @@ class Scheduler(SchedulerIOMixin):
             self._spec_t_prop = getattr(self, "_spec_t_prop", 0.0) + _time.perf_counter() - _t3
             if full:
                 nxt = [bonus] + picks[1:]
+                npre = 1
             else:
                 keep = z[: a + 1]                       # accepted prefix re-extends
                 nxt = keep + [bonus] + picks[1 : kn - a - 1]
-            st["pending"] = {"anchor": bonus, "position": L + a, "z": nxt[:kn]}
+                npre = a + 2                            # z[0:a+1] + bonus already appended
+            st["pending"] = {"anchor": bonus, "position": L + a, "z": nxt[:kn], "pre": npre}
         else:
             if not full:
                 # finished mid-partial-block: crop to emitted depth is implicit
@@ -728,6 +739,7 @@ class Scheduler(SchedulerIOMixin):
         for i, tok in enumerate(z[1:committed], start=1):
             if i > 0:
                 req.append_host(_t.tensor([tok], dtype=_t.int32))
+            req.device_len = req.input_ids.numel()   # keep can_decode honest in spec mode
             fin = self._spec_emit_fin(req, tok)
             if fin is not None:
                 finished = True
@@ -766,7 +778,7 @@ class Scheduler(SchedulerIOMixin):
                 }
                 self._spec_t_prop = getattr(self, "_spec_t_prop", 0.0) + _time.perf_counter() - _t3
                 _svc = self._spec_svc
-                if _svc.n_propose % 25 == 0 and _svc.n_propose > 0:
+                if _svc.n_propose > 0 and _svc.n_propose % 25 == 0:
                     print(f"[svc-direct] n={_svc.n_propose} total={_svc.ms/_svc.n_propose:.1f} "
                           f"pre={_svc.t_pre/_svc.n_propose:.1f} fwd={_svc.t_fwd/_svc.n_propose:.1f} "
                           f"chn={_svc.t_chn/_svc.n_propose:.1f} graph={hasattr(_svc,'_graph')}",
