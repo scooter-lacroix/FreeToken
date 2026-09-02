@@ -90,8 +90,14 @@ def kq_gemv(w: torch.Tensor, x: torch.Tensor, quant_type: int) -> torch.Tensor:
     K = (w.shape[1] // 144) * 256
     T = x.shape[0]
     y = torch.empty(T, N, dtype=torch.bfloat16, device=x.device)
-    grid = (triton.cdiv(N, 16), T)
-    _kq_gemv_q4k[grid](w, x, y, K, N, w.shape[1], BLOCK_N=16, num_warps=8)
+    # gfx1100-tuned (real-weight bench): [6144,5120] 591GB/s @ (64,16) vs 362 @ (16,8);
+    # [10240,5120] 527 @ (32,8) vs 360. Split on N so both weight classes get their best.
+    if N >= 8192:
+        BN, W = 32, 8
+    else:
+        BN, W = 64, 16
+    grid = (triton.cdiv(N, BN), T)
+    _kq_gemv_q4k[grid](w, x, y, K, N, w.shape[1], BLOCK_N=BN, num_warps=W)
     return y
 
 

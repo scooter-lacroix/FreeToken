@@ -205,6 +205,40 @@ class Scheduler(SchedulerIOMixin):
         # before the message loop is what makes the check airtight: the batch launched later
         # this iteration can only be probed by messages of the NEXT iteration, which sees it here.
         self._last_data = last_data
+        import os as _pos
+
+        _prof_n = int(_pos.environ.get("FREETOKEN_PROFILE_STEPS", "0") or 0)
+        _real_decode = (
+            not self.prefill_manager.runnable
+            and len(self.decode_manager.running_reqs) == 1
+            and next(iter(self.decode_manager.running_reqs)).uid < self.WARMUP_UID_BASE
+        )
+        if _prof_n and _real_decode and not getattr(self, "_prof_started", False):
+            try:
+                from torch.profiler import ProfilerActivity, profile
+
+                self._prof = profile(
+                    activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA])
+                self._prof_started = True
+                self._prof_iter = 0
+                self._prof_max = _prof_n
+                self._prof.__enter__()
+                print(f"[prof] profiling next {_prof_n} iterations", flush=True)
+            except Exception as e:                     # noqa: BLE001
+                print(f"[prof] failed to start: {e!r}", flush=True)
+                self._prof_started = True
+                self._prof_max = 0
+        if getattr(self, "_prof_started", False) and getattr(self, "_prof_max", 0):
+            self._prof_iter = getattr(self, "_prof_iter", 0) + 1
+            if self._prof_iter > self._prof_max:
+                self._prof_max = 0
+                try:
+                    self._prof.__exit__(None, None, None)
+                    out = "/home/scooter/Documents/Product/Stan-s-ML-Stack/Fork/FreeToken/logs/decode_step_trace.json"
+                    self._prof.export_chrome_trace(out)
+                    print(f"[prof] trace saved: {out}", flush=True)
+                except Exception as e:                 # noqa: BLE001
+                    print(f"[prof] export failed: {e!r}", flush=True)
         blocking = not (
             last_data is not None  # don't block if we have a batch to be processed
             or self.prefill_manager.runnable
