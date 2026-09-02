@@ -420,27 +420,25 @@ class Scheduler(SchedulerIOMixin):
         import os as _os
 
         k = int(_os.environ.get("FREETOKEN_SPEC_K", "0") or 0)
+        running = self.decode_manager.running_reqs
+        n_real = sum(1 for r in running if r.uid < self.WARMUP_UID_BASE)
+        has_warmup = len(running) - n_real > 0
         if not (
             k > 0
             and self.cache_manager.is_hybrid
             and not self.prefill_manager.runnable
-            and len(self.decode_manager.running_reqs) == 1
+            and n_real == 1
+            and not has_warmup  # a co-resident warmup req would starve behind spec steps
         ):
-            import os as _g
-            if _g.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
-                print(f"[sd-gate] outer k={k} hybrid={self.cache_manager.is_hybrid} "
-                      f"prefill_run={self.prefill_manager.runnable} "
-                      f"running={len(self.decode_manager.running_reqs)}", flush=True)
+            if k > 0 and self.cache_manager.is_hybrid and not self.prefill_manager.runnable:
+                print(f"[spec-gate] decline: n_real={n_real} warmup={has_warmup} "
+                      f"failed={getattr(self, '_spec_failed', False)}", flush=True)
             return False
-        if len(self.decode_manager.running_reqs) != 1:
-            print(f"[sd-gate] running={len(self.decode_manager.running_reqs)}", flush=True)
-        req = next(iter(self.decode_manager.running_reqs))
-        if req.uid >= self.WARMUP_UID_BASE or req.table_idx == -1 or req.aborted:
-            print(f"[sd-gate] uid/table/abort {req.uid} {req.table_idx} {req.aborted}", flush=True)
+        req = next(r for r in running if r.uid < self.WARMUP_UID_BASE)
+        if req.table_idx == -1 or req.aborted:
             return False
         sp = req.sampling_params
         if (sp.temperature or 0.0) != 0.0 or req.linear_slot_idx is None:
-            print(f"[sd-gate] temp={sp.temperature} slot={req.linear_slot_idx}", flush=True)
             return False
         if getattr(self, "_spec_failed", False):
             return False
@@ -503,7 +501,6 @@ class Scheduler(SchedulerIOMixin):
         st = self._spec_state
         if st["pending"] is None:
             st["pending"] = self._spec_pending_from_last_row(req)
-            print(f"[spec-dbg] pending={st['pending'] is not None}", flush=True)
             if st["pending"] is None:
                 return False  # taps not armed -> normal decode
         from freetoken.message.tokenizer import DetokenizeMsg
@@ -525,9 +522,11 @@ class Scheduler(SchedulerIOMixin):
         _base = req.input_ids
         _z_ext = z_dev if _base.numel() == L else z_dev[1:]
 
+        # uid in the warmup range: if this transient ever leaks into a manager,
+        # every real-traffic gate (spec included) skips it by uid alone.
         vreq = Req(input_ids=_t.cat([_base, _z_ext]),
                    table_idx=req.table_idx, cached_len=L, output_len=req.output_len,
-                   uid=req.uid, sampling_params=req.sampling_params,
+                   uid=req.uid + self.WARMUP_UID_BASE, sampling_params=req.sampling_params,
                    cache_handle=req.cache_handle)
         vreq.device_len = vreq.input_ids.numel()
         # The transient verify req must NEVER enter decode_manager: _forward calls
@@ -536,17 +535,13 @@ class Scheduler(SchedulerIOMixin):
         # on the next normal batch (the step-2 decode assert). Zero output budget
         # makes can_decode False for the transient only.
         vreq.output_len = 0
-        print(f"[sd] vreq: in={vreq.input_ids.numel()} cached={L} dev={vreq.device_len} "
-              f"req.cached={req.cached_len} req.in={req.input_ids.numel()} z0={z[0]}", flush=True)
         vreq.linear_slot_idx = slot
         self.token_pool[vreq.table_idx, L : L + kn].copy_(z_dev)
         import time as _time
 
-        print("[sd] vreq built", flush=True)
         _t0 = _time.perf_counter()
         vbatch = Batch(reqs=[vreq], phase="prefill")
         forward_input = self._prepare_batch(vbatch)
-        print("[sd] prepared", flush=True)
         self._spec_t_prepare = getattr(self, "_spec_t_prepare", 0.0) + _time.perf_counter() - _t0
         vbatch.is_verify = True
         vbatch.fla_metadata = FLAMetadata(
@@ -558,26 +553,26 @@ class Scheduler(SchedulerIOMixin):
             st["log"] = [(_t.zeros_like(conv0), _t.zeros_like(rec0)) for _ in range(kn)]
             st["slot"] = slot
         gctx.spec_state_log = st["log"]
-        print("[sd] fwd enter", flush=True)
         _t1 = _time.perf_counter()
         with self.engine_stream_ctx:  # engine asserts its stream is current
             self._restore_linear_states(vbatch)
             self._forward(forward_input)
-            print("[sd] fwd done", flush=True)
-            # ALL host consumption of the verify forward's outputs happens INSIDE
+                # ALL host consumption of the verify forward's outputs happens INSIDE
             # the engine-stream context after an explicit sync: per-row argmax +
             # top-64 launch here and the small results are read via .tolist() while
             # the stream is ours. Reading engine-stream tensors from the ambient
             # context deadlocks on ROCm (the original post-forward stall).
             self.engine.stream.synchronize()
-            print("[sd] synced", flush=True)
             logits = gctx.spec_logits
             rows = [int(v) for v in logits.argmax(-1).reshape(-1).tolist()]
             tk = torch.topk(logits.float(), 64, dim=-1)
             tk_ids = tk.indices.tolist()
             tk_vals = tk.values.tolist()
-            print("[sd] rows+topk read", flush=True)
         gctx.spec_state_log = None
+        # The transient must not linger in decode_manager (filter_reqs ran inside
+        # _forward with can_decode semantics we don't fully control) — drop it
+        # explicitly; remove_req is an idempotent discard.
+        self.decode_manager.remove_req(vreq)
         _t2 = _time.perf_counter()
         self._spec_t_fwd = getattr(self, "_spec_t_fwd", 0.0) + (_t2 - _t1)
 
@@ -586,20 +581,19 @@ class Scheduler(SchedulerIOMixin):
         while a < kn - 1 and rows[a] == z[a + 1]:
             a += 1
         bonus = rows[a]
-        print(f"[sd] a={a}", flush=True)
         committed = a + 1                          # z[0..a] get KV
         self.cache_manager._free(
             self.cache_manager.page_table[req.table_idx, L + committed : L + kn])
-        print("[sd] cropped", flush=True)
         if committed < kn:
             pool.restore_slot(slot, st["log"][committed - 1])
-        print("[sd] state restored", flush=True)
         req.cached_len = req.device_len = L + committed
 
         reply = []
         finished = False
-        print("[sd] emit loop enter", flush=True)
-        for i, tok in enumerate(z[:committed]):
+        # z[0] is the PREVIOUS step's bonus -- already emitted and appended then.
+        # Emit only the newly-verified tokens z[1..committed-1]; re-sending z[0]
+        # duplicated every bonus into the stream (tripled text with echo accepts).
+        for i, tok in enumerate(z[1:committed], start=1):
             if i > 0:
                 req.append_host(_t.tensor([tok], dtype=_t.int32))
             fin = self._spec_emit_fin(req, tok)
@@ -614,9 +608,12 @@ class Scheduler(SchedulerIOMixin):
                 break
             self._spec_toolcall_anchor(req, tok)
             reply.append(self._spec_msg(req, tok, None))
-        print("[sd] emit loop done", flush=True)
         if not finished:
             req.append_host(_t.tensor([bonus], dtype=_t.int32))
+            # normal-decode compatibility: a fallback non-spec step reads its input
+            # token from token_pool[cached_len]; stage the pending bonus there.
+            self.token_pool[req.table_idx, req.cached_len] = _t.tensor(
+                [bonus], dtype=_t.int32, device=self.device)
             fin = self._spec_emit_fin(req, bonus)
             if fin is not None:
                 finished = True
@@ -625,7 +622,6 @@ class Scheduler(SchedulerIOMixin):
                 self._spec_toolcall_anchor(req, bonus)
                 reply.append(self._spec_msg(req, bonus, None))
                 _t3 = _time.perf_counter()
-                print("[sd] propose enter", flush=True)
                 taps_row = {d: t[a] for d, t in taps.items()}
                 emb_row, mask_row = gctx.spec_embed(bonus)
                 st["pending"] = {
@@ -637,7 +633,12 @@ class Scheduler(SchedulerIOMixin):
                         embed_row=emb_row, mask_row=mask_row),
                 }
                 self._spec_t_prop = getattr(self, "_spec_t_prop", 0.0) + _time.perf_counter() - _t3
-                print("[sd] propose done", flush=True)
+                _svc = self._spec_svc
+                if _svc.n_propose % 25 == 0 and _svc.n_propose > 0:
+                    print(f"[svc-direct] n={_svc.n_propose} total={_svc.ms/_svc.n_propose:.1f} "
+                          f"pre={_svc.t_pre/_svc.n_propose:.1f} fwd={_svc.t_fwd/_svc.n_propose:.1f} "
+                          f"chn={_svc.t_chn/_svc.n_propose:.1f} graph={hasattr(_svc,'_graph')}",
+                          flush=True)
         if finished:
             self.decode_manager.remove_req(req)
             self._free_req_resources(req)
@@ -649,7 +650,8 @@ class Scheduler(SchedulerIOMixin):
         if self._spec_n % 25 == 0:
             n = self._spec_n
             print(f"[spec-timing] n={n} prep={self._spec_t_prepare/n*1000:.0f}ms "
-                  f"fwd={self._spec_t_fwd/n*1000:.0f}ms prop={self._spec_t_prop/n*1000:.0f}ms",
+                  f"fwd={self._spec_t_fwd/n*1000:.0f}ms prop={self._spec_t_prop/n*1000:.0f}ms "
+                      f"emb={getattr(self, '_spec_t_emb', 0.0)/n*1000:.0f}ms",
                   flush=True)
         return True
 

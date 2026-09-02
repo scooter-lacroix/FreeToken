@@ -323,6 +323,22 @@ class Engine:
 
         self.device = torch.device(f"cuda:{config.tp_info.rank}")
         torch.cuda.set_device(self.device)
+        # S4 spec draft BEFORE any pool sizing: the KV/mamba pools expand to fill
+        # free memory, so a post-boot arm always OOMs (~70MB left). The draft
+        # encoder is small; claiming it here makes the pool budgets account for
+        # it. Must run after set_device (rank's device) and before allocation.
+        import os as _os
+
+        if config.tp_info.rank == 0 and (
+            _k := int(_os.environ.get("FREETOKEN_SPEC_K", "0") or 0)
+        ) > 0:
+            try:
+                from freetoken.models.dflash.service import get_service
+
+                if get_service(k=_k) is None:
+                    print("[engine] spec draft arm returned None", flush=True)
+            except Exception as exc:                 # noqa: BLE001
+                print(f"[engine] spec draft arm failed: {exc!r}", flush=True)
         torch.manual_seed(42)
         self.stream = torch.cuda.Stream()
         torch.cuda.set_stream(self.stream)
