@@ -476,9 +476,19 @@ class Scheduler(SchedulerIOMixin):
         _alloc_req = Req(input_ids=_ids, table_idx=req.table_idx,
                          cached_len=L, output_len=0, uid=req.uid + self.WARMUP_UID_BASE,
                          sampling_params=req.sampling_params, cache_handle=req.cache_handle)
-        self.cache_manager.allocate_paged([_alloc_req])
+        # allocate_paged's _write_page_table does pinned H2D + device
+        # index_put -- on the ambient stream that class of work invalidates
+        # the next verify-graph replay on this ROCm stack, so stage it on the
+        # engine stream with the rest of the step
+        with self.engine_stream_ctx:
+            self.cache_manager.allocate_paged([_alloc_req])
 
-        self._spec_entry_snap = pool.snapshot_slot(slot)
+        with self.engine_stream_ctx:
+            # device snapshot: ambient-stream GPU work between engine-stream
+            # replays invalidates the captured verify graph on this ROCm
+            # stack (bisected: H2D of any kind on the ambient stream; sync and
+            # pure allocs are clean; the same H2Ds INSIDE this ctx are clean)
+            self._spec_entry_snap = pool.snapshot_slot(slot)
 
         _t1 = _time.perf_counter()
         _gr = self.engine.graph_runner
@@ -538,7 +548,6 @@ class Scheduler(SchedulerIOMixin):
         self._spec_n_vr = getattr(self, "_spec_n_vr", 0) + 1
         taps = vr.taps
 
-
         # Retry-block protocol: on partial accept (a < kn-1) revert the GDN
         # slot to the ENTRY snapshot and keep cached_len at L — the next block
         # re-extends positions L.. with the accepted rows as its prefix (their
@@ -546,6 +555,36 @@ class Scheduler(SchedulerIOMixin):
         # so progress >= 1 token/step is guaranteed). Full accept keeps the
         # graph's final state and advances cached_len past the block. No
         # per-position state log needed at all.
+        import os as _os_ab
+
+        if (_os_ab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
+                and getattr(self, "_spec_n_ab", 0) < 1):
+            # Time-ladder probe: is the invalidation a function of the HOST
+            # GAP between replays rather than any operation? (Everything
+            # scheduler-visible now runs on the engine stream; the only
+            # uncontrolled variable left is elapsed time / GPU idle.)
+            import time as _time_ab
+
+            self._spec_n_ab = getattr(self, "_spec_n_ab", 0) + 1
+            entry_ab = self._spec_entry_snap
+            _pr_ab = self.cache_manager.page_table[req.table_idx]
+
+            def _pr_replay():
+                with self.engine_stream_ctx:
+                    vr.replay_step(z_ids=z_dev.to(self.device), slot=slot, L=L,
+                                   page_row=_pr_ab, stream=self.engine.stream)
+                    self.engine.stream.synchronize()
+                return int(vr.nan_out[0])
+
+            for _gap in (0.0, 0.05, 0.25, 1.0, 3.0):
+                pool.restore_slot(slot, entry_ab)
+                if _gap:
+                    _time_ab.sleep(_gap)
+                _nan = _pr_replay()
+                print(f"[ABT] L={L} gap={_gap}s: nan={_nan}", flush=True)
+            pool.restore_slot(slot, entry_ab)
+            _pr_replay()
+
         import os as _os_b
 
         if _os_b.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
@@ -571,9 +610,11 @@ class Scheduler(SchedulerIOMixin):
             req.cached_len = req.device_len = L + kn
             emit = z[pre:] + [bonus] if pre < kn else [bonus]
         else:
-            pool.restore_slot(slot, entry_snap)
-            self.cache_manager._free(
-                self.cache_manager.page_table[req.table_idx, L : L + kn])
+            with self.engine_stream_ctx:
+                pool.restore_slot(slot, entry_snap)
+            with self.engine_stream_ctx:
+                self.cache_manager._free(
+                    self.cache_manager.page_table[req.table_idx, L : L + kn])
             emit = z[pre : a + 1] + [bonus]
         for tok in emit:
             if req.input_ids.numel() >= req.max_device_len:   # budget BEFORE append
@@ -594,20 +635,23 @@ class Scheduler(SchedulerIOMixin):
             self._spec_toolcall_anchor(req, tok)
             reply.append(self._spec_msg(req, tok, None))
         if not finished:
-            self.token_pool[req.table_idx, L + a + 1] = _t.tensor(
-                [bonus], dtype=_t.int32, device=self.device)
+            with self.engine_stream_ctx:
+                self.token_pool[req.table_idx, L + a + 1] = _t.tensor(
+                    [bonus], dtype=_t.int32, device=self.device)
             _t3 = _time.perf_counter()
             taps_row = {d: t[a] for d, t in taps.items()}
-            emb_row, mask_row = gctx.spec_embed(bonus)
+            with self.engine_stream_ctx:
+                emb_row, mask_row = gctx.spec_embed(bonus)
             if _os_b.environ.get("FREETOKEN_SPEC_NODRAFT", "0") in {"1", "true", "yes"}:
                 # invalidator bisect: skip the DFlash propose entirely
                 picks = [bonus] * kn
             else:
-                picks = self._spec_svc.propose(
-                    bonus, L + a, taps_row,
-                    torch.tensor(tk_ids[a]),
-                    torch.tensor(tk_vals[a], dtype=torch.float32),
-                    embed_row=emb_row, mask_row=mask_row)
+                with self.engine_stream_ctx:
+                    picks = self._spec_svc.propose(
+                        bonus, L + a, taps_row,
+                        torch.tensor(tk_ids[a]),
+                        torch.tensor(tk_vals[a], dtype=torch.float32),
+                        embed_row=emb_row, mask_row=mask_row)
             self._spec_t_prop = getattr(self, "_spec_t_prop", 0.0) + _time.perf_counter() - _t3
             if full:
                 nxt = [bonus] + picks[1:]
@@ -727,7 +771,8 @@ class Scheduler(SchedulerIOMixin):
         # makes can_decode False for the transient only.
         vreq.output_len = 0
         vreq.linear_slot_idx = slot
-        self.token_pool[vreq.table_idx, L : L + kn].copy_(z_dev)
+        with self.engine_stream_ctx:
+            self.token_pool[vreq.table_idx, L : L + kn].copy_(z_dev)
         import time as _time
 
         vr = getattr(self.engine.graph_runner, "verify_runner", None)
