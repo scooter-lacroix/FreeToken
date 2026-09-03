@@ -1450,7 +1450,9 @@ class Scheduler(SchedulerIOMixin):
             return
         for req in batch.reqs:
             if req.mamba_restore_src is not None:
-                if _os.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+                import os as _os_m
+
+                if _os_m.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
                     print(f"[phase] cow-restore uid={req.uid} "
                           f"src={req.mamba_restore_src} dst={req.linear_slot_idx}",
                           flush=True)
