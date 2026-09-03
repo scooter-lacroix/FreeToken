@@ -68,7 +68,18 @@ class Scheduler(SchedulerIOMixin):
 
         # use another stream to overlap metadata processing with computation
         self.device = self.engine.device
-        self.stream = torch.cuda.Stream(device=self.device)
+        import os as _os_spec_stream
+
+        if int(_os_spec_stream.environ.get("FREETOKEN_SPEC_K", "0") or 0) > 0:
+            # Spec mode: ONE stream for everything. The verify graph is only
+            # stable when capture, replay, and ALL other GPU work (prefill and
+            # decode forwards included) share a single stream -- cross-stream
+            # work while it is live surfaces as all-NaN replays or hard GPU
+            # page faults (measured both). The scheduling-overlap pipelining
+            # this second stream provided is not worth a wedged graph.
+            self.stream = self.engine.stream
+        else:
+            self.stream = torch.cuda.Stream(device=self.device)
         self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
         torch.cuda.set_stream(self.stream)
 
