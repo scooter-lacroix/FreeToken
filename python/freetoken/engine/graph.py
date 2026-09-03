@@ -99,7 +99,7 @@ class VerifyGraphRunner:
         self.nan_out = torch.zeros(2, dtype=torch.int32, device=device)
         self.graph = None
 
-    def capture(self, attn_backend, model, dummy_req):
+    def capture(self, attn_backend, model, dummy_req, stream=None):
         import torch
 
         from freetoken.core import Batch, Context, get_global_ctx
@@ -147,18 +147,25 @@ class VerifyGraphRunner:
         gctx.spec_logits_sink = self.logits_out
         gctx.spec_nan_sink = self.nan_out
 
+        # ``stream``: the stream the graph will be REPLAYED on. torch's
+        # default capture uses an internal side stream; for replay stability
+        # on this ROCm stack capture, replay, and every inter-replay op must
+        # share ONE stream (the boot selftest proved that config clean;
+        # cross-stream inter-replay work yields all-NaN or hard faults), so
+        # serving captures pass the scheduler's stream explicitly.
+        _cs = stream if stream is not None else torch.cuda.Stream()
+        self.replay_stream = _cs
         with torch.cuda.device(self.device):
-            side = torch.cuda.Stream()
-            with torch.cuda.stream(side):
+            with torch.cuda.stream(_cs):
                 for _ in range(2):
                     with gctx.forward_batch(batch):
                         model.forward()
-            torch.cuda.synchronize()
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=side):
-                with gctx.forward_batch(batch):
-                    model.forward()
-            torch.cuda.synchronize()
+                torch.cuda.synchronize()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=_cs):
+                    with gctx.forward_batch(batch):
+                        model.forward()
+                torch.cuda.synchronize()
         import os as _os_dbg
 
         if _os_dbg.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
@@ -167,7 +174,7 @@ class VerifyGraphRunner:
             # the capture itself broke the forward (pool/config freeze),
             # independent of any scheduler staging.
             with torch.cuda.device(self.device):
-                with torch.cuda.stream(side):
+                with torch.cuda.stream(_cs):
                     _pool = get_global_ctx().linear_state_pool
                     _snap = _pool.snapshot_slot(0)
 
@@ -440,7 +447,7 @@ class GraphRunner:
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
 
-    def _capture_verify(self, k: int, model) -> None:
+    def _capture_verify(self, k: int, model, stream=None) -> None:
         import json as _json
         import os as _os
 
@@ -451,7 +458,7 @@ class GraphRunner:
         hidden = int(getattr(_cfg, "hidden_size", 0) or 5120)
         vocab = int(getattr(_cfg, "vocab_size", 0) or 248320)
         vr = VerifyGraphRunner(k, self.max_seq_len, vocab, hidden, self.device, tap_layers)
-        vr.capture(self.attn_backend, model, self.dummy_req)
+        vr.capture(self.attn_backend, model, self.dummy_req, stream=stream)
         self.verify_runner = vr
         logger.info_rank0(f"verify graph captured (k={k})")
 

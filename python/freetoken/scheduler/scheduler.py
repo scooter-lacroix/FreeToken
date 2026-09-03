@@ -72,6 +72,21 @@ class Scheduler(SchedulerIOMixin):
         self.engine_stream_ctx = torch.cuda.stream(self.engine.stream)
         torch.cuda.set_stream(self.stream)
 
+        # The verify graph captured during Engine init (and its post-warmup
+        # re-capture) lives on the stream that was current THERE (the default
+        # stream). Replaying it on the scheduler's stream is a cross-stream
+        # replay -- measured as an all-NaN-or-hard-fault class on this ROCm
+        # stack. Re-capture on OUR stream so capture and replay coincide.
+        _vr_boot = getattr(self.engine.graph_runner, "verify_runner", None)
+        if _vr_boot is not None:
+            _pool_boot = self.engine.linear_state_pool
+            if _pool_boot is not None:
+                _ps = _pool_boot.padding_slot
+                _pool_boot.conv_states[:, _ps].zero_()
+                _pool_boot.recurrent_states[:, _ps].zero_()
+            self.engine.graph_runner._capture_verify(
+                _vr_boot.k, self.engine.model, stream=self.stream)
+
         # initialize other managers
         self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
         # ONE cache manager for every model (ShadowRadix layering): the shared page table is the
@@ -476,31 +491,27 @@ class Scheduler(SchedulerIOMixin):
         _alloc_req = Req(input_ids=_ids, table_idx=req.table_idx,
                          cached_len=L, output_len=0, uid=req.uid + self.WARMUP_UID_BASE,
                          sampling_params=req.sampling_params, cache_handle=req.cache_handle)
-        # allocate_paged's _write_page_table does pinned H2D + device
-        # index_put -- on the ambient stream that class of work invalidates
-        # the next verify-graph replay on this ROCm stack, so stage it on the
-        # engine stream with the rest of the step
-        with self.engine_stream_ctx:
-            self.cache_manager.allocate_paged([_alloc_req])
+        self.cache_manager.allocate_paged([_alloc_req])
 
-        with self.engine_stream_ctx:
-            # device snapshot: ambient-stream GPU work between engine-stream
-            # replays invalidates the captured verify graph on this ROCm
-            # stack (bisected: H2D of any kind on the ambient stream; sync and
-            # pure allocs are clean; the same H2Ds INSIDE this ctx are clean)
-            self._spec_entry_snap = pool.snapshot_slot(slot)
+        # All spec-path GPU work runs on the scheduler's OWN stream
+        # (current here): the verify graph is captured AND replayed on it, and
+        # only same-stream ops between replays keep it valid -- cross-stream
+        # work (engine-stream or otherwise) invalidates the next replay with
+        # all-NaN logits on this ROCm stack.
+        self._spec_entry_snap = pool.snapshot_slot(slot)
 
         _t1 = _time.perf_counter()
         _gr = self.engine.graph_runner
+        _sched_stream = torch.cuda.current_stream()
         for _attempt in range(2):
-            with self.engine_stream_ctx:
+            with torch.cuda.stream(_sched_stream):
                 self._spec_t_stage = getattr(self, "_spec_t_stage", 0.0) + (_time.perf_counter() - _t1)
                 _tr0 = _time.perf_counter()
                 vr.replay_step(
                     z_ids=z_dev.to(self.device), slot=slot, L=L,
                     page_row=self.cache_manager.page_table[req.table_idx],
-                    stream=self.engine.stream)
-                self.engine.stream.synchronize()
+                    stream=_sched_stream)
+                _sched_stream.synchronize()
                 _stale = int(vr.nan_out[0]) > 0
             if not _stale:
                 break
@@ -532,9 +543,9 @@ class Scheduler(SchedulerIOMixin):
             import gc as _gc
 
             _gc.collect()
-            _gr._capture_verify(_k, self.engine.model)
+            _gr._capture_verify(_k, self.engine.model, stream=_sched_stream)
             vr = _gr.verify_runner
-        with self.engine_stream_ctx:
+        with torch.cuda.stream(_sched_stream):
             if int(vr.nan_out[0]) > 0:
                 raise RuntimeError(
                     "verify graph NaN after re-capture; falling back to decode")
@@ -610,11 +621,9 @@ class Scheduler(SchedulerIOMixin):
             req.cached_len = req.device_len = L + kn
             emit = z[pre:] + [bonus] if pre < kn else [bonus]
         else:
-            with self.engine_stream_ctx:
-                pool.restore_slot(slot, entry_snap)
-            with self.engine_stream_ctx:
-                self.cache_manager._free(
-                    self.cache_manager.page_table[req.table_idx, L : L + kn])
+            pool.restore_slot(slot, entry_snap)
+            self.cache_manager._free(
+                self.cache_manager.page_table[req.table_idx, L : L + kn])
             emit = z[pre : a + 1] + [bonus]
         for tok in emit:
             if req.input_ids.numel() >= req.max_device_len:   # budget BEFORE append
@@ -635,23 +644,20 @@ class Scheduler(SchedulerIOMixin):
             self._spec_toolcall_anchor(req, tok)
             reply.append(self._spec_msg(req, tok, None))
         if not finished:
-            with self.engine_stream_ctx:
-                self.token_pool[req.table_idx, L + a + 1] = _t.tensor(
-                    [bonus], dtype=_t.int32, device=self.device)
+            self.token_pool[req.table_idx, L + a + 1] = _t.tensor(
+                [bonus], dtype=_t.int32, device=self.device)
             _t3 = _time.perf_counter()
             taps_row = {d: t[a] for d, t in taps.items()}
-            with self.engine_stream_ctx:
-                emb_row, mask_row = gctx.spec_embed(bonus)
+            emb_row, mask_row = gctx.spec_embed(bonus)
             if _os_b.environ.get("FREETOKEN_SPEC_NODRAFT", "0") in {"1", "true", "yes"}:
                 # invalidator bisect: skip the DFlash propose entirely
                 picks = [bonus] * kn
             else:
-                with self.engine_stream_ctx:
-                    picks = self._spec_svc.propose(
-                        bonus, L + a, taps_row,
-                        torch.tensor(tk_ids[a]),
-                        torch.tensor(tk_vals[a], dtype=torch.float32),
-                        embed_row=emb_row, mask_row=mask_row)
+                picks = self._spec_svc.propose(
+                    bonus, L + a, taps_row,
+                    torch.tensor(tk_ids[a]),
+                    torch.tensor(tk_vals[a], dtype=torch.float32),
+                    embed_row=emb_row, mask_row=mask_row)
             self._spec_t_prop = getattr(self, "_spec_t_prop", 0.0) + _time.perf_counter() - _t3
             if full:
                 nxt = [bonus] + picks[1:]
@@ -771,8 +777,7 @@ class Scheduler(SchedulerIOMixin):
         # makes can_decode False for the transient only.
         vreq.output_len = 0
         vreq.linear_slot_idx = slot
-        with self.engine_stream_ctx:
-            self.token_pool[vreq.table_idx, L : L + kn].copy_(z_dev)
+        self.token_pool[vreq.table_idx, L : L + kn].copy_(z_dev)
         import time as _time
 
         vr = getattr(self.engine.graph_runner, "verify_runner", None)
