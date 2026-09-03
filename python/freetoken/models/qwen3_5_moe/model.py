@@ -392,7 +392,26 @@ class Qwen3_5MoEForCausalLM(BaseLLMModel):
         # reads the last forward's full logits + tap store + an embedding-row
         # callable from the ctx. Refs only -- no copies, no device traffic.
         try:
-            ctx.spec_logits = logits
+            # Verify-graph capture: a plain rebind here would leave the captured
+            # graph's lm_head writing a transient pool tensor nobody reads -- the
+            # graph must COPY into the persistent sink so every replay lands in
+            # verify_runner.logits_out (rebind is fine for eager forwards).
+            _sink = getattr(ctx, "spec_logits_sink", None)
+            if _sink is not None:
+                import os as _os_sink
+
+                if _os_sink.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+                    print(f"[sink] logits={tuple(logits.shape)} sink={tuple(_sink.shape)} "
+                          f"match={tuple(logits.shape) == tuple(_sink.shape)}", flush=True)
+            if _sink is not None and tuple(logits.shape) == tuple(_sink.shape):
+                _sink.copy_(logits)
+                ctx.spec_logits = _sink
+                _nsink = getattr(ctx, "spec_nan_sink", None)
+                if _nsink is not None:
+                    _nsink[0] = torch.isnan(logits).sum()
+                    _nsink[1] = torch.isinf(logits).sum()
+            else:
+                ctx.spec_logits = logits
             ctx.spec_taps = getattr(self.model, "_dflash_tap_dump", None)
             if getattr(ctx, "spec_embed", None) is None:
                 emb = self.model.embed_tokens

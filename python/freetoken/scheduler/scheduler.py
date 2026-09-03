@@ -479,15 +479,55 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.allocate_paged([_alloc_req])
 
         self._spec_entry_snap = pool.snapshot_slot(slot)
+
         _t1 = _time.perf_counter()
+        _gr = self.engine.graph_runner
+        for _attempt in range(2):
+            with self.engine_stream_ctx:
+                self._spec_t_stage = getattr(self, "_spec_t_stage", 0.0) + (_time.perf_counter() - _t1)
+                _tr0 = _time.perf_counter()
+                vr.replay_step(
+                    z_ids=z_dev.to(self.device), slot=slot, L=L,
+                    page_row=self.cache_manager.page_table[req.table_idx],
+                    stream=self.engine.stream)
+                self.engine.stream.synchronize()
+                _stale = int(vr.nan_out[0]) > 0
+            if not _stale:
+                break
+            # The captured verify graph was invalidated by eager traffic since
+            # its capture (any first-of-shape prefill -- warmup ladders, a new
+            # request -- leaves later replays all-NaN; captured-kernel reads of
+            # allocator-recycled memory). Self-heal: re-capture with a clean
+            # GDN padding slot and replay once more.
+            print(f"[spec] verify graph stale (attempt {_attempt}) -> re-capturing",
+                  flush=True)
+            # the stale replay already wrote through: undo its GDN slot advance
+            # so the retry starts from the same entry state
+            pool.restore_slot(slot, self._spec_entry_snap)
+            _ps = pool.padding_slot
+            pool.conv_states[:, _ps].zero_()
+            pool.recurrent_states[:, _ps].zero_()
+            # capture-time store_kv writes through out_loc: point it at the
+            # engine's guard page so a live request's KV rows 0-7 survive
+            _dp = int(self.cache_manager.page_table[
+                self.engine.dummy_req.table_idx][0].item())
+            vr.out_loc.fill_(_dp)
+            # free the old graph's private pool before capturing the new one
+            # (mid-serving free memory is ~0). NOTE: no torch.cuda.empty_cache()
+            # here -- on this ROCm stack it destabilizes live verify-graph
+            # replays (the next step goes stale again -> re-capture loop).
+            _k = vr.k
+            _gr.verify_runner = None
+            del vr
+            import gc as _gc
+
+            _gc.collect()
+            _gr._capture_verify(_k, self.engine.model)
+            vr = _gr.verify_runner
         with self.engine_stream_ctx:
-            self._spec_t_stage = getattr(self, "_spec_t_stage", 0.0) + (_time.perf_counter() - _t1)
-            _tr0 = _time.perf_counter()
-            vr.replay_step(
-                z_ids=z_dev.to(self.device), slot=slot, L=L,
-                page_row=self.cache_manager.page_table[req.table_idx],
-                stream=self.engine.stream)
-            self.engine.stream.synchronize()
+            if int(vr.nan_out[0]) > 0:
+                raise RuntimeError(
+                    "verify graph NaN after re-capture; falling back to decode")
             logits = vr.logits_out
             rows = [int(v) for v in logits.argmax(-1).reshape(-1).tolist()]
             tk = _t.topk(logits.float(), 64, dim=-1)
@@ -498,6 +538,7 @@ class Scheduler(SchedulerIOMixin):
         self._spec_n_vr = getattr(self, "_spec_n_vr", 0) + 1
         taps = vr.taps
 
+
         # Retry-block protocol: on partial accept (a < kn-1) revert the GDN
         # slot to the ENTRY snapshot and keep cached_len at L — the next block
         # re-extends positions L.. with the accepted rows as its prefix (their
@@ -505,6 +546,14 @@ class Scheduler(SchedulerIOMixin):
         # so progress >= 1 token/step is guaranteed). Full accept keeps the
         # graph's final state and advances cached_len past the block. No
         # per-position state log needed at all.
+        import os as _os_b
+
+        if _os_b.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+            _tnan = {d: int(t.isnan().sum()) for d, t in taps.items()} if taps else {}
+            print(f"[sd2] uid={req.uid} L={L} pre={st['pending'].get('pre', 1)} "
+                  f"z[:3]={z[:3]} rows[:3]={rows[:3]} slot={slot} "
+                  f"lsum={float(logits.abs().sum()):.1f} nan={vr.nan_out.tolist()} "
+                  f"tap_nan={_tnan}", flush=True)
         a = 0
         while a < kn - 1 and rows[a] == z[a + 1]:
             a += 1
@@ -550,11 +599,15 @@ class Scheduler(SchedulerIOMixin):
             _t3 = _time.perf_counter()
             taps_row = {d: t[a] for d, t in taps.items()}
             emb_row, mask_row = gctx.spec_embed(bonus)
-            picks = self._spec_svc.propose(
-                bonus, L + a, taps_row,
-                torch.tensor(tk_ids[a]),
-                torch.tensor(tk_vals[a], dtype=torch.float32),
-                embed_row=emb_row, mask_row=mask_row)
+            if _os_b.environ.get("FREETOKEN_SPEC_NODRAFT", "0") in {"1", "true", "yes"}:
+                # invalidator bisect: skip the DFlash propose entirely
+                picks = [bonus] * kn
+            else:
+                picks = self._spec_svc.propose(
+                    bonus, L + a, taps_row,
+                    torch.tensor(tk_ids[a]),
+                    torch.tensor(tk_vals[a], dtype=torch.float32),
+                    embed_row=emb_row, mask_row=mask_row)
             self._spec_t_prop = getattr(self, "_spec_t_prop", 0.0) + _time.perf_counter() - _t3
             if full:
                 nxt = [bonus] + picks[1:]
@@ -678,7 +731,10 @@ class Scheduler(SchedulerIOMixin):
         import time as _time
 
         vr = getattr(self.engine.graph_runner, "verify_runner", None)
-        if vr is not None and kn == vr.k:
+        import os as _os_e
+
+        if (vr is not None and kn == vr.k
+                and _os_e.environ.get("FREETOKEN_SPEC_EAGER", "0") not in {"1", "true", "yes"}):
             return self._spec_replay_step(req, vr, st, gctx, z, z_dev, L, kn, slot)
 
         _t0 = _time.perf_counter()
@@ -686,8 +742,12 @@ class Scheduler(SchedulerIOMixin):
         forward_input = self._prepare_batch(vbatch)
         self._spec_t_prepare = getattr(self, "_spec_t_prepare", 0.0) + _time.perf_counter() - _t0
         vbatch.is_verify = True
+        # cu_seqlens declares the varlen sequence boundaries: the k-row verify
+        # block is ONE sequence of length kn. [0,1] (arange(0,2)) silently left
+        # rows 1..kn-1 unprocessed -- their outputs were uninitialized pool
+        # memory (finite garbage at capture, NaN once the pool dirtied).
         vbatch.fla_metadata = FLAMetadata(
-            cu_seqlens=_t.arange(0, 2, dtype=_t.int32, device=self.device),
+            cu_seqlens=_t.tensor([0, kn], dtype=_t.int32, device=self.device),
             cache_indices=_t.tensor([slot], dtype=_t.int32, device=self.device),
             has_initial_state=None, fresh_state_indices=None)
         if st["log"] is None or st["slot"] != slot or len(st["log"]) < kn:
@@ -719,6 +779,13 @@ class Scheduler(SchedulerIOMixin):
         self._spec_t_fwd = getattr(self, "_spec_t_fwd", 0.0) + (_t2 - _t1)
 
         taps = gctx.spec_taps or {}
+        import os as _os_dbg2
+
+        if _os_dbg2.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+            _tnan = {d: int(t.isnan().sum()) for d, t in taps.items()} if taps else {}
+            print(f"[sd2e] uid={req.uid} L={L} pre={st['pending'].get('pre', 1)} "
+                  f"z[:3]={z[:3]} rows[:3]={rows[:3]} slot={slot} "
+                  f"lsum={float(logits.abs().sum()):.1f} tap_nan={_tnan}", flush=True)
         a = 0
         while a < kn - 1 and rows[a] == z[a + 1]:
             a += 1

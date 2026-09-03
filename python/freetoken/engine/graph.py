@@ -86,11 +86,17 @@ class VerifyGraphRunner:
         self.indices = torch.zeros(max_seq_len + k + 64, dtype=torch.int32, device=device)
         self.linear_idx = torch.zeros(1, dtype=torch.int32, device=device)
         self.q_to_req = torch.zeros(k, dtype=torch.int32, device=device)
-        self.logits_out = torch.empty(k, vocab_size, dtype=torch.bfloat16, device=device)
+        # fp32 (not bf16): the scheduler argmaxes/topk's this buffer directly --
+        # bf16 mantissa could flip argmax between near-tied top-1/top-2 logits
+        # and corrupt greedy acceptance.
+        self.logits_out = torch.empty(k, vocab_size, dtype=torch.float32, device=device)
         self.taps = {d: torch.zeros(k, hidden, dtype=torch.bfloat16, device=device)
                      for d in tap_layers}
         # per-position GDN snapshots: k pairs of full-slot columns, written by the
         # captured verify branch (restore log[a] on partial accept)
+        # NaN/Inf counters written by a captured kernel (readable post-replay):
+        # localizes whether the replay forward itself NaNs vs. the copy.
+        self.nan_out = torch.zeros(2, dtype=torch.int32, device=device)
         self.graph = None
 
     def capture(self, attn_backend, model, dummy_req):
@@ -102,12 +108,10 @@ class VerifyGraphRunner:
         from freetoken.kvcache.linear_state_pool import LinearStatePool
 
         pool = get_global_ctx().linear_state_pool
-        n_layers = pool.conv_states.shape[0]
-        self.state_log = [
-            (torch.zeros_like(pool.conv_states[:, 0]),
-             torch.zeros_like(pool.recurrent_states[:, 0]))
-            for _ in range(self.k)
-        ]
+        # NOTE: no per-position state_log here -- nothing reads it since the
+        # gdn is_verify branch was deleted (partial-accept rollback uses the
+        # scheduler's entry snapshot instead), and k x full-width GDN columns
+        # cost ~144 MiB, which OOMs a mid-serving re-capture.
 
         batch = Batch(reqs=[dummy_req], phase="prefill")
         batch.padded_reqs = batch.reqs
@@ -117,7 +121,10 @@ class VerifyGraphRunner:
         batch.out_loc = self.out_loc
         batch.linear_table_idx = self.linear_idx
         batch.fla_metadata = FLAMetadata(
-            cu_seqlens=torch.arange(0, 2, dtype=torch.int32, device=self.device),
+            # one varlen sequence spanning the whole k-row block: [0,1] would
+            # leave rows 1..k-1 unprocessed by the fla chunk kernel (uninit
+            # outputs -> NaN/garbage logits on replay)
+            cu_seqlens=torch.tensor([0, self.k], dtype=torch.int32, device=self.device),
             cache_indices=self.linear_idx,
         )
         batch.attn_metadata = TritonMetadata(
@@ -133,8 +140,12 @@ class VerifyGraphRunner:
         )
         gctx = get_global_ctx()
         gctx.spec_tap_dev = self.taps
-        gctx.spec_state_log = self.state_log
         gctx.spec_logits = self.logits_out  # the flush stash points here at capture
+        # THE sink: without this the captured flush rebinds ctx.spec_logits to a
+        # transient pool tensor and logits_out is never written on replay (all
+        # rows argmaxed token 0 -> '!' garbage loop at full acceptance).
+        gctx.spec_logits_sink = self.logits_out
+        gctx.spec_nan_sink = self.nan_out
 
         with torch.cuda.device(self.device):
             side = torch.cuda.Stream()
@@ -148,9 +159,77 @@ class VerifyGraphRunner:
                 with gctx.forward_batch(batch):
                     model.forward()
             torch.cuda.synchronize()
+        import os as _os_dbg
+
+        if _os_dbg.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+            # Boot self-test: one more eager warmup vs a replay of the fresh
+            # graph, same inputs -> logits must match. Divergence here means
+            # the capture itself broke the forward (pool/config freeze),
+            # independent of any scheduler staging.
+            with torch.cuda.device(self.device):
+                with torch.cuda.stream(side):
+                    _pool = get_global_ctx().linear_state_pool
+                    _snap = _pool.snapshot_slot(0)
+
+                    def _eager_ref():
+                        with gctx.forward_batch(batch):
+                            model.forward()
+                        torch.cuda.synchronize()
+                        return self.logits_out.clone(), {
+                            d: t.clone() for d, t in self.taps.items()}
+
+                    def _replay_cmp(ref, ref_taps, tag):
+                        _pool.restore_slot(0, _snap)
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        _d = (self.logits_out.float() - ref.float()).abs().max().item()
+                        _n = int(self.logits_out.isnan().sum())
+                        _td = {d: round((self.taps[d].float() - ref_taps[d].float())
+                                        .abs().max().item(), 3) for d in self.taps}
+                        print(f"[vr-selftest] {tag}: maxdiff={_d:.3f} nan={_n} "
+                              f"tapdiff={_td}", flush=True)
+
+                    # variant A: boot-dummy buffers
+                    _ref, _rt = _eager_ref()
+                    _replay_cmp(_ref, _rt, "dummy")
+
+                    def _stage_l66(do_pos=True, do_kv=True):
+                        if do_kv:
+                            self.kv_indptr[0].zero_()
+                            self.kv_indptr[1].fill_(66)
+                            self.prefix_lens[0].fill_(58)
+                        if do_pos:
+                            self.positions.copy_(torch.arange(58, 58 + self.k,
+                                                              dtype=torch.int32,
+                                                              device=self.device))
+
+                    # variant B: both groups staged
+                    _stage_l66()
+                    _ref, _rt = _eager_ref()
+                    _e2, _t2 = _eager_ref()  # determinism control: eager vs eager
+                    _d_ee = (_ref.float() - _e2.float()).abs().max().item()
+                    print(f"[vr-selftest] B eager_vs_eager maxdiff={_d_ee:.3f} "
+                          f"(determinism control)", flush=True)
+                    _replay_cmp(_ref, _rt, "L66both")
+                    # variant C: positions only (RoPE path)
+                    _pool.restore_slot(0, _snap)
+                    _stage_l66(do_pos=False)
+                    _ref, _rt = _eager_ref()
+                    _replay_cmp(_ref, _rt, "pos_only")
+                    # variant D: KV metadata only
+                    _pool.restore_slot(0, _snap)
+                    _stage_l66(do_kv=False)
+                    self.positions.copy_(torch.arange(0, self.k, dtype=torch.int32,
+                                                      device=self.device))
+                    _ref, _rt = _eager_ref()
+                    _replay_cmp(_ref, _rt, "kvmeta_only")
+        if _os_dbg.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+            print(f"[vr-cap] sink_sum={float(self.logits_out.abs().sum()):.1f} "
+                  f"row0_top={int(self.logits_out[0].argmax())}", flush=True)
         self.graph = graph
         gctx.spec_tap_dev = None
-        gctx.spec_state_log = None
+        gctx.spec_logits_sink = None  # eager forwards rebind as before
+        gctx.spec_nan_sink = None
 
     @torch.inference_mode()
     def replay_step(self, *, z_ids, slot: int, L: int, page_row, stream):

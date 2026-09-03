@@ -519,6 +519,24 @@ class Engine:
         if config.attention_backend.split(",")[0] == "triton":
             # Prefill runs on the first comma part; warm its autotune cache.
             self._warmup_prefill()
+            _vr_old = getattr(self.graph_runner, "verify_runner", None)
+            if _vr_old is not None:
+                # A verify graph captured BEFORE the prefill warmup is dead on
+                # arrival: the first big-T eager forward invalidates something
+                # the captured kernels read, and every later replay returns NaN
+                # logits (boot selftest clean, first-request probes NaN with
+                # dummy staging + a hard-zeroed GDN slot). Capture AFTER the
+                # warmup churn so the graph's references postdate it. The GDN
+                # padding slot must be reset first: the warmup's cumulative
+                # ~2000-token advance leaves a state deep enough that the fla
+                # chunk NaNs from it even EAGERLY (observed at re-capture).
+                if self.linear_state_pool is not None:
+                    _ps = self.linear_state_pool.padding_slot
+                    self.linear_state_pool.conv_states[:, _ps].zero_()
+                    self.linear_state_pool.recurrent_states[:, _ps].zero_()
+                self.graph_runner._capture_verify(_vr_old.k, self.model)
+                logger.info_rank0(
+                    f"verify graph re-captured post-warmup (k={_vr_old.k})")
 
     def _init_communication(self, config: EngineConfig) -> torch.distributed.ProcessGroup:
         if config.tp_info.size == 1 or config.use_pynccl:
@@ -1158,6 +1176,7 @@ class Engine:
 
         dummy_row = self.page_table[self.dummy_req.table_idx]
         dummy_slot = int(dummy_row[0].item())
+
         started = torch.cuda.Event(enable_timing=True)
         ended = torch.cuda.Event(enable_timing=True)
         started.record(self.stream)

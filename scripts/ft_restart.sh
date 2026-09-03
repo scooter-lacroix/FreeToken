@@ -21,9 +21,12 @@ setsid env -u PYTHONPATH CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}" FREET
   --cuda-graph-max-bs 1 "$@" \
   > "$LOG" 2>&1 < /dev/null &
 echo "BOOTED $!"
-for i in $(seq 1 45); do
+for i in $(seq 1 60); do
   sleep 10
-  tr -d '\0' < "$LOG" 2>/dev/null | grep -aq "ready to serve" && { echo READY; exit 0; }
+  # wait for BOTH the frontend bind AND the scheduler's warmup completion —
+  # traffic that lands mid-warmup decodes alongside the warmup request and
+  # trips co-residency classes (spec gate / bs=2 metadata)
+  tr -d '\0' < "$LOG" 2>/dev/null | grep -aq "prefill warmup complete" && { echo READY; exit 0; }
   tr -d '\0' < "$LOG" 2>/dev/null | grep -aqE "EADDRINUSE|Traceback" && { echo BOOT-FAILED; exit 1; }
 done
 echo TIMEOUT; exit 1
