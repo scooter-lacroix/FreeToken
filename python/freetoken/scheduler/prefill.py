@@ -20,9 +20,26 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+_pinned_keepalive: list = []
+
+
 def _maybe_pinned(t: torch.Tensor) -> torch.Tensor:
-    """Pinning only buys the async H2D copy below; without a device it just raises."""
-    return t.pin_memory() if torch.cuda.is_available() else t
+    """Pinned staging for the async H2D copies below, KEPT ALIVE until the
+    copy has long drained. The previous ``return t.pin_memory()`` handed a
+    TEMPORARY pinned tensor to ``copy_(..., non_blocking=True)``: Python
+    dropped it on return while the async copy engine still read the pinned
+    pages -- a use-after-free that surfaced as GPU "Page not present" faults
+    on host addresses at request boundaries (masked under launch
+    serialization). Retain the last 64 staged buffers; every scheduler-loop
+    iteration syncs the stream, so a buffer is reused only after many
+    completed copies."""
+    if not torch.cuda.is_available():
+        return t
+    buf = t.reshape(-1).pin_memory() if t.is_contiguous() else t.contiguous().pin_memory()
+    _pinned_keepalive.append(buf)
+    if len(_pinned_keepalive) > 64:
+        del _pinned_keepalive[:32]
+    return buf
 
 
 class ChunkedReq(Req):

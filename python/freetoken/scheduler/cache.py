@@ -881,8 +881,21 @@ def _write_page_table(
         torch.arange(first_pos, last_pos, out=positions_host[offset : offset + length])
         offset += length
     assert offset == needed_tokens, "Mismatch in allocated tokens and filled tokens."
+    # KEEP-ALIVE: these pinned host tensors are read ASYNCHRONOUSLY by the
+    # copy engine after this function returns -- dropping them at scope exit
+    # freed the pinned pages mid-copy (GPU "Page not present" faults on host
+    # addresses, timing-dependent). Retain recent staging buffers; the
+    # scheduler loop syncs every iteration, so old entries have drained long
+    # before the ring wraps.
+    _pt_keepalive = getattr(_write_page_table, "_keepalive", None)
+    if _pt_keepalive is None:
+        _pt_keepalive = []
+        _write_page_table._keepalive = _pt_keepalive
     table_idxs = table_idx_host.to(page_table.device, non_blocking=True)
     offsets = positions_host.to(page_table.device, non_blocking=True)
+    _pt_keepalive += [table_idx_host, positions_host]
+    if len(_pt_keepalive) > 64:
+        del _pt_keepalive[:32]
     assert allocated.dtype == page_table.dtype, (
         f"allocated dtype {allocated.dtype} != page_table dtype {page_table.dtype}"
     )

@@ -43,6 +43,26 @@ class FLAMetadata:
     track_conv_src: torch.Tensor | None = None   # [nt, kernel-1] int64 conv-input token positions
 
 
+_fla_pin_keepalive: list = []
+
+
+def _pin_to_device(host_t: "torch.Tensor", device) -> "torch.Tensor":
+    """Async H2D of a pinned HOST tensor with the source KEPT ALIVE.
+
+    ``torch.tensor(..., pin_memory=True).to(device, non_blocking=True)``
+    frees the pinned pages the moment the temporary drops (immediately, for
+    inline expressions) while the async copy engine still reads them -- GPU
+    "Page not present / supervisor privilege" faults on HOST addresses,
+    timing-dependent, clustered on prefix-hit prefills (the track-metadata
+    path only runs for chunk-boundary-crossing continuations). Retain recent
+    sources; scheduler-loop syncs drain the ring long before reuse."""
+    out = host_t.to(device, non_blocking=True)
+    _fla_pin_keepalive.append(host_t)
+    if len(_fla_pin_keepalive) > 128:
+        del _fla_pin_keepalive[:64]
+    return out
+
+
 def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     """Build the per-forward GDN metadata. Uses pinned host staging + non_blocking H2D
     (the input_ids/attn-metadata pattern), so the copies overlap the forward instead of
@@ -80,11 +100,11 @@ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
     track_dst, track_h_row, track_conv_src = _build_track_metadata(reqs, cu_host, device, pin)
 
     return FLAMetadata(
-        cu_seqlens=cu_host.to(device, non_blocking=True),
-        cache_indices=idx_host.to(device, non_blocking=True),
-        has_initial_state=has_init_host.to(device, non_blocking=True),
+        cu_seqlens=_pin_to_device(cu_host, device),
+        cache_indices=_pin_to_device(idx_host, device),
+        has_initial_state=_pin_to_device(has_init_host, device),
         fresh_state_indices=(
-            fresh_host.to(device, non_blocking=True) if fresh_host is not None else None
+            _pin_to_device(fresh_host, device) if fresh_host is not None else None
         ),
         track_dst=track_dst, track_h_row=track_h_row, track_conv_src=track_conv_src,
     )
@@ -121,7 +141,7 @@ def _build_track_metadata(reqs, cu_host, device, pin):
         r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
     if not dst:
         return None, None, None
-    to = lambda xs, **kw: torch.tensor(xs, **pin, **kw).to(device, non_blocking=True)
+    to = lambda xs, **kw: _pin_to_device(torch.tensor(xs, **pin, **kw), device)
     return (to(dst, dtype=torch.int64), to(h_row, dtype=torch.int64),
             to(conv_src, dtype=torch.int64))
 

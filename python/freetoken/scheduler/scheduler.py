@@ -60,6 +60,24 @@ class ForwardInput(NamedTuple):
 ForwardData: TypeAlias = "Tuple[ForwardInput, ForwardOutput]"
 
 
+_sched_pin_keepalive: list = []
+
+
+def _pinned_to_device(t: torch.Tensor, device) -> torch.Tensor:
+    """Async H2D of a pinned HOST tensor, with the pinned source KEPT ALIVE.
+
+    Handing a function-local pinned tensor to ``.to(device, non_blocking=True)``
+    frees the pinned pages at scope exit while the async copy engine still
+    reads them -- GPU "Page not present" faults on host addresses,
+    timing-dependent (masked under launch serialization). Retain recent
+    sources; the scheduler loop syncs every iteration so the ring drains."""
+    out = t.to(device, non_blocking=True)
+    _sched_pin_keepalive.append(t)
+    if len(_sched_pin_keepalive) > 128:
+        del _sched_pin_keepalive[:64]
+    return out
+
+
 class Scheduler(SchedulerIOMixin):
     def __init__(self, config: SchedulerConfig):
         from freetoken.engine import Engine
@@ -309,6 +327,10 @@ class Scheduler(SchedulerIOMixin):
         if _lt:
             self._lt_pick = getattr(self, "_lt_pick", 0.0) + _tt.perf_counter() - _ta
             _tb = _tt.perf_counter()
+        if batch is not None and _tos.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+            print(f"[phase] prepare phase={batch.phase} "
+                  f"n={len(batch.reqs)} uid={batch.reqs[0].uid} "
+                  f"cached={batch.reqs[0].cached_len}", flush=True)
         forward_input = self._prepare_batch(batch) if batch is not None else None
         if _lt:
             self._lt_prep = getattr(self, "_lt_prep", 0.0) + _tt.perf_counter() - _tb
@@ -513,6 +535,10 @@ class Scheduler(SchedulerIOMixin):
 
         _t1 = _time.perf_counter()
         _gr = self.engine.graph_runner
+        import os as _os_ph
+
+        if _os_ph.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+            print(f"[phase] spec-replay uid={req.uid} L={L}", flush=True)
         _sched_stream = torch.cuda.current_stream()
         for _attempt in range(2):
             with torch.cuda.stream(_sched_stream):
@@ -1424,6 +1450,10 @@ class Scheduler(SchedulerIOMixin):
             return
         for req in batch.reqs:
             if req.mamba_restore_src is not None:
+                if _os.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+                    print(f"[phase] cow-restore uid={req.uid} "
+                          f"src={req.mamba_restore_src} dst={req.linear_slot_idx}",
+                          flush=True)
                 pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                 req.mamba_restore_src = None  # consumed: restore exactly once
 
@@ -1649,9 +1679,9 @@ class Scheduler(SchedulerIOMixin):
                     pool = self.engine.linear_state_pool
                     slots = [r.linear_slot_idx if r.linear_slot_idx is not None
                              else pool.padding_slot for r in batch.padded_reqs]
-                    batch.linear_table_idx = torch.tensor(
-                        slots, dtype=torch.int32, device="cpu", pin_memory=True
-                    ).to(self.device, non_blocking=True)
+                    batch.linear_table_idx = _pinned_to_device(
+                        torch.tensor(slots, dtype=torch.int32, device="cpu",
+                                     pin_memory=True), self.device)
                 else:
                     batch.linear_table_idx = input_mapping[0].to(torch.int32)
             # Per-forward GDN metadata (cu_seqlens / cache_indices / continuation flags),
@@ -1784,7 +1814,7 @@ def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
             out=indices_host[offset : offset + length],
         )
         offset += length
-    return indices_host.to(device, non_blocking=True)
+    return _pinned_to_device(indices_host, device)
 
 
 def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
@@ -1794,7 +1824,7 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
         length = req.extend_len
         mapping_host[offset : offset + length].fill_(req.table_idx)
         offset += length
-    return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)
+    return _pinned_to_device(mapping_host, device), batch.positions.to(torch.int64)
 
 
 def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
@@ -1802,4 +1832,4 @@ def _make_write_tuple(batch: Batch, device: torch.device) -> Indice2D:
     mapping_host = torch.tensor(mapping_list, dtype=torch.int64, pin_memory=True)
     write_list = [(req.device_len if req.can_decode else -1) for req in batch.reqs]
     write_host = torch.tensor(write_list, dtype=torch.int64, pin_memory=True)
-    return mapping_host.to(device, non_blocking=True), write_host.to(device, non_blocking=True)
+    return _pinned_to_device(mapping_host, device), _pinned_to_device(write_host, device)
