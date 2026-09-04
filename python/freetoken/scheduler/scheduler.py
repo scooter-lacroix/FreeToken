@@ -1094,7 +1094,9 @@ class Scheduler(SchedulerIOMixin):
             # first spec block's pre-watermark counts it (z[0] skipped, not
             # re-emitted -- the prefill->spec 'TheThe' boundary duplicate).
             if req.input_ids.numel() < req.max_device_len:
-                req.append_host(_t.tensor([anchor], dtype=_t.int32))
+                import torch as _t_pa
+
+                req.append_host(_t_pa.tensor([anchor], dtype=_t_pa.int32))
         taps_row = {d: t[t.shape[0] - 1] for d, t in taps.items()}
         return {"anchor": anchor, "position": L - 1,
                 "picks": self._spec_propose(anchor, L - 1, taps_row, row_logits)}
