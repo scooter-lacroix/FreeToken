@@ -544,6 +544,57 @@ class Scheduler(SchedulerIOMixin):
 
         if _os_ph.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
             print(f"[phase] spec-replay uid={req.uid} L={L}", flush=True)
+        import os as _os_ab
+
+        if (_os_ab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
+                and getattr(self, "_spec_n_ab", 0) < 1):
+            # Decode-path invalidator bisect at the natural fault point (the
+            # first spec step after another request's normal decode run).
+            # Order matters: first NaN poisons the pool for later probes.
+            self._spec_n_ab = getattr(self, "_spec_n_ab", 0) + 1
+            entry_ab = self._spec_entry_snap
+            _pr_ab = self.cache_manager.page_table[req.table_idx]
+            _dev = self.device
+
+            def _pr():
+                with torch.cuda.stream(torch.cuda.current_stream()):
+                    vr.replay_step(z_ids=z_dev.to(_dev), slot=slot, L=L,
+                                   page_row=_pr_ab,
+                                   stream=torch.cuda.current_stream())
+                    torch.cuda.current_stream().synchronize()
+                return int(vr.nan_out[0])
+
+            def _op_rocblas():
+                _a = torch.randn(64, 5120, device=_dev, dtype=torch.bfloat16)
+                _b = torch.randn(5120, 256, device=_dev, dtype=torch.bfloat16)
+                _c = torch.mm(_a, _b)
+                del _a, _b, _c
+
+            def _op_scratch():
+                _s1 = torch.empty((1, 64, 128, 128), dtype=torch.float32, device=_dev)
+                _s2 = torch.empty((1, 64, 128), dtype=torch.float32, device=_dev)
+                del _s1, _s2
+
+            def _op_triton():
+                torch.arange(L, L + kn, dtype=torch.int32, device=_dev)
+
+            print(f"[ABP] L={L} slot={slot} (post-decode-traffic)", flush=True)
+            for _nm, _op in [("baseline", None), ("consecutive", None),
+                             ("triton_arange", _op_triton),
+                             ("scratch_alloc", _op_scratch),
+                             ("rocblas_mm", _op_rocblas)]:
+                pool.restore_slot(slot, entry_ab)
+                if _nm == "baseline":
+                    pass  # restore + replay directly
+                elif _nm == "consecutive":
+                    pass  # no op between restore and replay
+                else:
+                    _op()
+                _nan = _pr()
+                print(f"[ABP] after {_nm}: nan={_nan}", flush=True)
+            pool.restore_slot(slot, entry_ab)
+            _pr()
+
         if getattr(self, "_spec_graph_dirty", False):
             # normal forwards ran since the last replay: re-capture BEFORE
             # replaying (the stale graph hard-faults, which the NaN heal
