@@ -577,6 +577,21 @@ class Scheduler(SchedulerIOMixin):
                       flush=True)
             self._efp_prev = (_efp, L)
 
+        # HOST-PULL keep-alive (last coherence candidate): every coherent
+        # probe boot D2H-synced the GDN slot and page-table row each step via
+        # fingerprint host pulls; production never did. Dummy launches, device
+        # syncs, eager passes, and double replays are all falsified -- this is
+        # the remaining delta. Gated FREETOKEN_SPEC_HOSTPULL (default ON for
+        # the experiment; ~1-2ms/step).
+        import os as _os_hp
+
+        if _os_hp.environ.get("FREETOKEN_SPEC_HOSTPULL", "0") in {"1", "true", "yes"}:
+            _ = pool.recurrent_states[:, slot].detach().cpu().contiguous().view(
+                torch.uint8)
+            _ = self.cache_manager.page_table[req.table_idx, : L + kn
+                                              ].detach().cpu().contiguous().view(
+                torch.uint8)
+
         _t1 = _time.perf_counter()
         _gr = self.engine.graph_runner
         import os as _os_ph
