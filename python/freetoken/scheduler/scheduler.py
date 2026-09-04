@@ -1012,7 +1012,7 @@ class Scheduler(SchedulerIOMixin):
         self._spec_t_send = getattr(self, "_spec_t_send", 0.0) + (
             _time.perf_counter() - _t_sr0)
         self._spec_n = getattr(self, "_spec_n", 0) + 1
-        if self._spec_n % 25 == 0:
+        if self._spec_n % 25 == 0 or self._spec_n == 1:
             n = self._spec_n
             _acc2 = getattr(self, "_spec_sub_acc", {}) or {}
             _subs = " ".join(f"{k}={_acc2.get(k, 0.0)/n*1000:.0f}" for k in
@@ -1094,7 +1094,9 @@ class Scheduler(SchedulerIOMixin):
             # first spec block's pre-watermark counts it (z[0] skipped, not
             # re-emitted -- the prefill->spec 'TheThe' boundary duplicate).
             if req.input_ids.numel() < req.max_device_len:
-                req.append_host(_t.tensor([anchor], dtype=_t.int32))
+                import torch as _t_anchor
+
+                req.append_host(_t_anchor.tensor([anchor], dtype=_t_anchor.int32))
         taps_row = {d: t[t.shape[0] - 1] for d, t in taps.items()}
         return {"anchor": anchor, "position": L - 1,
                 "picks": self._spec_propose(anchor, L - 1, taps_row, row_logits)}
