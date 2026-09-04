@@ -598,80 +598,12 @@ class Scheduler(SchedulerIOMixin):
 
         if _os_ph.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
             print(f"[phase] spec-replay uid={req.uid} L={L}", flush=True)
-        import os as _os_ab
-
-        if (_os_ab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
-                and getattr(self, "_spec_n_ab", 0) < 1):
-            # Decode-path invalidator bisect at the natural fault point (the
-            # first spec step after another request's normal decode run).
-            # Order matters: first NaN poisons the pool for later probes.
-            self._spec_n_ab = getattr(self, "_spec_n_ab", 0) + 1
-            entry_ab = self._spec_entry_snap
-            _pr_ab = self.cache_manager.page_table[req.table_idx]
-            _dev = self.device
-
-            def _pr():
-                with torch.cuda.stream(torch.cuda.current_stream()):
-                    vr.replay_step(z_ids=z_dev.to(_dev), slot=slot, L=L,
-                                   page_row=_pr_ab,
-                                   stream=torch.cuda.current_stream())
-                    torch.cuda.current_stream().synchronize()
-                return int(vr.nan_out[0])
-
-            def _op_rocblas():
-                _a = torch.randn(64, 5120, device=_dev, dtype=torch.bfloat16)
-                _b = torch.randn(5120, 256, device=_dev, dtype=torch.bfloat16)
-                _c = torch.mm(_a, _b)
-                del _a, _b, _c
-
-            def _op_scratch():
-                _s1 = torch.empty((1, 64, 128, 128), dtype=torch.float32, device=_dev)
-                _s2 = torch.empty((1, 64, 128), dtype=torch.float32, device=_dev)
-                del _s1, _s2
-
-            def _op_triton():
-                torch.arange(L, L + kn, dtype=torch.int32, device=_dev)
-
-            print(f"[ABP] L={L} slot={slot} (post-decode-traffic)", flush=True)
-            for _nm, _op in [("baseline", None), ("consecutive", None),
-                             ("triton_arange", _op_triton),
-                             ("scratch_alloc", _op_scratch),
-                             ("rocblas_mm", _op_rocblas)]:
-                pool.restore_slot(slot, entry_ab)
-                if _nm == "baseline":
-                    pass  # restore + replay directly
-                elif _nm == "consecutive":
-                    pass  # no op between restore and replay
-                else:
-                    _op()
-                _nan = _pr()
-                print(f"[ABP] after {_nm}: nan={_nan}", flush=True)
-            pool.restore_slot(slot, entry_ab)
-            _pr()
-
-        if getattr(self, "_spec_graph_dirty", False):
-            # normal forwards ran since the last replay: re-capture BEFORE
-            # replaying (the stale graph hard-faults, which the NaN heal
-            # cannot catch)
-            print("[spec] normal traffic since last replay -> proactive re-capture",
-                  flush=True)
-            vr = self._spec_recapture(pool, vr)
-            self._spec_graph_dirty = False
         _sched_stream = torch.cuda.current_stream()
         _sub = {}
         for _attempt in range(2):
             with torch.cuda.stream(_sched_stream):
                 self._spec_t_stage = getattr(self, "_spec_t_stage", 0.0) + (_time.perf_counter() - _t1)
                 _tr0 = _time.perf_counter()
-                # REPLAY-TWICE experiment: probe-active boots (extra graph
-                # replay between production steps) were coherent while
-                # no-probe boots garble -- test whether replay #1 after a
-                # gap is wrong and #2 right. First result discarded.
-                if _os_ab.environ.get("FREETOKEN_SPEC_2X", "0") in {"1", "true", "yes"}:
-                    vr.replay_step(
-                        z_ids=z_dev.to(self.device), slot=slot, L=L,
-                        page_row=self.cache_manager.page_table[req.table_idx],
-                        stream=_sched_stream)
                 _z_gpu = z_dev.to(self.device)
                 _sub["h2d"] = _sub.get("h2d", 0.0) + _time.perf_counter() - _tr0
                 _t_l = _time.perf_counter()
@@ -875,6 +807,40 @@ class Scheduler(SchedulerIOMixin):
         self._spec_n_vr = getattr(self, "_spec_n_vr", 0) + 1
         self._spec_graph_dirty = False
         taps = vr.taps
+
+        import os as _os_r12
+
+        if (_os_r12.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
+                and getattr(self, "_spec_n_r12", 0) < 1 and L > 8000):
+            # R12 at DEPTH: three consecutive replays of the SAME staged z
+            # with entry restores between. r1!=r2 => graph depth-unstable;
+            # equal while production rows vary => state mutates BETWEEN steps.
+            self._spec_n_r12 = 1
+            _snap12 = self._spec_entry_snap
+            _pr12 = self.cache_manager.page_table[req.table_idx]
+
+            def _tap12():
+                pool.restore_slot(slot, _snap12)
+                with torch.cuda.stream(torch.cuda.current_stream()):
+                    vr.replay_step(z_ids=z_dev.to(self.device), slot=slot,
+                                   L=L, page_row=_pr12,
+                                   stream=torch.cuda.current_stream())
+                    torch.cuda.current_stream().synchronize()
+                return ({d: t.clone() for d, t in vr.taps.items()},
+                        [int(v) for v in vr.logits_out.argmax(-1)
+                         .reshape(-1).tolist()[:4]])
+
+            _a, _ra = _tap12()
+            _b, _rb = _tap12()
+            _c, _rc = _tap12()
+            _d12 = {d: round((_a[d].float() - _b[d].float()).abs().max().item(), 3)
+                    for d in _a}
+            _d23 = {d: round((_b[d].float() - _c[d].float()).abs().max().item(), 3)
+                    for d in _b}
+            print(f"[R12D] L={L} r1={_ra} r2={_rb} r3={_rc} "
+                  f"r1r2={_d12} r2r3={_d23} prod_rows={rows[:4]}", flush=True)
+            pool.restore_slot(slot, _snap12)
+
 
         # Retry-block protocol: on partial accept (a < kn-1) revert the GDN
         # slot to the ENTRY snapshot and keep cached_len at L — the next block
