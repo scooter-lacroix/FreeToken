@@ -778,10 +778,28 @@ class Scheduler(SchedulerIOMixin):
             # current entry state; if its rows equal the previous step's rows,
             # the graph's state evolved cleanly -- if not, the retry boundary
             # changed what the graph sees for identical staging.
+            import hashlib
+
+            def _h(_t):
+                return hashlib.md5(
+                    _t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+                ).hexdigest()[:10]
+
+            _pt_row = self.cache_manager.page_table[req.table_idx]
+            _fp = {
+                "pages": _h(_pt_row[: L + 8]),
+                "slot_rec": _h(pool.recurrent_states[:, slot]),
+                "slot_conv": _h(pool.conv_states[:, slot]),
+                "tokpool": _h(self.token_pool[req.table_idx, : L + 8]),
+            }
             _prev = getattr(self, "_eab_prev", None)
-            self._eab_prev = (z_dev.clone(), rows[:4], self._spec_entry_snap)
-            if _prev is not None:
-                _pz, _prows, _psnap = _prev
+            if _prev is not None and len(_prev) == 5:
+                _changed = [k for k in _fp if _fp[k] != _prev[4][k]]
+                print(f"[EABF] changed across cycle: {_changed} now={_fp} prev={_prev[4]}",
+                      flush=True)
+            self._eab_prev = (z_dev.clone(), rows[:4], self._spec_entry_snap, None, _fp)
+            if _prev is not None and len(_prev) == 5:
+                _pz, _prows, _psnap = _prev[0], _prev[1], _prev[2]
                 pool.restore_slot(slot, self._spec_entry_snap)
                 with torch.cuda.stream(torch.cuda.current_stream()):
                     vr.replay_step(z_ids=_pz.to(self.device), slot=slot, L=L,
