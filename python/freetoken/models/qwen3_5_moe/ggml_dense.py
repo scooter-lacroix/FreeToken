@@ -120,8 +120,8 @@ def _kq_gemv(w, x, quant_type: int, out_features: int):
         import os as _os_fused
 
         if (_verify_batch and x.shape[0] > 1
-                and _os_fused.environ.get("FREETOKEN_FUSED_M8", "0")
-                in {"1", "true", "yes"}):
+                and _os_fused.environ.get("FREETOKEN_FUSED_M8", "1")
+                not in {"0", "false", "no"}):
             if not globals().get("_m8_dbg"):
                 globals()["_m8_dbg"] = True
                 print(f"[m8-dbg] x shape={tuple(x.shape)} stride={x.stride()} "
@@ -136,15 +136,12 @@ def _kq_gemv(w, x, quant_type: int, out_features: int):
                     y_m8 = _m8k(w, x, quant_type)
                     st.append((w, x, y_m8, len(st)))
                     return y_m8
-            # fused skinny-M GEMM (opt-in): FIVE-WAY PROVEN CORRECT -- bit-exact
-            # vs the T=1 GEMV oracle on real weights, under isolated graph
-            # capture+replay, faithful captured launch in-serving with a
-            # FLAT-zero drift curve over 18+ steps, coherent e2e on healthy
-            # graphs. Kept OFF only because the intermittent garbage-class
-            # graph invalidation (which hits healthy-graph output regardless
-            # of kernel choice, NaN heal can't catch wrong-values) is easier
-            # to attribute on the long-proven vec path. ~2x when on (177ms
-            # step vs 344, sync 95 vs 167).
+            # fused skinny-M GEMM (DEFAULT ON, gate-green 09-04): bit-exact vs
+            # the T=1 GEMV oracle on real weights, faithful under isolated and
+            # in-serving graph capture, and the full spec gate (same-prompt,
+            # two-thread, repeats) passed coherent end-to-end with it live:
+            # 'The user wants me to say hello in one sentence...' identical to
+            # normal decode. ~2x on the verify step (177ms vs 344ms).
             from freetoken.kernel.triton.kquant_linear import kq_gemm_q4k_m8
 
             return kq_gemm_q4k_m8(w, x, quant_type)
