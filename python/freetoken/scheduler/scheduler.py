@@ -692,6 +692,48 @@ class Scheduler(SchedulerIOMixin):
                 print(f"[m8-dump] step={getattr(self, '_spec_n', 0)} call{_idx}: "
                       f"replay-vs-eager maxdiff={_d:.4f}", flush=True)
 
+        import os as _os_eab
+
+        if (_os_eab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
+                and getattr(self, "_spec_n_eab", 0) < 9
+                and getattr(self, "_spec_n", 0) % 3 == 0):
+            # Eager-vs-graph rows probe: run the eager verify on the SAME
+            # entry state and compare argmax rows. rows==erows while the
+            # client stream garbles => GPU path faithful, emission/staging
+            # protocol guilty.
+            from freetoken.attention.linear import FLAMetadata as _FLA
+            from freetoken.core import Batch as _B, Req as _R
+
+            self._spec_n_eab = getattr(self, "_spec_n_eab", 0) + 1
+            _esnap = self._spec_entry_snap
+            pool.restore_slot(slot, _esnap)
+            _vrq = _R(
+                input_ids=_t.cat([req.input_ids[:L], z_dev]),
+                table_idx=req.table_idx, cached_len=L, output_len=0,
+                uid=req.uid + self.WARMUP_UID_BASE,
+                sampling_params=req.sampling_params, cache_handle=req.cache_handle)
+            _vrq.device_len = L + kn
+            _vrq.linear_slot_idx = slot
+            _vb = _B(reqs=[_vrq], phase="prefill")
+            _vb.padded_reqs = _vb.reqs
+            _fi = self._prepare_batch(_vb)
+            _vb.is_verify = True
+            _vb.fla_metadata = _FLA(
+                cu_seqlens=_t.tensor([0, kn], dtype=_t.int32, device=self.device),
+                cache_indices=_t.tensor([slot], dtype=_t.int32, device=self.device),
+                has_initial_state=None, fresh_state_indices=None)
+            with self.engine_stream_ctx:
+                self._restore_linear_states(_vb)
+                self._forward(_fi)
+                self.engine.stream.synchronize()
+                _elog = gctx.spec_logits
+                _erows = [int(v) for v in _elog.argmax(-1).reshape(-1).tolist()]
+            self.decode_manager.remove_req(_vrq)
+            print(f"[EAB] step={getattr(self, '_spec_n', 0)} L={L} "
+                  f"graph_rows={rows[:4]} eager_rows={_erows[:4]} "
+                  f"match={rows[:4] == _erows[:4]}", flush=True)
+            pool.restore_slot(slot, _esnap)
+
         _sub["total"] = _sub.get("total", 0.0) + (_time.perf_counter() - _t1)
         _acc = getattr(self, "_spec_sub_acc", None)
         if _acc is None:
@@ -745,16 +787,22 @@ class Scheduler(SchedulerIOMixin):
 
         if _os_b.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
             _tnan = {d: int(t.isnan().sum()) for d, t in taps.items()} if taps else {}
-            print(f"[sd2] uid={req.uid} L={L} pre={st['pending'].get('pre', 1)} "
-                  f"z[:3]={z[:3]} rows[:3]={rows[:3]} slot={slot} "
-                  f"lsum={float(logits.abs().sum()):.1f} nan={vr.nan_out.tolist()} "
-                  f"tap_nan={_tnan}", flush=True)
+            self._sd2_ctx = (req.uid, L, st['pending'].get('pre', 1), z, rows, slot)
         a = 0
         while a < kn - 1 and rows[a] == z[a + 1]:
             a += 1
         bonus = rows[a]
         full = a == kn - 1
         entry_snap = self._spec_entry_snap
+        if _os_b.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+            _uid_d, _L_d, _pre_d, _z_d, _rows_d, _slot_d = getattr(
+                self, "_sd2_ctx", (req.uid, L, 1, z, rows, slot))
+            _emit_d = (z[_pre_d:a + 1] + [bonus]) if not full else (
+                (z[_pre_d:] + [bonus]) if _pre_d < kn else [bonus])
+            print(f"[sd2] uid={_uid_d} L={_L_d} pre={_pre_d} a={a} full={full} "
+                  f"z[:3]={_z_d[:3]} rows[:3]={_rows_d[:3]} slot={_slot_d} "
+                  f"emit={_emit_d} lsum={float(logits.abs().sum()):.1f} "
+                  f"nan={vr.nan_out.tolist()}", flush=True)
 
         reply = []
         finished = False
