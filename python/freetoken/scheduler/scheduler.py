@@ -1130,7 +1130,11 @@ class Scheduler(SchedulerIOMixin):
         _tail_ids = req.input_ids[L:].tolist()
         if _tail_ids and _tail_ids != z[: len(_tail_ids)]:
             z = [int(x) for x in _tail_ids] + z[len(_tail_ids):]
-            z = z[: max(k, len(z))]
+            # FIXED-SHAPE block: truncate to k (a decode step between spec
+            # steps appends a token making the tail k+1; feeding that to
+            # dispatch produced kn=k+1 != vr.k). The k+1-th tail token
+            # waits for the next block.
+            z = z[:k]
         kn = len(z)
         _vr_k = getattr(getattr(self.engine.graph_runner, "verify_runner", None), "k", 0)
         if _vr_k and kn < _vr_k:
