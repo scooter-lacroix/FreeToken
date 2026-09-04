@@ -512,7 +512,19 @@ class Scheduler(SchedulerIOMixin):
         if _acc is not None and len(_acc) >= _win and req.uid in _acc:
             h = _acc[req.uid]
             if len(h) >= _win and (sum(h[-_win:]) / _win) < _thr:
-                return False  # decode until this request finishes
+                # HANDOFF ALIGNMENT: after a partial accept the verified
+                # stream is AHEAD of committed KV (cached_len); resuming
+                # normal decode at cached_len would re-process tokens already
+                # in input_ids (duplicated context = the first-request garbage
+                # class). Defer the handoff until a full accept aligns the
+                # stream with the KV watermark.
+                if req.input_ids.numel() == req.cached_len:
+                    return False  # aligned: decode until this request finishes
+                # not aligned: mark intent; the next full accept completes it
+                self._spec_want_decode = True
+        if getattr(self, "_spec_want_decode", False) and req.input_ids.numel() == req.cached_len:
+            self._spec_want_decode = False
+            return False
         try:
             return self._spec_step_inner(req, k)
         except Exception as e:                              # noqa: BLE001
