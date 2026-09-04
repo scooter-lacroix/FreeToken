@@ -604,16 +604,25 @@ class Scheduler(SchedulerIOMixin):
             vr = self._spec_recapture(pool, vr)
             self._spec_graph_dirty = False
         _sched_stream = torch.cuda.current_stream()
+        _sub = {}
         for _attempt in range(2):
             with torch.cuda.stream(_sched_stream):
                 self._spec_t_stage = getattr(self, "_spec_t_stage", 0.0) + (_time.perf_counter() - _t1)
                 _tr0 = _time.perf_counter()
+                _z_gpu = z_dev.to(self.device)
+                _sub["h2d"] = _sub.get("h2d", 0.0) + _time.perf_counter() - _tr0
+                _t_l = _time.perf_counter()
                 vr.replay_step(
-                    z_ids=z_dev.to(self.device), slot=slot, L=L,
+                    z_ids=_z_gpu, slot=slot, L=L,
                     page_row=self.cache_manager.page_table[req.table_idx],
                     stream=_sched_stream)
+                _sub["launch"] = _sub.get("launch", 0.0) + _time.perf_counter() - _t_l
+                _t_s = _time.perf_counter()
                 _sched_stream.synchronize()
+                _sub["sync"] = _sub.get("sync", 0.0) + _time.perf_counter() - _t_s
+                _t_n = _time.perf_counter()
                 _stale = int(vr.nan_out[0]) > 0
+                _sub["nanread"] = _sub.get("nanread", 0.0) + _time.perf_counter() - _t_n
             if not _stale:
                 break
             # The captured verify graph was invalidated by eager traffic since
@@ -643,12 +652,27 @@ class Scheduler(SchedulerIOMixin):
             if int(vr.nan_out[0]) > 0:
                 raise RuntimeError(
                     "verify graph NaN after re-capture; falling back to decode")
+            _t_a = _time.perf_counter()
             logits = vr.logits_out
             rows = [int(v) for v in logits.argmax(-1).reshape(-1).tolist()]
+            _sub["argmax"] = _sub.get("argmax", 0.0) + _time.perf_counter() - _t_a
+            _t_k = _time.perf_counter()
             tk = _t.topk(logits.float(), 64, dim=-1)
+            _sub["topk"] = _sub.get("topk", 0.0) + _time.perf_counter() - _t_k
+            _t_l1 = _time.perf_counter()
             tk_ids = tk.indices.tolist()
+            _sub["tolist1"] = _sub.get("tolist1", 0.0) + _time.perf_counter() - _t_l1
+            _t_l2 = _time.perf_counter()
             tk_vals = tk.values.tolist()
+            _sub["tolist2"] = _sub.get("tolist2", 0.0) + _time.perf_counter() - _t_l2
             self._spec_t_replay = getattr(self, "_spec_t_replay", 0.0) + (_time.perf_counter() - _tr0)
+        _sub["total"] = _sub.get("total", 0.0) + (_time.perf_counter() - _t1)
+        _acc = getattr(self, "_spec_sub_acc", None)
+        if _acc is None:
+            _acc = {}
+            self._spec_sub_acc = _acc
+        for _kk, _vv in _sub.items():
+            _acc[_kk] = _acc.get(_kk, 0.0) + _vv
         self._spec_t_fwd = getattr(self, "_spec_t_fwd", 0.0) + (_time.perf_counter() - _t1)
         self._spec_n_vr = getattr(self, "_spec_n_vr", 0) + 1
         self._spec_graph_dirty = False
@@ -776,10 +800,14 @@ class Scheduler(SchedulerIOMixin):
         self._spec_n = getattr(self, "_spec_n", 0) + 1
         if self._spec_n % 25 == 0:
             n = self._spec_n
+            _acc2 = getattr(self, "_spec_sub_acc", {}) or {}
+            _subs = " ".join(f"{k}={_acc2.get(k, 0.0)/n*1000:.0f}" for k in
+                             ("total", "h2d", "launch", "sync", "nanread",
+                              "argmax", "topk", "tolist1", "tolist2"))
             print(f"[spec-timing] n={n} fwd={self._spec_t_fwd/n*1000:.0f}ms "
                   f"replay={getattr(self, '_spec_t_replay', 0.0)/n*1000:.0f}ms "
-                  f"prop={self._spec_t_prop/n*1000:.0f}ms vr_n={getattr(self, '_spec_n_vr', 0)}",
-                  flush=True)
+                  f"prop={self._spec_t_prop/n*1000:.0f}ms vr_n={getattr(self, '_spec_n_vr', 0)} "
+                  f"| sub(ms): {_subs}", flush=True)
         return True
 
     def _spec_recapture(self, pool, vr):

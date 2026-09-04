@@ -96,10 +96,13 @@ def _kq_gemv(w, x, quant_type: int, out_features: int):
     """
     import os
 
-    # verify batches (T=k>1) MUST take the GEMM path below: the Triton GEMV's
-    # grid is (row-blocks, T) — each (block, token) program re-reads its weight
-    # block, so T=8 multiplies the weight bytes 8x (measured 400us/call x272 =
-    # 109ms of a 174ms graphed verify step).
+    # NOTE: the historical exclusion of verify batches (T=k>1) from the ggml
+    # GEMM path was RIGHT to leave (the a8 GEMM at M=8 measured ~2.7s/step —
+    # the prefill profile's 196ms-vs-4.9ms class), but the Triton GEMV is
+    # only validated at T=1 (T=8 produced garbage). Verify batches fall
+    # through to the ggml VEC kernel below: validated for M<=8 (the LM head
+    # has run it since the S4 driver) and its 8x weight re-read is ~15x
+    # cheaper than the a8 GEMM.
     _verify_batch = False
     try:
         from freetoken.core import get_global_ctx as _gctx
@@ -120,16 +123,9 @@ def _kq_gemv(w, x, quant_type: int, out_features: int):
         return kq_gemv(w, x, quant_type)
     from freetoken.kernel.gguf import ggml_mul_mat_a8, ggml_mul_mat_vec_a8
 
-    # Spec-verify batches (T=k>1): the vec kernel re-reads the weight matrix PER
-    # TOKEN (8x bytes); the GEMM path reads weights once for the whole block.
-    _verify = False
-    try:
-        from freetoken.core import get_global_ctx as _gctx
-
-        _verify = getattr(getattr(_gctx(), "batch", None), "is_verify", False)
-    except Exception:                                   # noqa: BLE001
-        pass
-    if x.shape[0] <= 8 and not (_verify and x.shape[0] > 1):
+    # vec kernel for skinny batches including verify (see note above: the
+    # a8 GEMM at M=8 measured ~2.7s/step; 8x weight re-reads win by ~15x)
+    if x.shape[0] <= 8:
         if quant_type == 14 and out_features * 256 <= w.shape[1] * 210 * 4096:
             # Q6_K Triton GEMV (real-weight parity ~bf16 rounding; ~578GB/s vs the
             # vendored vec kernel's ~500 at [5120,6144]) — same guard shape as Q4_K.
