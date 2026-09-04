@@ -368,6 +368,11 @@ class Scheduler(SchedulerIOMixin):
         if _lt:
             _t2 = _tt.perf_counter()
         if forward_input is not None:
+            # a normal (non-spec) forward ran: the verify graph's external
+            # state may be invalidated by the decode/prefill machinery (fault
+            # at the next replay, measured at request boundaries) -- mark it
+            # so the next spec step re-captures before replaying
+            self._spec_graph_dirty = True
             with self.engine_stream_ctx:  # run the batch in the engine's stream
                 self.engine.stream.wait_stream(self.stream)
                 # COW-restore GDN snapshots for prefix hits ON THE ENGINE STREAM, after the
@@ -539,6 +544,14 @@ class Scheduler(SchedulerIOMixin):
 
         if _os_ph.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
             print(f"[phase] spec-replay uid={req.uid} L={L}", flush=True)
+        if getattr(self, "_spec_graph_dirty", False):
+            # normal forwards ran since the last replay: re-capture BEFORE
+            # replaying (the stale graph hard-faults, which the NaN heal
+            # cannot catch)
+            print("[spec] normal traffic since last replay -> proactive re-capture",
+                  flush=True)
+            vr = self._spec_recapture(pool, vr)
+            self._spec_graph_dirty = False
         _sched_stream = torch.cuda.current_stream()
         for _attempt in range(2):
             with torch.cuda.stream(_sched_stream):
@@ -574,14 +587,7 @@ class Scheduler(SchedulerIOMixin):
             # (mid-serving free memory is ~0). NOTE: no torch.cuda.empty_cache()
             # here -- on this ROCm stack it destabilizes live verify-graph
             # replays (the next step goes stale again -> re-capture loop).
-            _k = vr.k
-            _gr.verify_runner = None
-            del vr
-            import gc as _gc
-
-            _gc.collect()
-            _gr._capture_verify(_k, self.engine.model, stream=_sched_stream)
-            vr = _gr.verify_runner
+            vr = self._spec_recapture(pool, vr)
         with torch.cuda.stream(_sched_stream):
             if int(vr.nan_out[0]) > 0:
                 raise RuntimeError(
@@ -594,6 +600,7 @@ class Scheduler(SchedulerIOMixin):
             self._spec_t_replay = getattr(self, "_spec_t_replay", 0.0) + (_time.perf_counter() - _tr0)
         self._spec_t_fwd = getattr(self, "_spec_t_fwd", 0.0) + (_time.perf_counter() - _t1)
         self._spec_n_vr = getattr(self, "_spec_n_vr", 0) + 1
+        self._spec_graph_dirty = False
         taps = vr.taps
 
         # Retry-block protocol: on partial accept (a < kn-1) revert the GDN
@@ -723,6 +730,26 @@ class Scheduler(SchedulerIOMixin):
                   f"prop={self._spec_t_prop/n*1000:.0f}ms vr_n={getattr(self, '_spec_n_vr', 0)}",
                   flush=True)
         return True
+
+    def _spec_recapture(self, pool, vr):
+        """Re-capture the verify graph on the current (scheduler/engine) stream
+        with a clean GDN padding slot and out_loc aimed at the guard page."""
+        _ps = pool.padding_slot
+        pool.conv_states[:, _ps].zero_()
+        pool.recurrent_states[:, _ps].zero_()
+        _dp = int(self.cache_manager.page_table[
+            self.engine.dummy_req.table_idx][0].item())
+        vr.out_loc.fill_(_dp)
+        _k = vr.k
+        _gr = self.engine.graph_runner
+        _gr.verify_runner = None
+        del vr
+        import gc as _gc
+
+        _gc.collect()
+        _gr._capture_verify(_k, self.engine.model,
+                            stream=torch.cuda.current_stream())
+        return _gr.verify_runner
 
     def _spec_arm(self, k: int):
         from freetoken.models.dflash.service import get_service
