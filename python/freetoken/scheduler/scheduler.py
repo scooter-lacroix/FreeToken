@@ -769,41 +769,48 @@ class Scheduler(SchedulerIOMixin):
             from freetoken.core import Batch as _B, Req as _R
 
             self._spec_n_eab = getattr(self, "_spec_n_eab", 0) + 1
-            _esnap = self._spec_entry_snap
-            pool.restore_slot(slot, _esnap)
-            _vrq = _R(
-                input_ids=_t.cat([req.input_ids[:L], z_dev]),
-                table_idx=req.table_idx, cached_len=L, output_len=0,
-                uid=req.uid + self.WARMUP_UID_BASE,
-                sampling_params=req.sampling_params, cache_handle=req.cache_handle)
-            _vrq.device_len = L + kn
-            _vrq.linear_slot_idx = slot
-            _vb = _B(reqs=[_vrq], phase="prefill")
-            _vb.padded_reqs = _vb.reqs
-            _fi = self._prepare_batch(_vb)
-            _vb.is_verify = True
-            _vb.fla_metadata = _FLA(
-                cu_seqlens=_t.tensor([0, kn], dtype=_t.int32, device=self.device),
-                cache_indices=_t.tensor([slot], dtype=_t.int32, device=self.device),
-                has_initial_state=None, fresh_state_indices=None)
-            with self.engine_stream_ctx:
-                self._restore_linear_states(_vb)
-                self._forward(_fi)
-                self.engine.stream.synchronize()
-                _elog = gctx.spec_logits
-                _erows = [int(v) for v in _elog.argmax(-1).reshape(-1).tolist()]
-            self.decode_manager.remove_req(_vrq)
-            _etaps = gctx.spec_taps or {}
-            _tapd = {}
-            for _d, _tg in _etaps.items():
-                _vg = vr.taps.get(_d)
-                if _vg is None:
-                    continue
-                _tapd[_d] = round((_vg.float() - _tg.float().to(_vg.device))
-                                  .abs().max().item(), 3)
-            print(f"[EAB] step={getattr(self, '_spec_n', 0)} L={L} "
-                  f"graph_rows={rows[:4]} eager_rows={_erows[:4]} "
-                  f"match={rows[:4] == _erows[:4]} tapdiff={_tapd}", flush=True)
+            _no_eager = _os_eab.environ.get(
+                "FREETOKEN_SPEC_PUREGRAPH", "0") in {"1", "true", "yes"}
+            if _no_eager:
+                print(f"[EAB] step={getattr(self, '_spec_n', 0)} L={L} "
+                      f"graph_rows={rows[:4]} (PUREGRAPH: eager skipped)",
+                      flush=True)
+            if not _no_eager:
+                _esnap = self._spec_entry_snap
+                pool.restore_slot(slot, _esnap)
+                _vrq = _R(
+                    input_ids=_t.cat([req.input_ids[:L], z_dev]),
+                    table_idx=req.table_idx, cached_len=L, output_len=0,
+                    uid=req.uid + self.WARMUP_UID_BASE,
+                    sampling_params=req.sampling_params, cache_handle=req.cache_handle)
+                _vrq.device_len = L + kn
+                _vrq.linear_slot_idx = slot
+                _vb = _B(reqs=[_vrq], phase="prefill")
+                _vb.padded_reqs = _vb.reqs
+                _fi = self._prepare_batch(_vb)
+                _vb.is_verify = True
+                _vb.fla_metadata = _FLA(
+                    cu_seqlens=_t.tensor([0, kn], dtype=_t.int32, device=self.device),
+                    cache_indices=_t.tensor([slot], dtype=_t.int32, device=self.device),
+                    has_initial_state=None, fresh_state_indices=None)
+                with self.engine_stream_ctx:
+                    self._restore_linear_states(_vb)
+                    self._forward(_fi)
+                    self.engine.stream.synchronize()
+                    _elog = gctx.spec_logits
+                    _erows = [int(v) for v in _elog.argmax(-1).reshape(-1).tolist()]
+                self.decode_manager.remove_req(_vrq)
+                _etaps = gctx.spec_taps or {}
+                _tapd = {}
+                for _d, _tg in _etaps.items():
+                    _vg = vr.taps.get(_d)
+                    if _vg is None:
+                        continue
+                    _tapd[_d] = round((_vg.float() - _tg.float().to(_vg.device))
+                                      .abs().max().item(), 3)
+                print(f"[EAB] step={getattr(self, '_spec_n', 0)} L={L} "
+                      f"graph_rows={rows[:4]} eager_rows={_erows[:4]} "
+                      f"match={rows[:4] == _erows[:4]} tapdiff={_tapd}", flush=True)
             # z-ablation (replaces the faulting EABX restage): replay a HYBRID
             # z = [current z[0]] + [prev z[1:]] at the current entry state and
             # compare row-0 against both the production rows and the previous
@@ -844,7 +851,6 @@ class Scheduler(SchedulerIOMixin):
                       f"rows_now={_pr2} rows_then={_prows} "
                       f"same={_pr2 == list(_prows)}", flush=True)
                 pool.restore_slot(slot, self._spec_entry_snap)
-            pool.restore_slot(slot, _esnap)
 
         _sub["total"] = _sub.get("total", 0.0) + (_time.perf_counter() - _t1)
         _acc = getattr(self, "_spec_sub_acc", None)
