@@ -695,6 +695,41 @@ class Scheduler(SchedulerIOMixin):
         import os as _os_eab
 
         if (_os_eab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
+                and getattr(self, "_spec_n_r12", 0) < 1):
+            # replay #1 vs #2 with IDENTICAL inputs and restored slot: any tap
+            # depth that changes between them is pool-carry (the buffer whose
+            # value differs while inputs don't is the accumulate-without-init).
+            self._spec_n_r12 = 1
+            _snap12 = self._spec_entry_snap
+            _pr12 = self.cache_manager.page_table[req.table_idx]
+
+            def _tap_snapshot():
+                pool.restore_slot(slot, _snap12)
+                with torch.cuda.stream(torch.cuda.current_stream()):
+                    vr.replay_step(z_ids=z_dev.to(self.device), slot=slot, L=L,
+                                   page_row=_pr12,
+                                   stream=torch.cuda.current_stream())
+                    torch.cuda.current_stream().synchronize()
+                return {d: t.clone() for d, t in vr.taps.items()}
+
+            _t1_ = _tap_snapshot()
+            _t2_ = _tap_snapshot()
+            _t3_ = _tap_snapshot()
+            _d12 = {d: round((_t1_[d].float() - _t2_[d].float()).abs().max().item(), 3)
+                    for d in _t1_}
+            _d23 = {d: round((_t2_[d].float() - _t3_[d].float()).abs().max().item(), 3)
+                    for d in _t2_}
+            print(f"[R12] r1-vs-r2={_d12}", flush=True)
+            print(f"[R12] r2-vs-r3={_d23}", flush=True)
+            pool.restore_slot(slot, _snap12)
+            with torch.cuda.stream(torch.cuda.current_stream()):
+                vr.replay_step(z_ids=z_dev.to(self.device), slot=slot, L=L,
+                               page_row=_pr12,
+                               stream=torch.cuda.current_stream())
+                torch.cuda.current_stream().synchronize()
+        import os as _os_eab
+
+        if (_os_eab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
                 and getattr(self, "_spec_n_eab", 0) < 9
                 and getattr(self, "_spec_n", 0) % 3 == 0):
             # Eager-vs-graph rows probe: run the eager verify on the SAME
