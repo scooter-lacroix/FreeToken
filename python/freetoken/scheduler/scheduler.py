@@ -730,8 +730,7 @@ class Scheduler(SchedulerIOMixin):
         import os as _os_eab
 
         if (_os_eab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
-                and getattr(self, "_spec_n_eab", 0) < 9
-                and getattr(self, "_spec_n", 0) % 3 == 0):
+                and getattr(self, "_spec_n_eab", 0) < 5):
             # Eager-vs-graph rows probe: run the eager verify on the SAME
             # entry state and compare argmax rows. rows==erows while the
             # client stream garbles => GPU path faithful, emission/staging
@@ -775,6 +774,27 @@ class Scheduler(SchedulerIOMixin):
             print(f"[EAB] step={getattr(self, '_spec_n', 0)} L={L} "
                   f"graph_rows={rows[:4]} eager_rows={_erows[:4]} "
                   f"match={rows[:4] == _erows[:4]} tapdiff={_tapd}", flush=True)
+            # cross-cycle control: replay the PREVIOUS step's exact z at the
+            # current entry state; if its rows equal the previous step's rows,
+            # the graph's state evolved cleanly -- if not, the retry boundary
+            # changed what the graph sees for identical staging.
+            _prev = getattr(self, "_eab_prev", None)
+            self._eab_prev = (z_dev.clone(), rows[:4], self._spec_entry_snap)
+            if _prev is not None:
+                _pz, _prows, _psnap = _prev
+                pool.restore_slot(slot, self._spec_entry_snap)
+                with torch.cuda.stream(torch.cuda.current_stream()):
+                    vr.replay_step(z_ids=_pz.to(self.device), slot=slot, L=L,
+                                   page_row=self.cache_manager.page_table[
+                                       req.table_idx],
+                                   stream=torch.cuda.current_stream())
+                    torch.cuda.current_stream().synchronize()
+                _pr2 = [int(v) for v in vr.logits_out.argmax(-1)
+                        .reshape(-1).tolist()[:4]]
+                print(f"[EABX] prev-z re-staged at current state: "
+                      f"rows_now={_pr2} rows_then={_prows} "
+                      f"same={_pr2 == list(_prows)}", flush=True)
+                pool.restore_slot(slot, self._spec_entry_snap)
             pool.restore_slot(slot, _esnap)
 
         _sub["total"] = _sub.get("total", 0.0) + (_time.perf_counter() - _t1)
