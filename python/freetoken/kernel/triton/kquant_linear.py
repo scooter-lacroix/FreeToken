@@ -316,7 +316,7 @@ def _kq_gemm_q4k_m8(
     rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
     rmask = rows < N
     nblk = K // 256
-    acc = tl.zeros((BLOCK_N, TP), dtype=tl.float32)
+    acc = tl.zeros((TP, BLOCK_N), dtype=tl.float32)
 
     q = tl.arange(0, 128)
     qb = q // 32
@@ -357,20 +357,22 @@ def _kq_gemm_q4k_m8(
 
         nb = tl.load(w_ptr + b[:, None] + 16 + q[None, :],
                      mask=rmask[:, None], other=0).to(tl.int32)
-        w_lo = (sc_lo * (nb & 15).to(tl.float32) - mn_lo).to(tl.bfloat16)
-        w_hi = (sc_hi * (nb >> 4).to(tl.float32) - mn_hi).to(tl.bfloat16)
+        w_lo = sc_lo * (nb & 15).to(tl.float32) - mn_lo
+        w_hi = sc_hi * (nb >> 4).to(tl.float32) - mn_hi
 
-        xl = tl.load(x_ptr + t_ar[:, None].to(tl.int64) * K + kb * 256 + c_lo[None, :],
-                     mask=t_live[:, None], other=0.0).to(tl.bfloat16)
-        xh = tl.load(x_ptr + t_ar[:, None].to(tl.int64) * K + kb * 256 + c_lo[None, :] + 32,
-                     mask=t_live[:, None], other=0.0).to(tl.bfloat16)
-        # [TP,128] each -> one dot per nibble half: (BLOCK_N,128) @ (128,TP)
-        acc = tl.dot(w_lo, tl.trans(xl), acc)
-        acc = tl.dot(w_hi, tl.trans(xh), acc)
+        # No tl.dot: the MMA lowering does not survive CUDA-graph capture on
+        # this ROCm stack (garbage from the first replay). A static per-token
+        # elementwise accumulate reads the weight block ONCE and keeps fp32
+        # math like the proven T=1 GEMV.
+        for t in tl.static_range(T):
+            xl_t = tl.load(x_ptr + t * K + kb * 256 + c_lo).to(tl.float32)
+            xh_t = tl.load(x_ptr + t * K + kb * 256 + c_lo + 32).to(tl.float32)
+            contrib = tl.sum(w_lo * xl_t[None, :] + w_hi * xh_t[None, :], axis=1)
+            acc = acc + tl.where(t_ar[:, None] == t, contrib[None, :], 0.0)
 
     for t in tl.static_range(T):
-        # acc is (BLOCK_N, TP); pick token column t
-        col = tl.sum(tl.where(t_ar[None, :] == t, acc, 0.0), axis=1)
+        # acc is (TP, BLOCK_N); pick token row t
+        col = tl.sum(tl.where(t_ar[:, None] == t, acc, 0.0), axis=0)
         tl.store(y_ptr + t * N + rows, col.to(tl.bfloat16), mask=rmask)
 
 

@@ -122,6 +122,12 @@ def _kq_gemv(w, x, quant_type: int, out_features: int):
         if (_verify_batch and x.shape[0] > 1
                 and _os_fused.environ.get("FREETOKEN_FUSED_M8", "0")
                 in {"1", "true", "yes"}):
+            if not globals().get("_m8_dbg"):
+                globals()["_m8_dbg"] = True
+                print(f"[m8-dbg] x shape={tuple(x.shape)} stride={x.stride()} "
+                      f"dtype={x.dtype} contig={x.is_contiguous()} "
+                      f"ptr%16={x.data_ptr() % 16} w ptr%16={w.data_ptr() % 16} "
+                      f"N={out_features}", flush=True)
             # fused skinny-M GEMM: 2x faster (173ms/step vs 344) but its math
             # is WRONG at T>1 (garbage output e2e) -- opt-in while it is
             # debugged against the vec path on real weights (parity harness:
