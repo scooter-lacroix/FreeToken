@@ -1187,7 +1187,14 @@ class Scheduler(SchedulerIOMixin):
         _tail_ids = req.input_ids[L:].tolist()
         if _tail_ids and _tail_ids != z[: len(_tail_ids)]:
             z = [int(x) for x in _tail_ids] + z[len(_tail_ids):]
-            z = z[: max(k, len(z))]
+            # the verify block is FIXED-SHAPE: truncate to k. A normal decode
+            # step between spec steps (e.g. during a proactive re-capture gap)
+            # appends a token on top of the spec tail, making it k+1 — feeding
+            # that to dispatch sent kn=k+1 != vr.k and dropped the step to the
+            # EAGER tail (broken partial-accept restore + 144MB/step alloc
+            # that OOM'd). The k+1-th tail token simply waits for the next
+            # block.
+            z = z[:k]
         kn = len(z)
         _vr_k = getattr(getattr(self.engine.graph_runner, "verify_runner", None), "k", 0)
         if _vr_k and kn < _vr_k:
@@ -1225,6 +1232,10 @@ class Scheduler(SchedulerIOMixin):
         if (vr is not None and kn == vr.k
                 and _os_e.environ.get("FREETOKEN_SPEC_EAGER", "0") not in {"1", "true", "yes"}):
             return self._spec_replay_step(req, vr, st, gctx, z, z_dev, L, kn, slot)
+        if _os_e.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+            print(f"[DISPATCH->EAGER] vr_none={vr is None} kn={kn} "
+                  f"vr_k={getattr(vr, 'k', None)} L={L} "
+                  f"tail={int(req.input_ids.numel()) - L}", flush=True)
 
         _t0 = _time.perf_counter()
         vbatch = Batch(reqs=[vreq], phase="prefill")
