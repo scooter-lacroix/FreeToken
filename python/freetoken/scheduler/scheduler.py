@@ -530,7 +530,14 @@ class Scheduler(SchedulerIOMixin):
                          cached_len=L, output_len=0, uid=req.uid + self.WARMUP_UID_BASE,
                          sampling_params=req.sampling_params, cache_handle=req.cache_handle)
         _t_ap0 = _time.perf_counter()
-        self.cache_manager.allocate_paged([_alloc_req])
+        try:
+            self.cache_manager.allocate_paged([_alloc_req])
+        except AssertionError:
+            # deep-context page pressure: the verify block's kn pages can't
+            # be freed right now (live window owns the pool) -- decline this
+            # step to normal decode instead of killing spec for the boot
+            print("[spec] page pressure: declining step to decode", flush=True)
+            return False
         self._t_pre_alloc = _time.perf_counter()
         self._spec_t_allocpg = getattr(self, "_spec_t_allocpg", 0.0) + (
             _time.perf_counter() - _t_ap0)
