@@ -497,6 +497,22 @@ class Scheduler(SchedulerIOMixin):
             return False
         if getattr(self, "_spec_failed", False):
             return False
+        # ADAPTIVE SPEC: the draft's value is prompt-class-dependent (essay
+        # prose +54%, repetitive summary -36% at 16k). Track the trailing
+        # accepted-per-step ratio; when it drops below the break-even
+        # threshold (a step costs ~1 verify forward, so <1 accepted token
+        # per step loses to normal decode), hand this request to decode.
+        import os as _os_ad
+
+        _win = int(_os_ad.environ.get("FREETOKEN_SPEC_ADAPT_WIN", "12"))
+        _thr = float(_os_ad.environ.get("FREETOKEN_SPEC_ADAPT THR", "1.0")
+                     if False else _os_ad.environ.get(
+                         "FREETOKEN_SPEC_ADAPT_THR", "1.0"))
+        _acc = getattr(self, "_spec_acc_hist", None)
+        if _acc is not None and len(_acc) >= _win and req.uid in _acc:
+            h = _acc[req.uid]
+            if len(h) >= _win and (sum(h[-_win:]) / _win) < _thr:
+                return False  # decode until this request finishes
         try:
             return self._spec_step_inner(req, k)
         except Exception as e:                              # noqa: BLE001
@@ -1019,6 +1035,12 @@ class Scheduler(SchedulerIOMixin):
         self._spec_t_send = getattr(self, "_spec_t_send", 0.0) + (
             _time.perf_counter() - _t_sr0)
         self._spec_n = getattr(self, "_spec_n", 0) + 1
+        _acc = getattr(self, "_spec_acc_hist", None)
+        if _acc is None:
+            _acc = {}
+            self._spec_acc_hist = _acc
+        _acc.setdefault(req.uid, []).append(a + 1)
+        _acc[req.uid] = _acc[req.uid][-64:]
         if self._spec_n % 25 == 0 or self._spec_n == 1:
             n = self._spec_n
             _acc2 = getattr(self, "_spec_sub_acc", {}) or {}
