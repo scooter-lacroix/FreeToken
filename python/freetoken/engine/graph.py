@@ -446,6 +446,16 @@ class GraphRunner:
         self._reset_moe_offload_cache()
         free_memory = get_free_memory(self.device)
         logger.info_rank0(f"Free GPU memory after capturing CUDA graphs: {mem_GB(free_memory)}")
+        # The S4 verify graph is independent of the decode bs graphs: capture
+        # it here too when armed. Without this, decode-graph-enabled boots never
+        # built a verify runner and every spec step fell to the EAGER path
+        # (whose partial-accept state restore is broken -> first-request
+        # garbage; observed at K=4 + decode-graphs).
+        import os as _os_full
+
+        _kv = int(_os_full.environ.get("FREETOKEN_SPEC_K", "0") or 0)
+        if _kv > 0:
+            self._capture_verify(_kv, model)
 
     def _capture_verify(self, k: int, model, stream=None) -> None:
         import json as _json
