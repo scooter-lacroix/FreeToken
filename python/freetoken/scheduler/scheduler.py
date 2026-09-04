@@ -648,6 +648,15 @@ class Scheduler(SchedulerIOMixin):
             with torch.cuda.stream(_sched_stream):
                 self._spec_t_stage = getattr(self, "_spec_t_stage", 0.0) + (_time.perf_counter() - _t1)
                 _tr0 = _time.perf_counter()
+                # REPLAY-TWICE experiment: probe-active boots (extra graph
+                # replay between production steps) were coherent while
+                # no-probe boots garble -- test whether replay #1 after a
+                # gap is wrong and #2 right. First result discarded.
+                if _os_ab.environ.get("FREETOKEN_SPEC_2X", "0") in {"1", "true", "yes"}:
+                    vr.replay_step(
+                        z_ids=z_dev.to(self.device), slot=slot, L=L,
+                        page_row=self.cache_manager.page_table[req.table_idx],
+                        stream=_sched_stream)
                 _z_gpu = z_dev.to(self.device)
                 _sub["h2d"] = _sub.get("h2d", 0.0) + _time.perf_counter() - _tr0
                 _t_l = _time.perf_counter()
