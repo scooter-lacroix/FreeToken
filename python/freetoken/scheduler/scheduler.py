@@ -529,14 +529,23 @@ class Scheduler(SchedulerIOMixin):
         _alloc_req = Req(input_ids=_ids, table_idx=req.table_idx,
                          cached_len=L, output_len=0, uid=req.uid + self.WARMUP_UID_BASE,
                          sampling_params=req.sampling_params, cache_handle=req.cache_handle)
+        _t_ap0 = _time.perf_counter()
         self.cache_manager.allocate_paged([_alloc_req])
+        self._t_pre_alloc = _time.perf_counter()
+        self._spec_t_allocpg = getattr(self, "_spec_t_allocpg", 0.0) + (
+            _time.perf_counter() - _t_ap0)
 
         # All spec-path GPU work runs on the scheduler's OWN stream
         # (current here): the verify graph is captured AND replayed on it, and
         # only same-stream ops between replays keep it valid -- cross-stream
         # work (engine-stream or otherwise) invalidates the next replay with
         # all-NaN logits on this ROCm stack.
+        import time as _tp
+
+        _t_alloc0 = _tp.perf_counter()
         self._spec_entry_snap = pool.snapshot_slot(slot)
+        self._spec_t_snap = getattr(self, "_spec_t_snap", 0.0) + (
+            _tp.perf_counter() - _t_alloc0)
 
         _t1 = _time.perf_counter()
         _gr = self.engine.graph_runner
@@ -735,6 +744,7 @@ class Scheduler(SchedulerIOMixin):
         # rows [0, pre) of this block are already in input_ids (prior bonus +
         # retry-prefix appends); only emit genuinely new tokens so input_ids
         # grows exactly with the output budget (append_host caps at max_device_len)
+        _t_acc0 = _time.perf_counter()
         pre = int(st["pending"].get("pre", 1))
         if full:
             req.cached_len = req.device_len = L + kn
@@ -795,8 +805,13 @@ class Scheduler(SchedulerIOMixin):
             self._free_req_resources(req)
             self.finished_reqs.add(req)
             st["pending"] = None
+        self._spec_t_emit = getattr(self, "_spec_t_emit", 0.0) + (
+            _time.perf_counter() - _t_acc0)
+        _t_sr0 = _time.perf_counter()
         self.send_result(reply)
         self._flush_abort_acks()
+        self._spec_t_send = getattr(self, "_spec_t_send", 0.0) + (
+            _time.perf_counter() - _t_sr0)
         self._spec_n = getattr(self, "_spec_n", 0) + 1
         if self._spec_n % 25 == 0:
             n = self._spec_n
@@ -804,6 +819,10 @@ class Scheduler(SchedulerIOMixin):
             _subs = " ".join(f"{k}={_acc2.get(k, 0.0)/n*1000:.0f}" for k in
                              ("total", "h2d", "launch", "sync", "nanread",
                               "argmax", "topk", "tolist1", "tolist2"))
+            _subs += (f" | allocpg={getattr(self, '_spec_t_allocpg', 0.0)/n*1000:.0f}"
+                      f" snap={getattr(self, '_spec_t_snap', 0.0)/n*1000:.0f}"
+                      f" emit={getattr(self, '_spec_t_emit', 0.0)/n*1000:.0f}"
+                      f" send={getattr(self, '_spec_t_send', 0.0)/n*1000:.0f}")
             print(f"[spec-timing] n={n} fwd={self._spec_t_fwd/n*1000:.0f}ms "
                   f"replay={getattr(self, '_spec_t_replay', 0.0)/n*1000:.0f}ms "
                   f"prop={self._spec_t_prop/n*1000:.0f}ms vr_n={getattr(self, '_spec_n_vr', 0)} "

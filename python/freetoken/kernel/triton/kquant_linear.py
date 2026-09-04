@@ -299,6 +299,99 @@ def kq_gemv_q6k(w: torch.Tensor, x: torch.Tensor, quant_type: int) -> torch.Tens
     return y
 
 
+@triton.jit
+def _kq_gemm_q4k_m8(
+    w_ptr, x_ptr, y_ptr, K,
+    N, rb,
+    BLOCK_N: tl.constexpr,
+    T: tl.constexpr,
+    TP: tl.constexpr,
+):
+    """Fused skinny-M Q4_K GEMM: one program per row-block reads its weight
+    block ONCE and produces all T<=8 token rows via tensor-core dots --
+    the verify-batch shape (M=k). The per-token GEMV grid re-read weights T
+    times; the ggml a8 GEMM is ~40x slower at this M. Weights are dequantized
+    to bf16 and accumulated in fp32 (llama.cpp-class rounding)."""
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    rmask = rows < N
+    nblk = K // 256
+    acc = tl.zeros((BLOCK_N, TP), dtype=tl.float32)
+
+    q = tl.arange(0, 128)
+    qb = q // 32
+    r = q % 32
+    c_lo = 64 * qb + r
+    sb_lo = 2 * qb
+    sb_hi = 2 * qb + 1
+    u_lo = sb_lo % 4
+    u_hi = sb_hi % 4
+    lo_sel_lo = sb_lo < 4
+    lo_sel_hi = sb_hi < 4
+    t_ar = tl.arange(0, TP)
+    t_live = t_ar < T
+
+    for kb in range(nblk):
+        b = rows.to(tl.int64) * rb + kb * 144
+        d_lo = tl.load(w_ptr + b).to(tl.int32)
+        d_hi = tl.load(w_ptr + b + 1).to(tl.int32)
+        dall = (d_lo | (d_hi << 8)).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+        m_lo = tl.load(w_ptr + b + 2).to(tl.int32)
+        m_hi = tl.load(w_ptr + b + 3).to(tl.int32)
+        dmin = (m_lo | (m_hi << 8)).to(tl.uint16).to(tl.float16, bitcast=True).to(tl.float32)
+
+        A_s = tl.load(w_ptr + b[:, None] + 4 + u_lo[None, :], mask=rmask[:, None], other=0).to(tl.int32)
+        B_s = tl.load(w_ptr + b[:, None] + 12 + u_lo[None, :], mask=rmask[:, None], other=0).to(tl.int32)
+        A_m = tl.load(w_ptr + b[:, None] + 8 + u_lo[None, :], mask=rmask[:, None], other=0).to(tl.int32)
+        sc_lo = tl.where(lo_sel_lo[None, :], (A_s & 63).to(tl.float32),
+                         ((B_s & 15) | ((A_s >> 6) << 4)).to(tl.float32)) * dall[:, None]
+        mn_lo = tl.where(lo_sel_lo[None, :], (A_m & 63).to(tl.float32),
+                         ((B_s >> 4) | ((A_m >> 6) << 4)).to(tl.float32)) * dmin[:, None]
+        A_s = tl.load(w_ptr + b[:, None] + 4 + u_hi[None, :], mask=rmask[:, None], other=0).to(tl.int32)
+        B_s = tl.load(w_ptr + b[:, None] + 12 + u_hi[None, :], mask=rmask[:, None], other=0).to(tl.int32)
+        A_m = tl.load(w_ptr + b[:, None] + 8 + u_hi[None, :], mask=rmask[:, None], other=0).to(tl.int32)
+        sc_hi = tl.where(lo_sel_hi[None, :], (A_s & 63).to(tl.float32),
+                         ((B_s & 15) | ((A_s >> 6) << 4)).to(tl.float32)) * dall[:, None]
+        mn_hi = tl.where(lo_sel_hi[None, :], (A_m & 63).to(tl.float32),
+                         ((B_s >> 4) | ((A_m >> 6) << 4)).to(tl.float32)) * dmin[:, None]
+
+        nb = tl.load(w_ptr + b[:, None] + 16 + q[None, :],
+                     mask=rmask[:, None], other=0).to(tl.int32)
+        w_lo = (sc_lo * (nb & 15).to(tl.float32) - mn_lo).to(tl.bfloat16)
+        w_hi = (sc_hi * (nb >> 4).to(tl.float32) - mn_hi).to(tl.bfloat16)
+
+        xl = tl.load(x_ptr + t_ar[:, None].to(tl.int64) * K + kb * 256 + c_lo[None, :],
+                     mask=t_live[:, None], other=0.0).to(tl.bfloat16)
+        xh = tl.load(x_ptr + t_ar[:, None].to(tl.int64) * K + kb * 256 + c_lo[None, :] + 32,
+                     mask=t_live[:, None], other=0.0).to(tl.bfloat16)
+        # [TP,128] each -> one dot per nibble half: (BLOCK_N,128) @ (128,TP)
+        acc = tl.dot(w_lo, tl.trans(xl), acc)
+        acc = tl.dot(w_hi, tl.trans(xh), acc)
+
+    for t in tl.static_range(T):
+        # acc is (BLOCK_N, TP); pick token column t
+        col = tl.sum(tl.where(t_ar[None, :] == t, acc, 0.0), axis=1)
+        tl.store(y_ptr + t * N + rows, col.to(tl.bfloat16), mask=rmask)
+
+
+def kq_gemm_q4k_m8(w: torch.Tensor, x: torch.Tensor, quant_type: int) -> torch.Tensor:
+    """Verify-batch dense projection: Q4_K GEMM at 1 < T <= 8 (weights read
+    once per block; grid (row-blocks,) -- no per-token weight re-read)."""
+    assert quant_type == 12, "fused M8 path covers Q4_K"
+    N = w.shape[0]
+    K = (w.shape[1] // 144) * 256
+    T = x.shape[0]
+    assert 1 < T <= 8, T
+    y = torch.empty(T, N, dtype=torch.bfloat16, device=x.device)
+    if N >= 16384:
+        BN, W = 64, 8
+    else:
+        BN, W = 32, 4
+    _kq_gemm_q4k_m8[(triton.cdiv(N, BN),)](
+        w, x, y, K, N, w.shape[1], BLOCK_N=BN, T=T, TP=16, num_warps=W)
+    return y
+
+
 def kq_gemv(w: torch.Tensor, x: torch.Tensor, quant_type: int) -> torch.Tensor:
     """Dense GEMV over Q4_K-packed rows (``w`` [N, 144*K/256] uint8, ``x`` [T,K])."""
     assert quant_type == 12, "Triton path currently covers Q4_K"

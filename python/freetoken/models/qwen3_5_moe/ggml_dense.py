@@ -113,11 +113,23 @@ def _kq_gemv(w, x, quant_type: int, out_features: int):
     if (
         quant_type == 12
         and x.shape[0] <= 8
-        and not (_verify_batch and x.shape[0] > 1)
         and out_features >= 2048
         and os.environ.get("FREETOKEN_TRITON_KQ", "1").strip().lower()
         not in {"0", "false", "no", "off"}
     ):
+        import os as _os_fused
+
+        if (_verify_batch and x.shape[0] > 1
+                and _os_fused.environ.get("FREETOKEN_FUSED_M8", "0")
+                in {"1", "true", "yes"}):
+            # fused skinny-M GEMM: 2x faster (173ms/step vs 344) but its math
+            # is WRONG at T>1 (garbage output e2e) -- opt-in while it is
+            # debugged against the vec path on real weights (parity harness:
+            # run both at boot-capture and diff). Production rides the ggml
+            # VEC kernel: validated M<=8, coherent, 344ms/step.
+            from freetoken.kernel.triton.kquant_linear import kq_gemm_q4k_m8
+
+            return kq_gemm_q4k_m8(w, x, quant_type)
         from freetoken.kernel.triton.kquant_linear import kq_gemv
 
         return kq_gemv(w, x, quant_type)
