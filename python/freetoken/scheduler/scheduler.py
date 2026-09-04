@@ -1168,6 +1168,20 @@ class Scheduler(SchedulerIOMixin):
         if (vr is not None and kn == vr.k
                 and _os_e.environ.get("FREETOKEN_SPEC_EAGER", "0") not in {"1", "true", "yes"}):
             return self._spec_replay_step(req, vr, st, gctx, z, z_dev, L, kn, slot)
+        # HARD GUARD (eager tail deleted): its partial-accept restore was
+        # broken (zeros st['log']) and its 144MB/step st['log'] allocation
+        # OOM'd at zero free VRAM on deep boots. Shape mismatches DECLINE to
+        # normal decode (coherent, allocation-free); a missing verify graph
+        # disables spec outright.
+        if _os_e.environ.get("FREETOKEN_SPEC_EAGER", "0") not in {"1", "true", "yes"}:
+            if vr is None:
+                print("[spec] verify graph unavailable; spec disabled", flush=True)
+                self._spec_failed = True
+                return False
+            if _os_e.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+                print(f"[spec-decline] kn={kn} vr_k={vr.k} L={L} "
+                      f"tail={int(req.input_ids.numel()) - L}", flush=True)
+            return False
 
         _t0 = _time.perf_counter()
         vbatch = Batch(reqs=[vreq], phase="prefill")
