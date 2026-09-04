@@ -188,6 +188,11 @@ class Qwen3_5Model(BaseOP):
                     buf[: hidden.shape[0]].copy_(hidden)
                     store[depth] = buf  # device ref; host consumers run post-sync
                     return
+            if torch.cuda.is_current_stream_capturing():
+                # decode-graph capture: the pinned D2H below is capture-illegal
+                # on this HIP stack, and decode-batch taps are not consumed by
+                # the spec driver anyway -- skip instead of killing the boot
+                return
             pins = getattr(self, "_dflash_tap_pins", None)
             if pins is None:
                 pins = {}
