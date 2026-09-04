@@ -916,7 +916,13 @@ class Scheduler(SchedulerIOMixin):
         # retry-prefix appends); only emit genuinely new tokens so input_ids
         # grows exactly with the output budget (append_host caps at max_device_len)
         _t_acc0 = _time.perf_counter()
-        pre = int(st["pending"].get("pre", 1))
+        # STREAM-GROUND-TRUTH watermark: the number of z-prefix tokens
+        # ACTUALLY in input_ids beyond KV depth L. The old `pre` z-algebra
+        # desynced here (it claimed z[:pre] was appended while the stream
+        # held the previous bonus instead) -- the root cause of the spec
+        # garbage class (wrong text from right logits).
+        pre = int(req.input_ids.numel()) - L
+        pre = max(0, min(pre, kn))
         if full:
             req.cached_len = req.device_len = L + kn
             emit = z[pre:] + [bonus] if pre < kn else [bonus]
@@ -961,12 +967,10 @@ class Scheduler(SchedulerIOMixin):
             self._spec_t_prop = getattr(self, "_spec_t_prop", 0.0) + _time.perf_counter() - _t3
             if full:
                 nxt = [bonus] + picks[1:]
-                npre = 1
             else:
                 keep = z[: a + 1]                       # accepted prefix re-extends
                 nxt = keep + [bonus] + picks[1 : kn - a - 1]
-                npre = a + 2                            # z[0:a+1] + bonus already appended
-            st["pending"] = {"anchor": bonus, "position": L + a, "z": nxt[:kn], "pre": npre}
+            st["pending"] = {"anchor": bonus, "position": L + a, "z": nxt[:kn]}
         else:
             if not full:
                 # finished mid-partial-block: crop to emitted depth is implicit
@@ -1082,6 +1086,12 @@ class Scheduler(SchedulerIOMixin):
             z = [int(x) for x in pend["z"]]
         else:
             z = [int(pend["anchor"])] + [int(x) for x in pend["picks"][1:k]]
+        # stream-ground-truth: replace the assumed z-prefix with the tokens
+        # ACTUALLY appended beyond KV depth L (input_ids is ground truth)
+        _tail_ids = req.input_ids[L:].tolist()
+        if _tail_ids and _tail_ids != z[: len(_tail_ids)]:
+            z = [int(x) for x in _tail_ids] + z[len(_tail_ids):]
+            z = z[: max(k, len(z))]
         kn = len(z)
         _vr_k = getattr(getattr(self.engine.graph_runner, "verify_runner", None), "k", 0)
         if _vr_k and kn < _vr_k:
@@ -1201,7 +1211,11 @@ class Scheduler(SchedulerIOMixin):
             self._spec_toolcall_anchor(req, tok)
             reply.append(self._spec_msg(req, tok, None))
         if not finished:
-            req.append_host(_t.tensor([bonus], dtype=_t.int32))
+            if req.input_ids.numel() >= req.max_device_len:
+                finished = True
+                reply.append(self._spec_msg(req, bonus, ("length", None)))
+            else:
+                req.append_host(_t.tensor([bonus], dtype=_t.int32))
             # normal-decode compatibility: a fallback non-spec step reads its input
             # token from token_pool[cached_len]; stage the pending bonus there.
             self.token_pool[req.table_idx, req.cached_len] = _t.tensor(
