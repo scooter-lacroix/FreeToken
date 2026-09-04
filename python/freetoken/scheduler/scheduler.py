@@ -547,6 +547,36 @@ class Scheduler(SchedulerIOMixin):
         self._spec_t_snap = getattr(self, "_spec_t_snap", 0.0) + (
             _tp.perf_counter() - _t_alloc0)
 
+        # ENTRY-state fingerprints (pre-replay): across a step cycle the
+        # PREFIX pages [0:L), the GDN slot bytes, and tokpool[0:L] must be
+        # IDENTICAL at entry (same logical context); any view whose ENTRY
+        # bytes change across a cycle names the between-steps writer.
+        import os as _os_efp
+
+        if _os_efp.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}:
+            import hashlib
+
+            def _h(_t):
+                return hashlib.md5(
+                    _t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
+                ).hexdigest()[:10]
+
+            _efp = {
+                "prefix_pages": _h(self.cache_manager.page_table[req.table_idx][:L]),
+                "slot_entry": _h(pool.recurrent_states[:, slot]) + "/" + _h(
+                    pool.conv_states[:, slot]),
+                "tokpool_prefix": _h(self.token_pool[req.table_idx][:L]),
+            }
+            _pefp = getattr(self, "_efp_prev", None)
+            if _pefp is not None and _pefp[1] == L:
+                _chg = [k for k in _efp if _efp[k] != _pefp[0][k]]
+                print(f"[EFP] L={L} entry-view changes vs prev cycle: {_chg} "
+                      f"now={_efp}", flush=True)
+            elif _pefp is not None:
+                print(f"[EFP] L={L} (prev L={_pefp[1]} — prefix grew, expected)",
+                      flush=True)
+            self._efp_prev = (_efp, L)
+
         _t1 = _time.perf_counter()
         _gr = self.engine.graph_runner
         import os as _os_ph
