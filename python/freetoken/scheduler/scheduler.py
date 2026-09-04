@@ -1057,7 +1057,14 @@ class Scheduler(SchedulerIOMixin):
             return None
         L = req.cached_len
         row_logits = logits[logits.shape[0] - 1]
-        anchor = int(row_logits.reshape(-1).argmax().item())
+        # STREAM-GROUND-TRUTH anchor: if the prefill already appended its
+        # sampled first token, THAT token is position L's content -- the
+        # verify block must extend over it (deriving the anchor from logits
+        # again duplicated it: 'TheThe' boundary artifact).
+        if req.input_ids.numel() > L:
+            anchor = int(req.input_ids[-1].item())
+        else:
+            anchor = int(row_logits.reshape(-1).argmax().item())
         taps_row = {d: t[t.shape[0] - 1] for d, t in taps.items()}
         return {"anchor": anchor, "position": L - 1,
                 "picks": self._spec_propose(anchor, L - 1, taps_row, row_logits)}

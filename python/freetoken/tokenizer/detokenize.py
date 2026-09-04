@@ -113,6 +113,12 @@ class DetokenizeManager:
 
         incremental_strs: List[str] = []
         for msg, read_str, surr_str in zip(msgs, read_texts, surr_texts, strict=True):
+            if msg.uid not in self.decode_map:
+                # a finished uid deleted earlier in this batch (spec emission
+                # sends multiple msgs per step; a finished msg may precede a
+                # stale one) -- skip rather than kill the worker
+                incremental_strs.append("")
+                continue
             s = self.decode_map[msg.uid]
             new_text = read_str[len(surr_str) :]
             # Streaming chunk: update the decode status
