@@ -1114,8 +1114,24 @@ class Scheduler(SchedulerIOMixin):
         from freetoken.attention.linear import FLAMetadata
         from freetoken.core import Batch, Req, get_global_ctx
 
+        import os as _os_nd
+
         if getattr(self, "_spec_svc", None) is None:
-            self._spec_arm(k)
+            if _os_nd.environ.get("FREETOKEN_SPEC_NODRAFT", "0") in {"1", "true", "yes"}:
+                # nodraft: skip arming the DFlash service entirely (its
+                # encoder+codebooks cost GBs of VRAM that deep-context ladders
+                # need); a no-op stub keeps the propose call sites inert.
+                class _NoSvc:
+                    n_propose = 0
+                    ms = 0.0
+                    t_pre = t_fwd = t_chn = 0.0
+
+                    def propose(self, *a, **k):
+                        return [a[0]] * 64 if a else []
+
+                self._spec_svc = _NoSvc()
+            else:
+                self._spec_arm(k)
         st = self._spec_state
         if st["pending"] is None:
             st["pending"] = self._spec_pending_from_last_row(req)
