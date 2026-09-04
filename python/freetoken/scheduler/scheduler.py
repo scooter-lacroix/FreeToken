@@ -839,18 +839,6 @@ class Scheduler(SchedulerIOMixin):
                       f"prev_row0={_pzrows[0]} -> {_verdict} "
                       f"hybrid_rows={_hrows}", flush=True)
                 pool.restore_slot(slot, self._spec_entry_snap)
-                with torch.cuda.stream(torch.cuda.current_stream()):
-                    vr.replay_step(z_ids=_pz.to(self.device), slot=slot, L=L,
-                                   page_row=self.cache_manager.page_table[
-                                       req.table_idx],
-                                   stream=torch.cuda.current_stream())
-                    torch.cuda.current_stream().synchronize()
-                _pr2 = [int(v) for v in vr.logits_out.argmax(-1)
-                        .reshape(-1).tolist()[:4]]
-                print(f"[EABX] prev-z re-staged at current state: "
-                      f"rows_now={_pr2} rows_then={_prows} "
-                      f"same={_pr2 == list(_prows)}", flush=True)
-                pool.restore_slot(slot, self._spec_entry_snap)
 
         _sub["total"] = _sub.get("total", 0.0) + (_time.perf_counter() - _t1)
         _acc = getattr(self, "_spec_sub_acc", None)
