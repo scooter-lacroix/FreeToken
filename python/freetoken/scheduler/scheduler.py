@@ -804,32 +804,33 @@ class Scheduler(SchedulerIOMixin):
             print(f"[EAB] step={getattr(self, '_spec_n', 0)} L={L} "
                   f"graph_rows={rows[:4]} eager_rows={_erows[:4]} "
                   f"match={rows[:4] == _erows[:4]} tapdiff={_tapd}", flush=True)
-            # cross-cycle control: replay the PREVIOUS step's exact z at the
-            # current entry state; if its rows equal the previous step's rows,
-            # the graph's state evolved cleanly -- if not, the retry boundary
-            # changed what the graph sees for identical staging.
-            import hashlib
-
-            def _h(_t):
-                return hashlib.md5(
-                    _t.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
-                ).hexdigest()[:10]
-
-            _pt_row = self.cache_manager.page_table[req.table_idx]
-            _fp = {
-                "pages": _h(_pt_row[: L + 8]),
-                "slot_rec": _h(pool.recurrent_states[:, slot]),
-                "slot_conv": _h(pool.conv_states[:, slot]),
-                "tokpool": _h(self.token_pool[req.table_idx, : L + 8]),
-            }
-            _prev = getattr(self, "_eab_prev", None)
-            if _prev is not None and len(_prev) == 5:
-                _changed = [k for k in _fp if _fp[k] != _prev[4][k]]
-                print(f"[EABF] changed across cycle: {_changed} now={_fp} prev={_prev[4]}",
-                      flush=True)
-            self._eab_prev = (z_dev.clone(), rows[:4], self._spec_entry_snap, None, _fp)
-            if _prev is not None and len(_prev) == 5:
-                _pz, _prows, _psnap = _prev[0], _prev[1], _prev[2]
+            # z-ablation (replaces the faulting EABX restage): replay a HYBRID
+            # z = [current z[0]] + [prev z[1:]] at the current entry state and
+            # compare row-0 against both the production rows and the previous
+            # step's rows. row-0 following prev z[1:] => row-0 couples to
+            # z[1:] inside the captured block math (chunk-lane leakage);
+            # row-0 following production => z[1:] is innocent.
+            _pzab = getattr(self, "_zab_prev", None)
+            self._zab_prev = (z_dev.clone(), rows[:4])
+            if _pzab is not None:
+                _pzz, _pzrows = _pzab
+                _hy = _t.cat([z_dev[:1], _pzz[1:]])
+                pool.restore_slot(slot, self._spec_entry_snap)
+                with torch.cuda.stream(torch.cuda.current_stream()):
+                    vr.replay_step(z_ids=_hy.to(self.device), slot=slot, L=L,
+                                   page_row=self.cache_manager.page_table[
+                                       req.table_idx],
+                                   stream=torch.cuda.current_stream())
+                    torch.cuda.current_stream().synchronize()
+                _hrows = [int(v) for v in vr.logits_out.argmax(-1)
+                          .reshape(-1).tolist()[:4]]
+                _r0 = _hrows[0]
+                _verdict = ("COUPLES-TO-PREV" if _r0 == _pzrows[0]
+                            else "FOLLOWS-PRODUCTION" if _r0 == rows[0]
+                            else "NEITHER")
+                print(f"[ZAB] hybrid row0={_r0} prod_row0={rows[0]} "
+                      f"prev_row0={_pzrows[0]} -> {_verdict} "
+                      f"hybrid_rows={_hrows}", flush=True)
                 pool.restore_slot(slot, self._spec_entry_snap)
                 with torch.cuda.stream(torch.cuda.current_stream()):
                     vr.replay_step(z_ids=_pz.to(self.device), slot=slot, L=L,
