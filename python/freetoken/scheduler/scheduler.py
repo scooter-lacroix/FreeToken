@@ -497,34 +497,6 @@ class Scheduler(SchedulerIOMixin):
             return False
         if getattr(self, "_spec_failed", False):
             return False
-        # ADAPTIVE SPEC: the draft's value is prompt-class-dependent (essay
-        # prose +54%, repetitive summary -36% at 16k). Track the trailing
-        # accepted-per-step ratio; when it drops below the break-even
-        # threshold (a step costs ~1 verify forward, so <1 accepted token
-        # per step loses to normal decode), hand this request to decode.
-        import os as _os_ad
-
-        _win = int(_os_ad.environ.get("FREETOKEN_SPEC_ADAPT_WIN", "12"))
-        _thr = float(_os_ad.environ.get("FREETOKEN_SPEC_ADAPT THR", "1.0")
-                     if False else _os_ad.environ.get(
-                         "FREETOKEN_SPEC_ADAPT_THR", "1.0"))
-        _acc = getattr(self, "_spec_acc_hist", None)
-        if _acc is not None and len(_acc) >= _win and req.uid in _acc:
-            h = _acc[req.uid]
-            if len(h) >= _win and (sum(h[-_win:]) / _win) < _thr:
-                # HANDOFF ALIGNMENT: after a partial accept the verified
-                # stream is AHEAD of committed KV (cached_len); resuming
-                # normal decode at cached_len would re-process tokens already
-                # in input_ids (duplicated context = the first-request garbage
-                # class). Defer the handoff until a full accept aligns the
-                # stream with the KV watermark.
-                if req.input_ids.numel() == req.cached_len:
-                    return False  # aligned: decode until this request finishes
-                # not aligned: mark intent; the next full accept completes it
-                self._spec_want_decode = True
-        if getattr(self, "_spec_want_decode", False) and req.input_ids.numel() == req.cached_len:
-            self._spec_want_decode = False
-            return False
         try:
             return self._spec_step_inner(req, k)
         except Exception as e:                              # noqa: BLE001
@@ -558,14 +530,7 @@ class Scheduler(SchedulerIOMixin):
                          cached_len=L, output_len=0, uid=req.uid + self.WARMUP_UID_BASE,
                          sampling_params=req.sampling_params, cache_handle=req.cache_handle)
         _t_ap0 = _time.perf_counter()
-        try:
-            self.cache_manager.allocate_paged([_alloc_req])
-        except AssertionError:
-            # deep-context page pressure: the verify block's kn pages can't
-            # be freed right now (live window owns the pool) -- decline this
-            # step to normal decode instead of killing spec for the boot
-            print("[spec] page pressure: declining step to decode", flush=True)
-            return False
+        self.cache_manager.allocate_paged([_alloc_req])
         self._t_pre_alloc = _time.perf_counter()
         self._spec_t_allocpg = getattr(self, "_spec_t_allocpg", 0.0) + (
             _time.perf_counter() - _t_ap0)
@@ -1047,13 +1012,7 @@ class Scheduler(SchedulerIOMixin):
         self._spec_t_send = getattr(self, "_spec_t_send", 0.0) + (
             _time.perf_counter() - _t_sr0)
         self._spec_n = getattr(self, "_spec_n", 0) + 1
-        _acc = getattr(self, "_spec_acc_hist", None)
-        if _acc is None:
-            _acc = {}
-            self._spec_acc_hist = _acc
-        _acc.setdefault(req.uid, []).append(a + 1)
-        _acc[req.uid] = _acc[req.uid][-64:]
-        if self._spec_n % 25 == 0 or self._spec_n == 1:
+        if self._spec_n % 25 == 0:
             n = self._spec_n
             _acc2 = getattr(self, "_spec_sub_acc", {}) or {}
             _subs = " ".join(f"{k}={_acc2.get(k, 0.0)/n*1000:.0f}" for k in
@@ -1130,16 +1089,12 @@ class Scheduler(SchedulerIOMixin):
             anchor = int(req.input_ids[-1].item())
         else:
             anchor = int(row_logits.reshape(-1).argmax().item())
-            # BISECT-VERDICT (f0cfce0 good / 6f5834f bad on the same
-            # harness): this append is REQUIRED for gate-green — the
-            # prefill's reply SENDS this token to the client, and without it
-            # in input_ids the stream is one token SHORT and every verify
-            # runs on the wrong context (6f5834f removed it; the draft-echo
-            # z=[760,760,...] seen after was a SYMPTOM, not a double-append).
+            # The prefill's reply SENDS this token to the client (its batch
+            # reply path); make the stream match by appending it here so the
+            # first spec block's pre-watermark counts it (z[0] skipped, not
+            # re-emitted -- the prefill->spec 'TheThe' boundary duplicate).
             if req.input_ids.numel() < req.max_device_len:
-                import torch as _t_anchor
-
-                req.append_host(_t_anchor.tensor([anchor], dtype=_t_anchor.int32))
+                req.append_host(_t.tensor([anchor], dtype=_t.int32))
         taps_row = {d: t[t.shape[0] - 1] for d, t in taps.items()}
         return {"anchor": anchor, "position": L - 1,
                 "picks": self._spec_propose(anchor, L - 1, taps_row, row_logits)}
@@ -1150,24 +1105,8 @@ class Scheduler(SchedulerIOMixin):
         from freetoken.attention.linear import FLAMetadata
         from freetoken.core import Batch, Req, get_global_ctx
 
-        import os as _os_nd
-
         if getattr(self, "_spec_svc", None) is None:
-            if _os_nd.environ.get("FREETOKEN_SPEC_NODRAFT", "0") in {"1", "true", "yes"}:
-                # nodraft: skip arming the DFlash service entirely (its
-                # encoder+codebooks cost GBs of VRAM that deep-context ladders
-                # need); a no-op stub keeps the propose call sites inert.
-                class _NoSvc:
-                    n_propose = 0
-                    ms = 0.0
-                    t_pre = t_fwd = t_chn = 0.0
-
-                    def propose(self, *a, **k):
-                        return [a[0]] * 64 if a else []
-
-                self._spec_svc = _NoSvc()
-            else:
-                self._spec_arm(k)
+            self._spec_arm(k)
         st = self._spec_state
         if st["pending"] is None:
             st["pending"] = self._spec_pending_from_last_row(req)
@@ -1189,14 +1128,7 @@ class Scheduler(SchedulerIOMixin):
         _tail_ids = req.input_ids[L:].tolist()
         if _tail_ids and _tail_ids != z[: len(_tail_ids)]:
             z = [int(x) for x in _tail_ids] + z[len(_tail_ids):]
-            # the verify block is FIXED-SHAPE: truncate to k. A normal decode
-            # step between spec steps (e.g. during a proactive re-capture gap)
-            # appends a token on top of the spec tail, making it k+1 — feeding
-            # that to dispatch sent kn=k+1 != vr.k and dropped the step to the
-            # EAGER tail (broken partial-accept restore + 144MB/step alloc
-            # that OOM'd). The k+1-th tail token simply waits for the next
-            # block.
-            z = z[:k]
+            z = z[: max(k, len(z))]
         kn = len(z)
         _vr_k = getattr(getattr(self.engine.graph_runner, "verify_runner", None), "k", 0)
         if _vr_k and kn < _vr_k:
@@ -1234,10 +1166,6 @@ class Scheduler(SchedulerIOMixin):
         if (vr is not None and kn == vr.k
                 and _os_e.environ.get("FREETOKEN_SPEC_EAGER", "0") not in {"1", "true", "yes"}):
             return self._spec_replay_step(req, vr, st, gctx, z, z_dev, L, kn, slot)
-        if _os_e.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
-            print(f"[DISPATCH->EAGER] vr_none={vr is None} kn={kn} "
-                  f"vr_k={getattr(vr, 'k', None)} L={L} "
-                  f"tail={int(req.input_ids.numel()) - L}", flush=True)
 
         _t0 = _time.perf_counter()
         vbatch = Batch(reqs=[vreq], phase="prefill")
