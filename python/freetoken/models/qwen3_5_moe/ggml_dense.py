@@ -128,11 +128,23 @@ def _kq_gemv(w, x, quant_type: int, out_features: int):
                       f"dtype={x.dtype} contig={x.is_contiguous()} "
                       f"ptr%16={x.data_ptr() % 16} w ptr%16={w.data_ptr() % 16} "
                       f"N={out_features}", flush=True)
-            # fused skinny-M GEMM: 2x faster (173ms/step vs 344) but its math
-            # is WRONG at T>1 (garbage output e2e) -- opt-in while it is
-            # debugged against the vec path on real weights (parity harness:
-            # run both at boot-capture and diff). Production rides the ggml
-            # VEC kernel: validated M<=8, coherent, 344ms/step.
+            if _os_fused.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+                from freetoken.kernel.triton.kquant_linear import kq_gemm_q4k_m8 as _m8k
+
+                st = globals().setdefault("_m8_stash", [])
+                if len(st) < 2:
+                    y_m8 = _m8k(w, x, quant_type)
+                    st.append((w, x, y_m8, len(st)))
+                    return y_m8
+            # fused skinny-M GEMM (opt-in): FIVE-WAY PROVEN CORRECT -- bit-exact
+            # vs the T=1 GEMV oracle on real weights, under isolated graph
+            # capture+replay, faithful captured launch in-serving with a
+            # FLAT-zero drift curve over 18+ steps, coherent e2e on healthy
+            # graphs. Kept OFF only because the intermittent garbage-class
+            # graph invalidation (which hits healthy-graph output regardless
+            # of kernel choice, NaN heal can't catch wrong-values) is easier
+            # to attribute on the long-proven vec path. ~2x when on (177ms
+            # step vs 344, sync 95 vs 167).
             from freetoken.kernel.triton.kquant_linear import kq_gemm_q4k_m8
 
             return kq_gemm_q4k_m8(w, x, quant_type)

@@ -675,6 +675,23 @@ class Scheduler(SchedulerIOMixin):
             tk_vals = tk.values.tolist()
             _sub["tolist2"] = _sub.get("tolist2", 0.0) + _time.perf_counter() - _t_l2
             self._spec_t_replay = getattr(self, "_spec_t_replay", 0.0) + (_time.perf_counter() - _tr0)
+        import os as _os_dump
+
+        if (_os_dump.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
+                and getattr(self, "_spec_n_dump", 0) < 12
+                and getattr(self, "_spec_n", 0) % 3 == 0):
+            # m8 serving dump: the fused kernel's captured launch vs an eager
+            # re-run on the SAME (w, x) at the first live replay.
+            self._spec_n_dump = getattr(self, "_spec_n_dump", 0) + 1
+            import freetoken.models.qwen3_5_moe.ggml_dense as _gd
+            from freetoken.kernel.triton.kquant_linear import kq_gemm_q4k_m8
+
+            for _wq, _xq, _yq, _idx in getattr(_gd, "_m8_stash", []) or []:
+                _ye = kq_gemm_q4k_m8(_wq, _xq, 12)
+                _d = (_yq.float() - _ye.float()).abs().max().item()
+                print(f"[m8-dump] step={getattr(self, '_spec_n', 0)} call{_idx}: "
+                      f"replay-vs-eager maxdiff={_d:.4f}", flush=True)
+
         _sub["total"] = _sub.get("total", 0.0) + (_time.perf_counter() - _t1)
         _acc = getattr(self, "_spec_sub_acc", None)
         if _acc is None:
