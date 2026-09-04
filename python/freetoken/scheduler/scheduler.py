@@ -729,9 +729,17 @@ class Scheduler(SchedulerIOMixin):
                 _elog = gctx.spec_logits
                 _erows = [int(v) for v in _elog.argmax(-1).reshape(-1).tolist()]
             self.decode_manager.remove_req(_vrq)
+            _etaps = gctx.spec_taps or {}
+            _tapd = {}
+            for _d, _tg in _etaps.items():
+                _vg = vr.taps.get(_d)
+                if _vg is None:
+                    continue
+                _tapd[_d] = round((_vg.float() - _tg.float().to(_vg.device))
+                                  .abs().max().item(), 3)
             print(f"[EAB] step={getattr(self, '_spec_n', 0)} L={L} "
                   f"graph_rows={rows[:4]} eager_rows={_erows[:4]} "
-                  f"match={rows[:4] == _erows[:4]}", flush=True)
+                  f"match={rows[:4] == _erows[:4]} tapdiff={_tapd}", flush=True)
             pool.restore_slot(slot, _esnap)
 
         _sub["total"] = _sub.get("total", 0.0) + (_time.perf_counter() - _t1)
