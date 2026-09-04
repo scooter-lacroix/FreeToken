@@ -1130,10 +1130,12 @@ class Scheduler(SchedulerIOMixin):
             anchor = int(req.input_ids[-1].item())
         else:
             anchor = int(row_logits.reshape(-1).argmax().item())
-            # The prefill's reply SENDS this token to the client (its batch
-            # reply path); make the stream match by appending it here so the
-            # first spec block's pre-watermark counts it (z[0] skipped, not
-            # re-emitted -- the prefill->spec 'TheThe' boundary duplicate).
+            # BISECT-VERDICT (f0cfce0 good / 6f5834f bad on the same
+            # harness): this append is REQUIRED for gate-green — the
+            # prefill's reply SENDS this token to the client, and without it
+            # in input_ids the stream is one token SHORT and every verify
+            # runs on the wrong context (6f5834f removed it; the draft-echo
+            # z=[760,760,...] seen after was a SYMPTOM, not a double-append).
             if req.input_ids.numel() < req.max_device_len:
                 import torch as _t_anchor
 
