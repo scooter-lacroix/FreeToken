@@ -324,6 +324,19 @@ class VerifyGraphRunner:
                     # GATHER-side read is the corruption.
                     if _os_dbg.environ.get(
                             "FREETOKEN_SPEC_KVSPLIT", "0") == "1":
+                        # ZEROINIT (FREETOKEN_SPEC_ZEROINIT=1): swap torch.empty
+                        # /empty_like for zeros across the KVSPLIT runs. If the
+                        # degraded eager control (4.3 on later captures) and the
+                        # graph divergence collapse to ~0, an uninit-read in an
+                        # empty-allocated workspace is CONFIRMED; site-bisect
+                        # the zeroing next. Restored after.
+                        _zi = _os_dbg.environ.get(
+                            "FREETOKEN_SPEC_ZEROINIT", "0") in {"1", "true", "yes"}
+                        if _zi:
+                            _e_empty, _e_el = torch.empty, torch.empty_like
+                            torch.empty = torch.zeros
+                            torch.empty_like = torch.zeros_like
+                            print("[KVSPLIT] ZEROINIT: empties zeroed", flush=True)
                         _kvc = attn_backend.kvcache
                         _kc = _vc = None
                         for _li in range(1, 8):  # layer 0 is GDN; first full-attn
@@ -384,6 +397,8 @@ class VerifyGraphRunner:
                               f"{_dEE:.4f} | stored-KV K={_dk:.4f} V={_dv:.4f} "
                               f"-> {'STORE-SIDE' if max(_dk, _dv) > 0.05 else 'GATHER-SIDE'}",
                               flush=True)
+                        if _zi:
+                            torch.empty, torch.empty_like = _e_empty, _e_el
                     # variant C: positions only (RoPE path)
                     _pool.restore_slot(0, _snap)
                     _stage_l66(do_pos=False)
