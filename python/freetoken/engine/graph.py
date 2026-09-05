@@ -193,7 +193,10 @@ class VerifyGraphRunner:
                     self.n = 0
                 def tick(self):
                     self.n += 1
-                    __import__("time").sleep(0.005)
+                    if _pace == "selftest_sync":
+                        torch.cuda.synchronize()  # device-wide fence, no wall-clock
+                    else:
+                        __import__("time").sleep(0.005)
             self._pace_ticks = _Pacer()
         _moe_cache = moe_cache
         if (_moe_cache is not None
