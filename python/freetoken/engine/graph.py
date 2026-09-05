@@ -338,65 +338,67 @@ class VerifyGraphRunner:
                             torch.empty_like = torch.zeros_like
                             print("[KVSPLIT] ZEROINIT: empties zeroed", flush=True)
                         _kvc = attn_backend.kvcache
-                        _kc = _vc = None
-                        for _li in range(1, 8):  # layer 0 is GDN; first full-attn
+                        _layers_ok = []
+                        for _li in (3, 7, 27):
                             try:
-                                _kc = _kvc.k_cache(_li)
-                                _vc = _kvc.v_cache(_li)
-                                break
+                                _kvc.k_cache(_li)
+                                _layers_ok.append(_li)
                             except KeyError:
                                 continue
-                        assert _kc is not None, "no paged-KV layer in 1..7"
-                        _kc2 = _kc.view(-1, _kc.shape[-2], _kc.shape[-1])
-                        _vc2 = _vc.view(-1, _vc.shape[-2], _vc.shape[-1])
-                        # CLEAN ROWS: out_loc -> k DISTINCT dummy-req pages and
-                        # indices -> the dummy row, so neither side gathers a
-                        # row it just wrote (the zeros-staging made every
-                        # forward read its own row-0 writes — self-referential,
-                        # eager control maxdiff 4.96). All touched rows are
-                        # snapshotted and rewound between runs.
-                        _drow = get_global_ctx().page_table[dummy_req.table_idx]
+                        for _li in _layers_ok:
+                            _kc = _kvc.k_cache(_li)
+                            _vc = _kvc.v_cache(_li)
+                            _kc2 = _kc.view(-1, _kc.shape[-2], _kc.shape[-1])
+                            _vc2 = _vc.view(-1, _vc.shape[-2], _vc.shape[-1])
+                            # CLEAN ROWS: out_loc -> k DISTINCT dummy-req pages
+                            # and indices -> the dummy row, so neither side
+                            # gathers a row it just wrote. All touched rows are
+                            # snapshotted and rewound between runs.
+                            _drow = get_global_ctx().page_table[
+                                dummy_req.table_idx]
 
-                        def _stage_clean():
-                            _stage_l66()
-                            self.out_loc.copy_(_drow[: self.k])
-                            _nk = 66 + self.k
-                            self.indices[:_nk].copy_(_drow[:_nk])
+                            def _stage_clean():
+                                _stage_l66()
+                                self.out_loc.copy_(_drow[: self.k])
+                                _nk = 66 + self.k
+                                self.indices[:_nk].copy_(_drow[:_nk])
 
-                        _rows = torch.unique(_drow[: 66 + self.k].to(torch.long))
+                            _rows = torch.unique(
+                                _drow[: 66 + self.k].to(torch.long))
 
-                        def _snap_rows():
-                            return _kc2[_rows].clone(), _vc2[_rows].clone()
+                            def _snap_rows():
+                                return _kc2[_rows].clone(), _vc2[_rows].clone()
 
-                        def _rewind(rk, rv):
-                            _kc2[_rows].copy_(rk)
-                            _vc2[_rows].copy_(rv)
+                            def _rewind(rk, rv):
+                                _kc2[_rows].copy_(rk)
+                                _vc2[_rows].copy_(rv)
 
-                        _pool.restore_slot(0, _snap)
-                        _stage_clean()
-                        _rk0, _rv0 = _snap_rows()
-                        _eager_ref()
-                        _rkE, _rvE = _snap_rows()
-                        _rewind(_rk0, _rv0)
-                        _pool.restore_slot(0, _snap)
-                        _stage_clean()
-                        _eager_ref()
-                        _rkE2, _rvE2 = _snap_rows()
-                        _dEE = max(
-                            (_rkE.float() - _rkE2.float()).abs().max().item(),
-                            (_rvE.float() - _rvE2.float()).abs().max().item())
-                        _rewind(_rk0, _rv0)
-                        _pool.restore_slot(0, _snap)
-                        _stage_clean()
-                        graph.replay()
-                        torch.cuda.synchronize()
-                        _rkG, _rvG = _snap_rows()
-                        _dk = (_rkE.float() - _rkG.float()).abs().max().item()
-                        _dv = (_rvE.float() - _rvG.float()).abs().max().item()
-                        print(f"[KVSPLIT] layer={_li} control_eager_vs_eager="
-                              f"{_dEE:.4f} | stored-KV K={_dk:.4f} V={_dv:.4f} "
-                              f"-> {'STORE-SIDE' if max(_dk, _dv) > 0.05 else 'GATHER-SIDE'}",
-                              flush=True)
+                            _pool.restore_slot(0, _snap)
+                            _stage_clean()
+                            _rk0, _rv0 = _snap_rows()
+                            _eager_ref()
+                            _rkE, _rvE = _snap_rows()
+                            _rewind(_rk0, _rv0)
+                            _pool.restore_slot(0, _snap)
+                            _stage_clean()
+                            _eager_ref()
+                            _rkE2, _rvE2 = _snap_rows()
+                            _dEE = max(
+                                (_rkE.float() - _rkE2.float()).abs().max().item(),
+                                (_rvE.float() - _rvE2.float()).abs().max().item())
+                            _rewind(_rk0, _rv0)
+                            _pool.restore_slot(0, _snap)
+                            _stage_clean()
+                            graph.replay()
+                            torch.cuda.synchronize()
+                            _rkG, _rvG = _snap_rows()
+                            _dk = (_rkE.float() - _rkG.float()).abs().max().item()
+                            _dv = (_rvE.float() - _rvG.float()).abs().max().item()
+                            print(f"[KVSPLIT] layer={_li} "
+                                  f"control_eager_vs_eager={_dEE:.4f} | "
+                                  f"stored-KV K={_dk:.4f} V={_dv:.4f} "
+                                  f"-> {'STORE-SIDE' if max(_dk, _dv) > 0.05 else 'GATHER-SIDE'}",
+                                  flush=True)
                         if _zi:
                             torch.empty, torch.empty_like = _e_empty, _e_el
                     # variant C: positions only (RoPE path)
