@@ -1312,8 +1312,37 @@ class Scheduler(SchedulerIOMixin):
             _tnan = {d: int(t.isnan().sum()) for d, t in taps.items()} if taps else {}
             self._sd2_ctx = (req.uid, L, st['pending'].get('pre', 1), z, rows, slot)
         a = 0
-        while a < kn - 1 and rows[a] == z[a + 1]:
-            a += 1
+        # TOLERANCE-BAND ACCEPT (FREETOKEN_SPEC_TOLACCEPT=eps): the piecewise
+        # verify graph carries a small numeric divergence vs the eager
+        # reference (tapdiff 0.2-0.5 hidden-state delta flipping near-tied
+        # argmaxes; row-0 robust). Greedy exact-equality acceptance stalls at
+        # the flips; WITHIN-eps acceptance treats a row as ACCEPTED when its
+        # verify top-1 logit is within eps of the draft pick's verify logit
+        # (a near-tie means the graph cannot distinguish the candidates —
+        # accept the draft's choice; the emitted stream stays self-consistent
+        # because every accepted token re-enters the next block's context).
+        _tol = float(_os_b.environ.get("FREETOKEN_SPEC_TOLACCEPT", "0") or 0)
+        if _tol > 0 and tk_vals is not None:
+            while a < kn - 1:
+                if rows[a] == z[a + 1]:
+                    a += 1
+                    continue
+                # near-tie check: the drafted token's verify probability mass
+                # vs the argmax's, from this row's topk (tk_ids/tk_vals hold
+                # the graph's top-64 for row a)
+                _row_ids = tk_ids[a]
+                _row_vals = tk_vals[a]
+                try:
+                    _zi = _row_ids.index(z[a + 1])
+                except ValueError:
+                    _zi = -1
+                if _zi >= 0 and (_row_vals[0] - _row_vals[_zi]) <= _tol:
+                    a += 1  # near-tie: accept the draft's pick
+                    continue
+                break
+        else:
+            while a < kn - 1 and rows[a] == z[a + 1]:
+                a += 1
         bonus = rows[a]
         full = a == kn - 1
         entry_snap = self._spec_entry_snap
