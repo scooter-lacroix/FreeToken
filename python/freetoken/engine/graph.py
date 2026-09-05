@@ -513,6 +513,22 @@ class VerifyGraphRunner:
         self.kv_indptr[0].zero_()
         self.kv_indptr[1].fill_(L + k)
         self.prefix_lens[0].fill_(L)
+        # TWIN SLOT (FREETOKEN_SPEC_TWIN=1): copy the live GDN slot state
+        # into a dedicated twin slot and point the captured kernel's index at
+        # it — if the capture baked any aspect of the original slot's
+        # identity, serving through a capture-known twin with freshly copied
+        # bytes sidesteps it. Falsy slots (0/-1) and the padding slot pass
+        # through untouched.
+        import os as _os_t
+
+        if (_os_t.environ.get("FREETOKEN_SPEC_TWIN", "0") in {"1", "true", "yes"}
+                and slot is not None and slot > 0):
+            _pl = get_global_ctx().linear_state_pool
+            _tw = _pl.padding_slot
+            if _tw != slot:
+                _pl.conv_states[:, _tw].copy_(_pl.conv_states[:, slot])
+                _pl.recurrent_states[:, _tw].copy_(_pl.recurrent_states[:, slot])
+                slot = _tw
         self.linear_idx[0].fill_(slot)
         if __import__("os").environ.get("FREETOKEN_SPEC_PACE", "") == "prereplay":
             __import__("time").sleep(0.02)
