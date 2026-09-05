@@ -788,7 +788,10 @@ class Scheduler(SchedulerIOMixin):
                     self.engine.stream.synchronize()
                 _rw_rows = [int(v) for v in gctx.spec_logits.argmax(-1)
                             .reshape(-1).tolist()[:4]]
+                _rwv, _rwi = gctx.spec_logits[0].float().topk(5)
                 print(f"[R12D2] post-recapture eager rewarm rows={_rw_rows} "
+                      f"row0_top5={[int(i) for i in _rwi.tolist()]} "
+                      f"vals={[round(v, 2) for v in _rwv.tolist()]} "
                       f"t={_time_de.perf_counter() - _t0_rw:.2f}s "
                       f"(ref={_erows[:4]})", flush=True)
                 self.decode_manager.remove_req(_vrq)
@@ -804,11 +807,15 @@ class Scheduler(SchedulerIOMixin):
                                        L=L, page_row=_pr12,
                                        stream=torch.cuda.current_stream())
                     torch.cuda.current_stream().synchronize()
-                _r = [int(v) for v in runner.logits_out.argmax(-1)
-                      .reshape(-1).tolist()[:4]]
-                print(f"[R12D2] L={L} {tag} rows={_r} "
+                _lg = runner.logits_out[0].float()
+                _tv5, _ti5 = _lg.topk(5)
+                print(f"[R12D2] L={L} {tag} rows="
+                      f"{[int(v) for v in runner.logits_out.argmax(-1).reshape(-1).tolist()[:4]]} "
+                      f"row0_top5={[int(i) for i in _ti5.tolist()]} "
+                      f"vals={[round(v, 2) for v in _tv5.tolist()]} "
                       f"nan={int(runner.nan_out[0])}", flush=True)
-                return _r
+                return [int(v) for v in
+                        runner.logits_out.argmax(-1).reshape(-1).tolist()[:4]]
 
             if _vr2 is not None:
                 _ra = _tap_alt(vr, "vr#1")
@@ -940,7 +947,8 @@ class Scheduler(SchedulerIOMixin):
 
         if (_os_dump.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
                 and getattr(self, "_spec_n_dump", 0) < 12
-                and getattr(self, "_spec_n", 0) % 3 == 0):
+                and getattr(self, "_spec_n", 0) % 3 == 0
+                and L < 8000):
             # m8 serving dump: the fused kernel's captured launch vs an eager
             # re-run on the SAME (w, x) at the first live replay.
             self._spec_n_dump = getattr(self, "_spec_n_dump", 0) + 1
