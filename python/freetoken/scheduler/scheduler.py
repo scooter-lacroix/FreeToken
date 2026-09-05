@@ -1084,6 +1084,33 @@ class Scheduler(SchedulerIOMixin):
             print(f"[EAB] step={getattr(self, '_spec_n', 0)} L={L} "
                   f"graph_rows={rows[:4]} eager_rows={_erows[:4]} "
                   f"match={rows[:4] == _erows[:4]} tapdiff={_tapd}", flush=True)
+            # RESTOREDIVE (FREETOKEN_SPEC_RESTOREDIVE=1, step 1 only): the
+            # step-N defect is a deterministic stale read after the partial-
+            # accept restore cycle. On the EAGER REF'S OWN post-restore state,
+            # (a) print vr.out_loc staging vs the reallocated page_row,
+            # (b) replay the graph and compare rows vs the eager that JUST
+            # used this state — a divergence here convicts a graph-exclusive
+            # stale read (block-KV leftover / out_loc mismatch).
+            if (_os_eab.environ.get("FREETOKEN_SPEC_RESTOREDIVE", "0")
+                    in {"1", "true", "yes"}
+                    and getattr(self, "_spec_n", 0) == 1):
+                _pr1 = self.cache_manager.page_table[req.table_idx]
+                _ol = [int(v) for v in vr.out_loc.tolist()]
+                _pg = [int(v) for v in _pr1[L : L + kn].tolist()]
+                print(f"[RDIVE] out_loc={_ol} page_row[L:L+kn]={_pg} "
+                      f"match={_ol == _pg}", flush=True)
+                pool.restore_slot(slot, _esnap)
+                with torch.cuda.stream(torch.cuda.current_stream()):
+                    vr.replay_step(z_ids=z_dev.to(self.device), slot=slot,
+                                   L=L, page_row=_pr1,
+                                   stream=torch.cuda.current_stream())
+                    torch.cuda.current_stream().synchronize()
+                _g2 = [int(v) for v in vr.logits_out.argmax(-1)
+                       .reshape(-1).tolist()[:4]]
+                print(f"[RDIVE] graph-on-eager-state rows={_g2} "
+                      f"eager={_erows[:4]} match={_g2 == _erows[:4]} "
+                      f"prod={rows[:4]}", flush=True)
+                pool.restore_slot(slot, _esnap)
             # PROFSEQ: kernel-sequence diff REAL-staging vs DUMMY-staging eager
             # forwards. The captured verify graph freezes the walk it recorded
             # with CAPTURE-TIME (dummy) data; any host branch that decides on
