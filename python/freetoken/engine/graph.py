@@ -277,9 +277,18 @@ class VerifyGraphRunner:
                     print("[vr-cap] POOL-ISO: cache emptied pre-capture",
                           flush=True)
                 graph = torch.cuda.CUDAGraph()
+                _hc = __import__("os").environ.get(
+                    "FREETOKEN_SPEC_HSTASH", "0") in {"1", "true", "yes"}
+                if _hc:
+                    from freetoken.kernel.fla.chunk_delta_h import _HSTASH
+
+                    _HSTASH.clear()
+                    __import__("os").environ["FREETOKEN_SPEC_HCAP"] = "1"
                 with torch.cuda.graph(graph, stream=_cs):
                     with gctx.forward_batch(batch):
                         model.forward()
+                if _hc:
+                    __import__("os").environ["FREETOKEN_SPEC_HCAP"] = "0"
                 torch.cuda.synchronize()
         import os as _os_dbg
 

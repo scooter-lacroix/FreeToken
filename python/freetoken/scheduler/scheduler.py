@@ -1105,11 +1105,26 @@ class Scheduler(SchedulerIOMixin):
                                    L=L, page_row=_pr1,
                                    stream=torch.cuda.current_stream())
                     torch.cuda.current_stream().synchronize()
+                import hashlib as _hl
+
+                from freetoken.kernel.fla.chunk_delta_h import _HSTASH
+
+                def _hsh(t):
+                    return _hl.md5(
+                        t.detach().float().cpu().numpy().tobytes()
+                    ).hexdigest()[:8]
+
+                _pre = [_hsh(t) for t in _HSTASH]
                 _g2 = [int(v) for v in vr.logits_out.argmax(-1)
                        .reshape(-1).tolist()[:4]]
+                _post = [_hsh(t) for t in _HSTASH]
+                _chg = [i for i in range(len(_pre)) if _pre[i] != _post[i]]
                 print(f"[RDIVE] graph-on-eager-state rows={_g2} "
                       f"eager={_erows[:4]} match={_g2 == _erows[:4]} "
                       f"prod={rows[:4]}", flush=True)
+                print(f"[RDIVE] HSTASH n={len(_pre)} changed_idx={_chg} "
+                      f"(capture-pool buffers change; stale ones don't)",
+                      flush=True)
                 # first-diverging-layer: vr.taps (the DIVE replay's per-layer
                 # hidden states on the eager's own state) vs the eager's taps.
                 # Layers 1-2 are GDN; GDN divergence + stored-K exact convicts

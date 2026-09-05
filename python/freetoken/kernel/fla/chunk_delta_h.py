@@ -20,6 +20,7 @@ from freetoken.kernel.fla.utils import (
 )
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
+_HSTASH: list = []
 CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
 GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
@@ -328,6 +329,23 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
+    import os as _os_st
+
+    if _os_st.environ.get("FREETOKEN_SPEC_HSTASH", "0") in {"1", "true", "yes"}:
+        # fingerprint stash: append EVERY call's (h[, v_new]) — the eager
+        # warmups AND the capture-time call (whose tensors are the graph-
+        # pool buffers the captured kernels read/write on every replay).
+        # The dive hashes all entries across a graph replay; the capture-
+        # pair is the one whose bytes change when only the graph ran.
+        # only during the CAPTURE-marked walk (FREETOKEN_SPEC_HCAP=1 set by
+        # VerifyGraphRunner.capture around the captured forward): retain the
+        # first GDN layer's (h, v_new) — THE graph-pool buffers — and nothing
+        # else (a general append OOM'd the warmup ladder).
+        if _os_st.environ.get("FREETOKEN_SPEC_HCAP", "0") in {"1", "true", "yes"}:
+            if not _HSTASH:
+                _HSTASH.append(h)
+                if v_new is not None:
+                    _HSTASH.append(v_new)
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
         v=u,
