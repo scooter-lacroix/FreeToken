@@ -534,6 +534,15 @@ class Engine:
                     _ps = self.linear_state_pool.padding_slot
                     self.linear_state_pool.conv_states[:, _ps].zero_()
                     self.linear_state_pool.recurrent_states[:, _ps].zero_()
+                # vr2 (VR2 alternation probe) was captured pre-warmup -> dead on
+                # arrival by the same rule; clear it so _capture_verify builds a
+                # fresh post-warmup vr2 (its None-guard re-arms), and drop the
+                # dead one's private pool before the new capture allocates.
+                if getattr(self.graph_runner, "verify_runner2", None) is not None:
+                    self.graph_runner.verify_runner2 = None
+                    import gc as _gc_vr2
+
+                    _gc_vr2.collect()
                 self.graph_runner._capture_verify(_vr_old.k, self.model)
                 logger.info_rank0(
                     f"verify graph re-captured post-warmup (k={_vr_old.k})")

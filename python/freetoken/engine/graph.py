@@ -473,11 +473,23 @@ class GraphRunner:
         self.verify_runner = vr
         logger.info_rank0(f"verify graph captured (k={k})")
 
-        # S4 verify graph: independent of the decode bs graphs; capture when armed
+        # Alternation probe (FREETOKEN_SPEC_VR2=1): a SECOND verify graph with
+        # its own private memory pool. Deep (>=16k) evidence so far: on the SAME
+        # graph, a second replay in one step faults (restore variant) or wedges
+        # (raw variant) while single-replay-per-step production survives. If
+        # alternating vr/vr2 replays completes and agrees at depth, per-graph
+        # pool reuse is the bug -> fix is double-buffering or per-request
+        # recapture. Only captured once: _spec_recapture calls back into here,
+        # and re-adding a second live pool mid-serving would double the cost.
         import os as _os2
 
-        if int(_os2.environ.get("FREETOKEN_SPEC_K", "0") or 0) > 0 and self.verify_runner is None:
-            self._capture_verify(int(_os2.environ.get("FREETOKEN_SPEC_K", "8")), model)
+        if (int(_os2.environ.get("FREETOKEN_SPEC_VR2", "0") or 0) > 0
+                and getattr(self, "verify_runner2", None) is None):
+            vr2 = VerifyGraphRunner(k, self.max_seq_len, vocab, hidden,
+                                    self.device, tap_layers)
+            vr2.capture(self.attn_backend, model, self.dummy_req, stream=stream)
+            self.verify_runner2 = vr2
+            logger.info_rank0("verify graph #2 captured (VR2 alternation probe)")
 
     def can_use_cuda_graph(self, batch: Batch) -> bool:
         return batch.is_decode and batch.size <= self.max_graph_bs

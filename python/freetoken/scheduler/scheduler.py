@@ -681,10 +681,12 @@ class Scheduler(SchedulerIOMixin):
         import os as _os_eab
 
         if (_os_eab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
-                and getattr(self, "_spec_n_r12", 0) < 1):
+                and getattr(self, "_spec_n_r12", 0) < 1 and L < 8000):
             # replay #1 vs #2 with IDENTICAL inputs and restored slot: any tap
             # depth that changes between them is pool-carry (the buffer whose
             # value differs while inputs don't is the accumulate-without-init).
+            # L<8000: verdict collected; the restore-ladder FAULTS at depth
+            # (735a04a) and would kill the boot before R12D2 runs.
             self._spec_n_r12 = 1
             _snap12 = self._spec_entry_snap
             _pr12 = self.cache_manager.page_table[req.table_idx]
@@ -716,11 +718,12 @@ class Scheduler(SchedulerIOMixin):
         import os as _os_eab
 
         if (_os_eab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
-                and getattr(self, "_spec_n_eab", 0) < 5):
+                and getattr(self, "_spec_n_eab", 0) < 5 and L < 8000):
             # Eager-vs-graph rows probe: run the eager verify on the SAME
             # entry state and compare argmax rows. rows==erows while the
             # client stream garbles => GPU path faithful, emission/staging
-            # protocol guilty.
+            # protocol guilty. L<8000: ZAB's restore+replay pair inside this
+            # block is the depth-faulting sequence; keep deep steps clean.
             from freetoken.attention.linear import FLAMetadata as _FLA
             from freetoken.core import Batch as _B, Req as _R
 
@@ -811,40 +814,41 @@ class Scheduler(SchedulerIOMixin):
         import os as _os_r12
 
         if (_os_r12.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
-                and getattr(self, "_spec_n_r12", 0) < 1 and L > 8000):
-            # R12 at DEPTH: three consecutive replays of the SAME staged z
-            # with entry restores between. r1!=r2 => graph depth-unstable;
-            # equal while production rows vary => state mutates BETWEEN steps.
-            self._spec_n_r12 = 1
+                and getattr(self, "_spec_n_r12d", 0) < 1 and L > 8000):
+            # R12D2 alternation: restore+replay vr -> vr2 (own private pool) ->
+            # vr again, same staged z/L/slot. Prior ladder: a second replay of
+            # the SAME graph in one step faults (restored) or wedges (raw).
+            # If the alternated ladder completes and rows agree, per-graph-pool
+            # reuse is the bug; if vr2's replay also dies, the destabilizer is
+            # graph-external (shared GDN pool / stream state). Pre-replay
+            # markers name the exact replay that dies.
+            self._spec_n_r12d = 1
             _snap12 = self._spec_entry_snap
             _pr12 = self.cache_manager.page_table[req.table_idx]
+            _vr2 = getattr(self.engine.graph_runner, "verify_runner2", None)
 
-            def _tap12(do_restore=True):
-                if do_restore:
-                    pool.restore_slot(slot, _snap12)
+            def _tap_alt(runner, tag):
+                print(f"[R12D2] L={L} firing {tag} ...", flush=True)
+                pool.restore_slot(slot, _snap12)
                 with torch.cuda.stream(torch.cuda.current_stream()):
-                    vr.replay_step(z_ids=z_dev.to(self.device), slot=slot,
-                                   L=L, page_row=_pr12,
-                                   stream=torch.cuda.current_stream())
+                    runner.replay_step(z_ids=z_dev.to(self.device), slot=slot,
+                                       L=L, page_row=_pr12,
+                                       stream=torch.cuda.current_stream())
                     torch.cuda.current_stream().synchronize()
-                return ({d: t.clone() for d, t in vr.taps.items()},
-                        [int(v) for v in vr.logits_out.argmax(-1)
-                         .reshape(-1).tolist()[:4]])
+                _r = [int(v) for v in runner.logits_out.argmax(-1)
+                      .reshape(-1).tolist()[:4]]
+                print(f"[R12D2] L={L} {tag} rows={_r} "
+                      f"nan={int(runner.nan_out[0])}", flush=True)
+                return _r
 
-            # ladder: (1) plain replay (no restore) x2, (2) restore+replay
-            _n0, _r0 = _tap12(do_restore=False)
-            _n1, _r1 = _tap12(do_restore=False)
-            _a, _ra = _tap12()
-            _b, _rb = _tap12()
-            _d12 = {d: round((_a[d].float() - _b[d].float()).abs().max().item(), 3)
-                    for d in _a}
-            _d23 = {d: round((_b[d].float() - _c[d].float()).abs().max().item(), 3)
-                    for d in _b}
-            _d01 = {d: round((_n0[d].float() - _n1[d].float()).abs().max().item(), 3)
-                    for d in _n0}
-            print(f"[R12D] L={L} RAW r0={_r0} r1={_r1} rawdiff={_d01} | "
-                  f"REST r1={_ra} r2={_rb} rstdiff={_d12} prod={rows[:4]}",
-                  flush=True)
+            if _vr2 is not None:
+                _ra = _tap_alt(vr, "vr#1")
+                _rb = _tap_alt(_vr2, "vr2")
+                _rc = _tap_alt(vr, "vr#2")
+                print(f"[R12D2] L={L} agree vr-vs-vr2={_ra == _rb} "
+                      f"vr-vs-vr={_ra == _rc} prod={rows[:4]}", flush=True)
+            else:
+                _ra = _tap_alt(vr, "vr#1(no-vr2)")
             pool.restore_slot(slot, _snap12)
 
 
