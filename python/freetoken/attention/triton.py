@@ -195,21 +195,38 @@ class TritonAttentionBackend(BaseAttnBackend):
             and q.dtype in (torch.float16, torch.bfloat16)
             and (q.shape[-1] <= 256 or metadata.max_q_len >= self.prefill_tile_min_q)
         ):
-            return extend_paged_attention(
-                q=q,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                qo_indptr=metadata.cu_seqlens_q_gpu,
-                kv_indptr=metadata.indptr,
-                kv_indices=indices,
-                prefix_lens=metadata.prefix_lens,
-                max_q_len=metadata.max_q_len,
-                sm_scale=scale,
-                sliding_window=spec.sliding_window,
-                sinks=spec.sinks,
-                k_extend=k.view(q.shape[0], kv_heads, head_dim),
-                v_extend=v.view(q.shape[0], kv_heads, head_dim),
+            def _extend_call():
+                return extend_paged_attention(
+                    q=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    qo_indptr=metadata.cu_seqlens_q_gpu,
+                    kv_indptr=metadata.indptr,
+                    kv_indices=indices,
+                    prefix_lens=metadata.prefix_lens,
+                    max_q_len=metadata.max_q_len,
+                    sm_scale=scale,
+                    sliding_window=spec.sliding_window,
+                    sinks=spec.sinks,
+                    k_extend=k.view(q.shape[0], kv_heads, head_dim),
+                    v_extend=v.view(q.shape[0], kv_heads, head_dim),
+                )
+
+            # PIECEWISE-ATTN seam (same replay-job class as the GDN seams):
+            # the extend triton launch runs UNRECORDED between segments during
+            # a piecewise capture; the replay job re-runs it. Residual-diversion
+            # probe: if the ~5% tail-row residual (growing through attention
+            # layers) is the extend kernel's in-segment staging, this seam
+            # makes verify exact.
+            from freetoken.engine.piecewise import (
+                capture_seam as _seam_a,
+                piecewise_capture_active as _pw_a,
             )
+
+            if (_pw_a() and __import__("os").environ.get(
+                    "FREETOKEN_SPEC_PIECEWISE_ATTN", "0") in {"1", "true", "yes"}):
+                _seam_a(-1, (q,), job=_extend_call)
+            return _extend_call()
         return paged_attention(
             q=q,
             k_cache=k_cache,
