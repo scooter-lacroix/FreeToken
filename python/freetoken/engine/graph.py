@@ -115,16 +115,25 @@ class VerifyGraphRunner:
 
     def _replay_pw(self) -> None:
         cache = self.moe_cache
-        cache.suppress_inline_copy = True
+        _jobs = getattr(self, "pw_jobs", {}) or {}
+        if cache is not None:
+            cache.suppress_inline_copy = True
         try:
             self.pw_graphs[0].replay()
             for i, layer_id in enumerate(self.pw_seams):
-                # Host-driven miss fetch for this layer, then the segment
-                # holding its expert GEMM (mirrors GraphRunner.replay).
-                cache.copy_missing_staged(layer_id)
+                job = _jobs.get(i)
+                if job is not None:
+                    # GDN seam: re-run the eager fla call between segments
+                    # (Triton argument staging froze the captured form).
+                    job()
+                elif cache is not None:
+                    # MoE seam: host-driven miss fetch for this layer, then
+                    # the segment holding its expert GEMM.
+                    cache.copy_missing_staged(layer_id)
                 self.pw_graphs[i + 1].replay()
         finally:
-            cache.suppress_inline_copy = False
+            if cache is not None:
+                cache.suppress_inline_copy = False
 
     def capture(self, attn_backend, model, dummy_req, stream=None, moe_cache=None):
         import torch
@@ -199,9 +208,8 @@ class VerifyGraphRunner:
                         __import__("time").sleep(0.005)
             self._pace_ticks = _Pacer()
         _moe_cache = moe_cache
-        if (_moe_cache is not None
-                and __import__("os").environ.get("FREETOKEN_SPEC_PIECEWISE", "0")
-                in {"1", "true", "yes"}):
+        if __import__("os").environ.get(
+                "FREETOKEN_SPEC_PIECEWISE", "0") in {"1", "true", "yes"}:
             # PIECEWISE verify capture: warmups run eagerly (misses fetch for
             # real, populating the cache for the capture batch's routing),
             # then the captured walk runs with inline copies SUPPRESSED -- the
@@ -216,15 +224,18 @@ class VerifyGraphRunner:
                     torch.cuda.synchronize()
                     from freetoken.engine.piecewise import PiecewiseCapture
 
-                    _moe_cache.suppress_inline_copy = True
+                    if _moe_cache is not None:
+                        _moe_cache.suppress_inline_copy = True
                     try:
                         cap = PiecewiseCapture(_cs)
                         cap.capture(lambda: self._forward_ctx(gctx, batch, model))
                     finally:
-                        _moe_cache.suppress_inline_copy = False
+                        if _moe_cache is not None:
+                            _moe_cache.suppress_inline_copy = False
                     torch.cuda.synchronize()
             self.pw_graphs = cap.graphs
             self.pw_seams = cap.seams
+            self.pw_jobs = dict(getattr(cap, "jobs", {}) or {})
             self.graph = None
             if __import__("os").environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
                 print(f"[vr-cap] piecewise verify captured: "

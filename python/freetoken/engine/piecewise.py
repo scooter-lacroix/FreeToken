@@ -32,7 +32,8 @@ class _CaptureState:
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.pool = None  # shared graph memory-pool handle (None until first close)
         self.graphs: List[torch.cuda.CUDAGraph] = []
-        self.seams: List[int] = []  # MoE layer ids in encounter order
+        self.seams: List[int] = []
+        self.jobs: dict = {}  # MoE layer ids in encounter order
         self.keepalive: List[torch.Tensor] = []
 
     def reset(self, pool) -> None:
@@ -40,6 +41,7 @@ class _CaptureState:
         self.pool = pool
         self.graphs = []
         self.seams = []
+        self.jobs = {}
         self.keepalive = []
 
 
@@ -50,7 +52,7 @@ def piecewise_capture_active() -> bool:
     return _state.active
 
 
-def capture_seam(layer_id: int, tensors=()) -> None:
+def capture_seam(layer_id: int, tensors=(), job=None) -> None:
     """Close the current segment and open the next one (capture time only).
 
     Called by OffloadMoELayer at the ensure/copy seam while the piecewise
@@ -63,6 +65,8 @@ def capture_seam(layer_id: int, tensors=()) -> None:
     if tensors:
         _state.keepalive.extend(tensors)
     _state.seams.append(layer_id)
+    if job is not None:
+        _state.jobs[len(_state.seams) - 1] = job
     _state.graph.capture_end()
     self_graphs = _state.graphs
     self_graphs.append(_state.graph)
@@ -83,6 +87,7 @@ class PiecewiseCapture:
         self.pool = pool
         self.graphs: List[torch.cuda.CUDAGraph] = []
         self.seams: List[int] = []
+        self.jobs: dict = {}
 
     def capture(self, fn: Callable[[], object]) -> "PiecewiseCapture":
         assert not _state.active, "nested piecewise capture"
@@ -105,6 +110,7 @@ class PiecewiseCapture:
                         _state.pool = _state.graphs[0].pool()
             self.graphs = list(_state.graphs)
             self.seams = list(_state.seams)
+            self.jobs = dict(_state.jobs)
             self.pool = _state.pool
         finally:
             _state.active = False

@@ -238,12 +238,35 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             if fla.fresh_state_indices is not None:
                 pool.recurrent_states[li].index_fill_(0, fla.fresh_state_indices, 0.0)
             track = fla.track_dst is not None
-            result = gdn_prefill_chunk_fla(
-                q, k, v, g, beta,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
-                return_h=track,
+
+            def _fla_call():
+                return gdn_prefill_chunk_fla(
+                    q, k, v, g, beta,
+                    state_source=pool.recurrent_states[li],
+                    indices=fla.cache_indices,
+                    cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                    return_h=track,
+                )
+
+            # PIECEWISE-GDN seam (active only during a piecewise capture
+            # walk): close the segment BEFORE the fla triton call and open
+            # the next AFTER — the launch runs UNRECORED (host/eager) between
+            # segments, so Triton never argument-stages it into frozen graph
+            # bytes (the captured-verify step-N defect). The replay job
+            # re-runs the same call between segment replays.
+            from freetoken.engine.piecewise import (
+                capture_seam as _seam,
+                piecewise_capture_active as _pw_active,
             )
+
+            _pw_gdn = (
+                _pw_active()
+                and __import__("os").environ.get(
+                    "FREETOKEN_SPEC_PIECEWISE_GDN", "0") in {"1", "true", "yes"}
+            )
+            if _pw_gdn:
+                _seam(self.layer_id, (q, k, v, g, beta), job=_fla_call)
+            result = _fla_call()
             if track:
                 core_out, h = result
                 self._write_track_snapshot(pool, li, conv_in, h, fla)
