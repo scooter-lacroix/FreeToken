@@ -1215,7 +1215,13 @@ class Scheduler(SchedulerIOMixin):
 
         import os as _os_b
 
-        if _os_b.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+        if (_os_b.environ.get("FREETOKEN_SPEC_DBG", "0") == "1"
+                or _os_b.environ.get("FREETOKEN_SPEC_SYNCTAPS", "0")
+                in {"1", "true", "yes"}):
+            # the isnan-reduction forces a host sync on the tap buffers right
+            # after the replay — SPEC_DBG boots (which sync here) correlate
+            # 5/5 with exact step-0s; SYNCTAPS isolates the sync from the
+            # debug prints.
             _tnan = {d: int(t.isnan().sum()) for d, t in taps.items()} if taps else {}
             self._sd2_ctx = (req.uid, L, st['pending'].get('pre', 1), z, rows, slot)
         a = 0

@@ -267,7 +267,12 @@ class VerifyGraphRunner:
                 torch.cuda.synchronize()
         import os as _os_dbg
 
-        if _os_dbg.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+        _selftest_on = _os_dbg.environ.get(
+            "FREETOKEN_SPEC_SELFTEST", "0") in {"1", "true", "yes"}
+        if _selftest_on:
+            _stv = set(x.strip() for x in _os_dbg.environ.get(
+                "FREETOKEN_SPEC_STV",
+                "dummy,l66both,kvsplit,pos,kvmeta").split(",") if x.strip())
             # Boot self-test: one more eager warmup vs a replay of the fresh
             # graph, same inputs -> logits must match. Divergence here means
             # the capture itself broke the forward (pool/config freeze),
@@ -296,8 +301,9 @@ class VerifyGraphRunner:
                               f"tapdiff={_td}", flush=True)
 
                     # variant A: boot-dummy buffers
-                    _ref, _rt = _eager_ref()
-                    _replay_cmp(_ref, _rt, "dummy")
+                    if "dummy" in _stv:
+                        _ref, _rt = _eager_ref()
+                        _replay_cmp(_ref, _rt, "dummy")
 
                     def _stage_l66(do_pos=True, do_kv=True):
                         if do_kv:
@@ -310,20 +316,22 @@ class VerifyGraphRunner:
                                                               device=self.device))
 
                     # variant B: both groups staged
-                    _stage_l66()
-                    _ref, _rt = _eager_ref()
-                    _e2, _t2 = _eager_ref()  # determinism control: eager vs eager
-                    _d_ee = (_ref.float() - _e2.float()).abs().max().item()
-                    print(f"[vr-selftest] B eager_vs_eager maxdiff={_d_ee:.3f} "
-                          f"(determinism control)", flush=True)
-                    _replay_cmp(_ref, _rt, "L66both")
+                    if "l66both" in _stv:
+                        _stage_l66()
+                        _ref, _rt = _eager_ref()
+                        _e2, _t2 = _eager_ref()  # determinism control
+                        _d_ee = (_ref.float() - _e2.float()).abs().max().item()
+                        print(f"[vr-selftest] B eager_vs_eager maxdiff={_d_ee:.3f} "
+                              f"(determinism control)", flush=True)
+                        _replay_cmp(_ref, _rt, "L66both")
                     # KVSPLIT (FREETOKEN_SPEC_KVSPLIT=1): at L=66, compare the
                     # KV rows each side WRITES through out_loc (staged to the
                     # dummy req's scratch pages, one per block row). Stored rows
                     # differ => the STORE side under capture; identical => the
                     # GATHER-side read is the corruption.
-                    if _os_dbg.environ.get(
-                            "FREETOKEN_SPEC_KVSPLIT", "0") == "1":
+                    if (_os_dbg.environ.get(
+                            "FREETOKEN_SPEC_KVSPLIT", "0") == "1"
+                            and "kvsplit" in _stv):
                         # ZEROINIT (FREETOKEN_SPEC_ZEROINIT=1): swap torch.empty
                         # /empty_like for zeros across the KVSPLIT runs. If the
                         # degraded eager control (4.3 on later captures) and the
@@ -409,17 +417,19 @@ class VerifyGraphRunner:
                         if _zi:
                             torch.empty, torch.empty_like = _e_empty, _e_el
                     # variant C: positions only (RoPE path)
-                    _pool.restore_slot(0, _snap)
-                    _stage_l66(do_pos=False)
-                    _ref, _rt = _eager_ref()
-                    _replay_cmp(_ref, _rt, "pos_only")
+                    if "pos" in _stv:
+                        _pool.restore_slot(0, _snap)
+                        _stage_l66(do_pos=False)
+                        _ref, _rt = _eager_ref()
+                        _replay_cmp(_ref, _rt, "pos_only")
                     # variant D: KV metadata only
-                    _pool.restore_slot(0, _snap)
-                    _stage_l66(do_kv=False)
-                    self.positions.copy_(torch.arange(0, self.k, dtype=torch.int32,
-                                                      device=self.device))
-                    _ref, _rt = _eager_ref()
-                    _replay_cmp(_ref, _rt, "kvmeta_only")
+                    if "kvmeta" in _stv:
+                        _pool.restore_slot(0, _snap)
+                        _stage_l66(do_kv=False)
+                        self.positions.copy_(torch.arange(0, self.k, dtype=torch.int32,
+                                                          device=self.device))
+                        _ref, _rt = _eager_ref()
+                        _replay_cmp(_ref, _rt, "kvmeta_only")
         if _os_dbg.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
             print(f"[vr-cap] sink_sum={float(self.logits_out.abs().sum()):.1f} "
                   f"row0_top={int(self.logits_out[0].argmax())}", flush=True)
