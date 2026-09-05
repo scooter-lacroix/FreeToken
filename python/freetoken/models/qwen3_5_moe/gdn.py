@@ -234,11 +234,25 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             q = qf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
             k = kf.reshape(1, B, self.num_k_heads, self.head_k_dim).to(dtype)
             v = vf.reshape(1, B, self.num_v_heads, self.head_v_dim).to(dtype)
-            core_out = gdn_decode_fla(
-                q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
-                state_source=pool.recurrent_states[li], indices=fla.cache_indices,
-                cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+            def _decode_call():
+                return gdn_decode_fla(
+                    q, k, v, a, b, A_log=self.A_log, dt_bias=self.dt_bias,
+                    state_source=pool.recurrent_states[li],
+                    indices=fla.cache_indices,
+                    cu_seqlens=fla.cu_seqlens, scale=self.head_k_dim ** -0.5,
+                )
+
+            # PIECEWISE-GDN seam (same class as the prefill fla + conv1d
+            # seams): unrecorded launch between segments; replay job re-runs.
+            from freetoken.engine.piecewise import (
+                capture_seam as _seam_d,
+                piecewise_capture_active as _pw_active_d,
             )
+
+            if (_pw_active_d() and __import__("os").environ.get(
+                    "FREETOKEN_SPEC_PIECEWISE_GDN", "0") in {"1", "true", "yes"}):
+                _seam_d(self.layer_id, (q, k, v, a, b), job=_decode_call)
+            core_out = _decode_call()
         else:
             mixed = self._conv_prefill(
                 conv_in, pool, fla.cu_seqlens, fla.cache_indices, fla.has_initial_state)
