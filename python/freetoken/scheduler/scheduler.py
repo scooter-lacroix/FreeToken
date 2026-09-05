@@ -819,8 +819,9 @@ class Scheduler(SchedulerIOMixin):
             _snap12 = self._spec_entry_snap
             _pr12 = self.cache_manager.page_table[req.table_idx]
 
-            def _tap12():
-                pool.restore_slot(slot, _snap12)
+            def _tap12(do_restore=True):
+                if do_restore:
+                    pool.restore_slot(slot, _snap12)
                 with torch.cuda.stream(torch.cuda.current_stream()):
                     vr.replay_step(z_ids=z_dev.to(self.device), slot=slot,
                                    L=L, page_row=_pr12,
@@ -830,15 +831,20 @@ class Scheduler(SchedulerIOMixin):
                         [int(v) for v in vr.logits_out.argmax(-1)
                          .reshape(-1).tolist()[:4]])
 
+            # ladder: (1) plain replay (no restore) x2, (2) restore+replay
+            _n0, _r0 = _tap12(do_restore=False)
+            _n1, _r1 = _tap12(do_restore=False)
             _a, _ra = _tap12()
             _b, _rb = _tap12()
-            _c, _rc = _tap12()
             _d12 = {d: round((_a[d].float() - _b[d].float()).abs().max().item(), 3)
                     for d in _a}
             _d23 = {d: round((_b[d].float() - _c[d].float()).abs().max().item(), 3)
                     for d in _b}
-            print(f"[R12D] L={L} r1={_ra} r2={_rb} r3={_rc} "
-                  f"r1r2={_d12} r2r3={_d23} prod_rows={rows[:4]}", flush=True)
+            _d01 = {d: round((_n0[d].float() - _n1[d].float()).abs().max().item(), 3)
+                    for d in _n0}
+            print(f"[R12D] L={L} RAW r0={_r0} r1={_r1} rawdiff={_d01} | "
+                  f"REST r1={_ra} r2={_rb} rstdiff={_d12} prod={rows[:4]}",
+                  flush=True)
             pool.restore_slot(slot, _snap12)
 
 
