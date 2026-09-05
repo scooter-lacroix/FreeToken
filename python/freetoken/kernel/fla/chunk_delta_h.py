@@ -20,6 +20,7 @@ from freetoken.kernel.fla.utils import (
 )
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
+_PERSIST_H_CACHE: dict = {}
 _HSTASH: list = []
 CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
@@ -322,9 +323,30 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, V, K)
+    # PERSIST_H (FREETOKEN_SPEC_PERSIST_H=1): allocate h (and v_new) ONCE
+    # per shape and reuse forever. Under verify-graph capture the reused
+    # tensors were created during the first eager warmup (REGULAR allocator,
+    # outside the graph pool), so the captured launches target stable
+    # addresses whose bytes also persist after replay — fixing the
+    # never-refresh class (HSTASH changed_idx=[]: the wrapper-local pool
+    # buffers froze at capture and every in-graph reader saw stale bytes).
+    import os as _os_ph
 
-    v_new = torch.empty_like(u) if save_new_value else None
+    if _os_ph.environ.get("FREETOKEN_SPEC_PERSIST_H", "0") in {"1", "true", "yes"}:
+        _key = (tuple(u.shape), tuple(k.shape), H, V, K, k.device.index, u.dtype)
+        _c = _PERSIST_H_CACHE.get(_key)
+        if _c is None:
+            _c = (k.new_empty(B, NT, H, V, K),
+                  torch.empty_like(u) if save_new_value else None)
+            _PERSIST_H_CACHE[_key] = _c
+        h = _c[0]
+        v_new = _c[1] if save_new_value else None
+        if v_new is None and save_new_value:
+            v_new = torch.empty_like(u)
+            _PERSIST_H_CACHE[_key] = (h, v_new)
+    else:
+        h = k.new_empty(B, NT, H, V, K)
+        v_new = torch.empty_like(u) if save_new_value else None
 
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
