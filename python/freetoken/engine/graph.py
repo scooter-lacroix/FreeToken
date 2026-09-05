@@ -317,6 +317,52 @@ class VerifyGraphRunner:
                     print(f"[vr-selftest] B eager_vs_eager maxdiff={_d_ee:.3f} "
                           f"(determinism control)", flush=True)
                     _replay_cmp(_ref, _rt, "L66both")
+                    # KVSPLIT (FREETOKEN_SPEC_KVSPLIT=1): at L=66, compare the
+                    # KV rows each side WRITES through out_loc (staged to the
+                    # dummy req's scratch pages, one per block row). Stored rows
+                    # differ => the STORE side under capture; identical => the
+                    # GATHER-side read is the corruption.
+                    if _os_dbg.environ.get(
+                            "FREETOKEN_SPEC_KVSPLIT", "0") == "1":
+                        _kvc = attn_backend.kvcache
+                        _kc = _vc = None
+                        for _li in range(1, 8):  # layer 0 is GDN; first full-attn
+                            try:
+                                _kc = _kvc.k_cache(_li)
+                                _vc = _kvc.v_cache(_li)
+                                break
+                            except KeyError:
+                                continue
+                        assert _kc is not None, "no paged-KV layer in 1..7"
+                        _kc2 = _kc.view(-1, _kc.shape[-2], _kc.shape[-1])
+                        _vc2 = _vc.view(-1, _vc.shape[-2], _vc.shape[-1])
+                        # out_loc is unstaged here (zeros): every block row
+                        # collapses onto row 0, last-write-wins — comparing
+                        # each side's final row-0 write still discriminates
+                        # store-side vs gather-side.
+                        _rows = self.out_loc.to(torch.long)
+
+                        def _snap_rows():
+                            return _kc2[_rows].clone(), _vc2[_rows].clone()
+
+                        _pool.restore_slot(0, _snap)
+                        _stage_l66()
+                        _rk0, _rv0 = _snap_rows()
+                        _eager_ref()
+                        _rkE, _rvE = _snap_rows()
+                        _kc2[_rows].copy_(_rk0)
+                        _vc2[_rows].copy_(_rv0)
+                        _pool.restore_slot(0, _snap)
+                        _stage_l66()
+                        graph.replay()
+                        torch.cuda.synchronize()
+                        _rkG, _rvG = _snap_rows()
+                        _dk = (_rkE.float() - _rkG.float()).abs().max().item()
+                        _dv = (_rvE.float() - _rvG.float()).abs().max().item()
+                        print(f"[KVSPLIT] L66 layer={_li} stored-KV maxdiff K={_dk:.4f} "
+                              f"V={_dv:.4f} -> "
+                              f"{'STORE-SIDE' if max(_dk, _dv) > 0.05 else 'GATHER-SIDE'}",
+                              flush=True)
                     # variant C: positions only (RoPE path)
                     _pool.restore_slot(0, _snap)
                     _stage_l66(do_pos=False)
