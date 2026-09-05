@@ -598,9 +598,27 @@ class Scheduler(SchedulerIOMixin):
 
         if _os_ph.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
             print(f"[phase] spec-replay uid={req.uid} L={L}", flush=True)
+        _eager_verify = _os_ph.environ.get(
+            "FREETOKEN_SPEC_EAGERVERIFY", "0") in {"1", "true", "yes"}
+        if _eager_verify:
+            # EAGER VERIFY ENGINE: the captured verify graph is a per-boot
+            # correctness lottery (exact or garbage-from-first-replay — bimodal,
+            # across 40+ commits, every config, cache wipes) while the eager
+            # verify forward is deterministic-correct at every depth measured
+            # (0.10-0.14s at 13.4k context). Run verify eagerly; the shared
+            # accept/crop/restore/emit/propose tail below is unchanged. The
+            # graphed path stays the default.
+            _t_ev = _time.perf_counter()
+            logits, rows, tk, tk_ids, tk_vals = self._spec_eager_verify(
+                req, gctx, z_dev, L, kn, slot)
+            self._spec_t_replay = (getattr(self, "_spec_t_replay", 0.0)
+                                   + _time.perf_counter() - _t_ev)
+            _sub = {"eagerverify": _time.perf_counter() - _t_ev}
+            _tr0 = _t_ev
         import os as _os_de
 
-        if (_os_de.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
+        if (not _eager_verify
+                and _os_de.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
                 and getattr(self, "_spec_n_de", 0) < 1 and L > 8000):
             # DEAGER: eager verify forward at TRUE depth, BEFORE the production
             # graph replay (which hangs the GPU at this depth even on a clean
@@ -862,7 +880,8 @@ class Scheduler(SchedulerIOMixin):
                   f"-> indices/content-dependent; proceeding to production replay",
                   flush=True)
             pool.restore_slot(slot, _snap_de)
-        if (getattr(self, "_spec_graph_dirty", False)
+        if (not _eager_verify
+                and getattr(self, "_spec_graph_dirty", False)
                 and __import__("os").environ.get(
                     "FREETOKEN_SPEC_NORECAP", "0") not in {"1", "true", "yes"}):
             # normal forwards ran since the last replay: re-capture BEFORE
@@ -881,8 +900,8 @@ class Scheduler(SchedulerIOMixin):
             vr = self._spec_recapture(pool, vr)
             self._spec_graph_dirty = False
         _sched_stream = torch.cuda.current_stream()
-        _sub = {}
-        for _attempt in range(2):
+        _sub = {} if not _eager_verify else _sub
+        for _attempt in range(0 if _eager_verify else 2):
             with torch.cuda.stream(_sched_stream):
                 self._spec_t_stage = getattr(self, "_spec_t_stage", 0.0) + (_time.perf_counter() - _t1)
                 _tr0 = _time.perf_counter()
@@ -925,27 +944,29 @@ class Scheduler(SchedulerIOMixin):
             # here -- on this ROCm stack it destabilizes live verify-graph
             # replays (the next step goes stale again -> re-capture loop).
             vr = self._spec_recapture(pool, vr)
-        with torch.cuda.stream(_sched_stream):
-            if int(vr.nan_out[0]) > 0:
-                raise RuntimeError(
-                    "verify graph NaN after re-capture; falling back to decode")
-            _t_a = _time.perf_counter()
-            logits = vr.logits_out
-            rows = [int(v) for v in logits.argmax(-1).reshape(-1).tolist()]
-            _sub["argmax"] = _sub.get("argmax", 0.0) + _time.perf_counter() - _t_a
-            _t_k = _time.perf_counter()
-            tk = _t.topk(logits.float(), 64, dim=-1)
-            _sub["topk"] = _sub.get("topk", 0.0) + _time.perf_counter() - _t_k
-            _t_l1 = _time.perf_counter()
-            tk_ids = tk.indices.tolist()
-            _sub["tolist1"] = _sub.get("tolist1", 0.0) + _time.perf_counter() - _t_l1
-            _t_l2 = _time.perf_counter()
-            tk_vals = tk.values.tolist()
-            _sub["tolist2"] = _sub.get("tolist2", 0.0) + _time.perf_counter() - _t_l2
-            self._spec_t_replay = getattr(self, "_spec_t_replay", 0.0) + (_time.perf_counter() - _tr0)
+        if not _eager_verify:
+            with torch.cuda.stream(_sched_stream):
+                if int(vr.nan_out[0]) > 0:
+                    raise RuntimeError(
+                        "verify graph NaN after re-capture; falling back to decode")
+                _t_a = _time.perf_counter()
+                logits = vr.logits_out
+                rows = [int(v) for v in logits.argmax(-1).reshape(-1).tolist()]
+                _sub["argmax"] = _sub.get("argmax", 0.0) + _time.perf_counter() - _t_a
+                _t_k = _time.perf_counter()
+                tk = _t.topk(logits.float(), 64, dim=-1)
+                _sub["topk"] = _sub.get("topk", 0.0) + _time.perf_counter() - _t_k
+                _t_l1 = _time.perf_counter()
+                tk_ids = tk.indices.tolist()
+                _sub["tolist1"] = _sub.get("tolist1", 0.0) + _time.perf_counter() - _t_l1
+                _t_l2 = _time.perf_counter()
+                tk_vals = tk.values.tolist()
+                _sub["tolist2"] = _sub.get("tolist2", 0.0) + _time.perf_counter() - _t_l2
+                self._spec_t_replay = getattr(self, "_spec_t_replay", 0.0) + (_time.perf_counter() - _tr0)
         import os as _os_dump
 
-        if (_os_dump.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
+        if (not _eager_verify
+                and _os_dump.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
                 and getattr(self, "_spec_n_dump", 0) < 12
                 and getattr(self, "_spec_n", 0) % 3 == 0
                 and L < 8000):
@@ -963,7 +984,8 @@ class Scheduler(SchedulerIOMixin):
 
         import os as _os_eab
 
-        if (_os_eab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
+        if (not _eager_verify
+                and _os_eab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
                 and getattr(self, "_spec_n_r12", 0) < 1 and L < 8000):
             # replay #1 vs #2 with IDENTICAL inputs and restored slot: any tap
             # depth that changes between them is pool-carry (the buffer whose
@@ -1000,7 +1022,8 @@ class Scheduler(SchedulerIOMixin):
                 torch.cuda.current_stream().synchronize()
         import os as _os_eab
 
-        if (_os_eab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
+        if (not _eager_verify
+                and _os_eab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
                 and getattr(self, "_spec_n_eab", 0) < 5 and L < 8000):
             # Eager-vs-graph rows probe: run the eager verify on the SAME
             # entry state and compare argmax rows. rows==erows while the
@@ -1092,7 +1115,9 @@ class Scheduler(SchedulerIOMixin):
         self._spec_t_fwd = getattr(self, "_spec_t_fwd", 0.0) + (_time.perf_counter() - _t1)
         self._spec_n_vr = getattr(self, "_spec_n_vr", 0) + 1
         self._spec_graph_dirty = False
-        taps = vr.taps
+        # eager engine: the forward's taps are in gctx (set during _forward);
+        # graphed path: the runner's captured tap buffers.
+        taps = (gctx.spec_taps or {}) if _eager_verify else vr.taps
 
         # R12D2 alternation moved BEFORE the production replay (see the DEAGER
         # block): at 13k+ the production replay can GPU-hang, which killed this
@@ -1251,6 +1276,45 @@ class Scheduler(SchedulerIOMixin):
                   f"prop={self._spec_t_prop/n*1000:.0f}ms vr_n={getattr(self, '_spec_n_vr', 0)} "
                   f"| sub(ms): {_subs}", flush=True)
         return True
+
+    def _spec_eager_verify(self, req, gctx, z_dev, L, kn, slot):
+        """EAGER verify engine (FREETOKEN_SPEC_EAGERVERIFY=1): one varlen
+        prefill-metadata forward over [context, z] — deterministic-correct at
+        every depth measured (shallow through 13.4k), unlike the captured
+        verify graph whose first-replay correctness is a per-boot lottery.
+        Returns (logits, rows, tk, tk_ids, tk_vals); the forward's DFlash
+        taps land in gctx.spec_taps for the next propose. The slot must be at
+        its ENTRY state (the caller snapshots it); the shared accept tail's
+        partial-accept restore handles rollback exactly as the graphed path."""
+        import torch as _t
+
+        from freetoken.attention.linear import FLAMetadata as _FLA
+        from freetoken.core import Batch as _B, Req as _R
+
+        _vrq = _R(
+            input_ids=_t.cat([req.input_ids[:L], z_dev]),
+            table_idx=req.table_idx, cached_len=L, output_len=0,
+            uid=req.uid + self.WARMUP_UID_BASE,
+            sampling_params=req.sampling_params, cache_handle=req.cache_handle)
+        _vrq.device_len = L + kn
+        _vrq.linear_slot_idx = slot
+        _vb = _B(reqs=[_vrq], phase="prefill")
+        _vb.padded_reqs = _vb.reqs
+        _vb.is_verify = True
+        _fi = self._prepare_batch(_vb)
+        _vb.fla_metadata = _FLA(
+            cu_seqlens=_t.tensor([0, kn], dtype=_t.int32, device=self.device),
+            cache_indices=_t.tensor([slot], dtype=_t.int32, device=self.device),
+            has_initial_state=None, fresh_state_indices=None)
+        with self.engine_stream_ctx:
+            self._restore_linear_states(_vb)
+            self._forward(_fi)
+            self.engine.stream.synchronize()
+        logits = gctx.spec_logits
+        rows = [int(v) for v in logits.argmax(-1).reshape(-1).tolist()]
+        tk = _t.topk(logits.float(), 64, dim=-1)
+        self.decode_manager.remove_req(_vrq)
+        return logits, rows, tk, tk.indices.tolist(), tk.values.tolist()
 
     def _spec_recapture(self, pool, vr):
         """Re-capture the verify graph on the current (scheduler/engine) stream
