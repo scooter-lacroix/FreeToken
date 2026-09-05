@@ -1073,9 +1073,57 @@ class Scheduler(SchedulerIOMixin):
                         continue
                     _tapd[_d] = round((_vg.float() - _tg.float().to(_vg.device))
                                       .abs().max().item(), 3)
-                print(f"[EAB] step={getattr(self, '_spec_n', 0)} L={L} "
-                      f"graph_rows={rows[:4]} eager_rows={_erows[:4]} "
-                      f"match={rows[:4] == _erows[:4]} tapdiff={_tapd}", flush=True)
+            print(f"[EAB] step={getattr(self, '_spec_n', 0)} L={L} "
+                  f"graph_rows={rows[:4]} eager_rows={_erows[:4]} "
+                  f"match={rows[:4] == _erows[:4]} tapdiff={_tapd}", flush=True)
+            # PROFSEQ: kernel-sequence diff REAL-staging vs DUMMY-staging eager
+            # forwards. The captured verify graph freezes the walk it recorded
+            # with CAPTURE-TIME (dummy) data; any host branch that decides on
+            # tensor DATA (not shape) bakes the dummy path and replays it on
+            # real data forever -- the per-boot stable-wrong lottery. Diffing
+            # the two kernel sequences names every data-dependent branch.
+            import os as _os_ps
+
+            if (_os_ps.environ.get("FREETOKEN_SPEC_PROFSEQ", "0")
+                    in {"1", "true", "yes"}):
+                from torch.profiler import ProfilerActivity, profile
+
+                from freetoken.core import Batch as _BPS, Req as _RPS
+
+                def _seq(tag, ids_t, cached):
+                    _vrps = _RPS(
+                        input_ids=ids_t, table_idx=req.table_idx,
+                        cached_len=cached, output_len=0,
+                        uid=req.uid + self.WARMUP_UID_BASE,
+                        sampling_params=req.sampling_params,
+                        cache_handle=req.cache_handle)
+                    _vrps.device_len = cached + kn
+                    _vrps.linear_slot_idx = slot
+                    _vbps = _BPS(reqs=[_vrps], phase="prefill")
+                    _vbps.padded_reqs = _vbps.reqs
+                    _vbps.is_verify = True
+                    _fips = self._prepare_batch(_vbps)
+                    _vbps.fla_metadata = _FLA(
+                        cu_seqlens=_t.tensor([0, kn], dtype=_t.int32,
+                                             device=self.device),
+                        cache_indices=_t.tensor(
+                            [slot], dtype=_t.int32, device=self.device),
+                        has_initial_state=None, fresh_state_indices=None)
+                    with profile(activities=[ProfilerActivity.CUDA]) as pr:
+                        with self.engine_stream_ctx:
+                            self._restore_linear_states(_vbps)
+                            self._forward(_fips)
+                            self.engine.stream.synchronize()
+                    self.decode_manager.remove_req(_vrps)
+                    with open(f"/tmp/seq_{tag}.txt", "w") as f:
+                        for ev in pr.key_averages():
+                            f.write(f"{ev.count}\t{ev.key}\n")
+                    print(f"[PROFSEQ] {tag}: {len(pr.key_averages())} kernels "
+                          f"-> /tmp/seq_{tag}.txt", flush=True)
+
+                _seq("real", _t.cat([req.input_ids[:L], z_dev]), L)
+                _seq("dummy", _t.zeros(kn, dtype=_t.int32), 0)
+                pool.restore_slot(slot, _esnap)
             # z-ablation (replaces the faulting EABX restage): replay a HYBRID
             # z = [current z[0]] + [prev z[1:]] at the current entry state and
             # compare row-0 against both the production rows and the previous

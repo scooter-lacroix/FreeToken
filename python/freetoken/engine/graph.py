@@ -220,6 +220,27 @@ class VerifyGraphRunner:
             return
         with torch.cuda.device(self.device):
             with torch.cuda.stream(_cs):
+                # CAPTURE STAGING (FREETOKEN_SPEC_CAPSTAGE=1): the monolithic
+                # walk runs with the buffers' ZERO initialization unless we
+                # pre-stage them -- and any host value derived from the staged
+                # DATA at launch (grid dims, split counts) then freezes the
+                # dummy-shape variant into the graph. Stage realistic maximum
+                # metadata so the captured kernels match replay-time shapes.
+                if __import__("os").environ.get(
+                        "FREETOKEN_SPEC_CAPSTAGE", "0") in {"1", "true", "yes"}:
+                    _L = self.indices.shape[0] - self.k - 64
+                    self.positions.copy_(
+                        torch.arange(_L, _L + self.k, dtype=torch.int32,
+                                     device=self.device))
+                    _dp0 = int(self.out_loc.shape[0])  # placeholder, overwritten
+                    self.out_loc.zero_()
+                    self.indices.zero_()
+                    self.kv_indptr[0].zero_()
+                    self.kv_indptr[1].fill_(_L + self.k)
+                    self.prefix_lens[0].fill_(_L)
+                    torch.cuda.synchronize()
+                    print(f"[vr-cap] CAPSTAGE staged L={_L} for warmups+capture",
+                          flush=True)
                 for _ in range(2):
                     with gctx.forward_batch(batch):
                         model.forward()
