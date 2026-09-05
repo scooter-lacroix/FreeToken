@@ -351,3 +351,64 @@ def test_lock_pins_the_snapshot_and_the_whole_kv_path(hyb):
     assert events(hyb)["evict_full.cascade"] == 1
     assert hyb.kv.in_use() == set() and hyb.second.in_use() == set()
     hyb.check()
+
+
+# --------------------------------------------------------------------------- donor protection
+def _direct_cache():
+    """A directly-constructed HybridRadixCache for donor semantics (the reference model
+    does not model donors; these tests pin the mid-flight KV protection contract)."""
+    from freetoken.kvcache.hybrid_radix_cache import HybridRadixCache
+
+    return HybridRadixCache(torch.device("cpu"), page_size=PAGE)
+
+
+def _t(seq: Sequence[int]) -> torch.Tensor:
+    return torch.tensor(seq, dtype=torch.int64)
+
+
+def test_donor_live_span_is_never_kv_freed():
+    """The pacing gate / admission evictions may take a mid-flight donor's GDN slot, but
+    NEVER its KV: the running request's page_table row still references those pages (no
+    commit locks by design), and freeing them returned live ids to the allocator -- row
+    aliasing plus the double-free dead-runs behind the negative page-usage ledger."""
+    c = _direct_cache()
+    chain = ids(1, 2)
+    pages = torch.arange(2 * PAGE, dtype=torch.int32)
+    c.insert(_t(chain), pages, mamba_value=11, donor=99)
+    c.live_donors.add(99)
+
+    er = c.evict_mamba(1)                      # pressure: take the snapshot
+    assert er.mamba_slots == [11]              # slot comes back...
+    assert len(er.kv_indices) == 0             # ...KV stays tree-owned
+    assert c.full_evictable_size == 2 * PAGE
+
+    er2 = c.evict_full(2 * PAGE)               # page pressure must refuse it too
+    assert len(er2.kv_indices) == 0
+    assert c.full_evictable_size == 2 * PAGE
+
+    c.live_donors.discard(99)                  # donor finished: span becomes reclaimable
+    er3 = c.evict_full(2 * PAGE)
+    assert sorted(er3.kv_indices.tolist()) == pages.tolist()
+    assert c.full_evictable_size == 0
+
+
+def test_donor_mark_survives_walk_splits_and_dedup_keeps_the_first():
+    c = _direct_cache()
+    long_chain = ids(1, 2, 3)
+    pages = torch.arange(3 * PAGE, dtype=torch.int32)
+    c.insert(_t(long_chain), pages, mamba_value=21, donor=99)
+    c.live_donors.add(99)
+
+    # A shorter insert walks a PREFIX of the node -> _walk splits it; both halves
+    # still cover the donor's original page span.
+    c.insert(_t(ids(1, 2)), pages[: 2 * PAGE], mamba_value=22, donor=99)
+    node = c.root.children[_t(ids(1))._key if False else next(iter(c.root.children))]
+    front, back = node, next(iter(node.children.values()))
+    assert front.donor == 99 and back.donor == 99
+
+    # Dedup (boundary already owns a snapshot) must NOT re-arm eviction under a
+    # different donor: the FIRST donor's liveness still governs the span.
+    c.insert(_t(long_chain), pages, mamba_value=23, donor=77)
+    c.live_donors.discard(99)                  # 99 finished, 77 never committed here
+    er = c.evict_mamba(1)
+    assert er.mamba_slots == [21]              # 22/23 were dedup-freed by the caller

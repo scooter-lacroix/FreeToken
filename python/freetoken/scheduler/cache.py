@@ -477,6 +477,10 @@ class CacheManager:
             return
 
         # Prefill chunk commit: donate the frozen snapshot at the tracked ×64 boundary.
+        # Register the running req as a live donor FIRST (idempotent): everything this
+        # commit inserts is mid-flight -- the req's page_table row still references
+        # those pages, so eviction must tombstone-not-free their KV until finish.
+        self.prefix_cache.live_donors.add(req.uid)
         # Paced: only donate when the snapshot cache has room, so the commit's replacement
         # alloc never triggers evict_mamba -- un-paced, a long prompt donates at every ×64
         # boundary (~63/request), the replacement allocs drain the pool, and evict_mamba
@@ -544,7 +548,7 @@ class CacheManager:
         if pool.num_free_slots >= 1:
             replacement = pool.alloc(1)[0]
         prefix_len, mamba_exist = self.prefix_cache.insert(
-            req.input_ids[:L], page_indices[:L], frozen)
+            req.input_ids[:L], page_indices[:L], frozen, donor=req.uid)
         # NO dedup free here, by construction: prefix_len (the insert's walked boundary) is a
         # boundary of LIVE tree nodes, so [0, prefix_len) is fully tree-owned -- either
         # canonical pages this request matched at admission, or its own earlier commits'
@@ -670,7 +674,9 @@ class CacheManager:
     def _free_req_slots(self, req: Req, keep_live: bool = False) -> None:
         """Return a finished request's GDN pool slots: both ping-pong slots, plus the live slot
         unless it was donated to the tree. Idempotent -- clears the refs so a re-entry frees
-        nothing (defense-in-depth against the abort/finish double-free, see _free_req_resources)."""
+        nothing (defense-in-depth against the abort/finish double-free, see _free_req_resources).
+        Also drops the req from the tree's live-donor set, re-arming eviction of the span it
+        committed (its page_table row is going away with the request)."""
         slots = list(req.mamba_ping_pong) if req.mamba_ping_pong is not None else []
         if not keep_live and req.linear_slot_idx is not None:
             slots.append(req.linear_slot_idx)
@@ -678,6 +684,8 @@ class CacheManager:
             self.linear_state_pool.free(slots)
         req.mamba_ping_pong = None
         req.linear_slot_idx = None
+        if self.is_hybrid:
+            self.prefix_cache.live_donors.discard(req.uid)
 
     def check_integrity(self) -> None:
         if self.is_hybrid:

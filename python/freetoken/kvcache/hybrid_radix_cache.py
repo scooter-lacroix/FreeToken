@@ -71,6 +71,12 @@ class HybridRadixCache:
         self.full_protected = 0
         self.mamba_evictable = 0     # number of live, unlocked snapshots
         self.mamba_protected = 0
+        # Uids of RUNNING requests with in-flight committed spans. A node whose
+        # ``donor`` is in here is mid-flight: the donor's page_table row still
+        # references its pages, so eviction may free the GDN slot (tombstone)
+        # but NEVER the KV. Maintained by CacheManager (add at chunk commit,
+        # discard at finish/abort via _free_req_slots).
+        self.live_donors: set[int] = set()
 
     # ---------------------------------------------------------------- match / insert
     def match_prefix(self, input_ids: torch.Tensor) -> HybridMatch:
@@ -104,11 +110,12 @@ class HybridRadixCache:
         return HybridMatch(self.empty, 0, None, self.root)
 
     def insert(self, input_ids: torch.Tensor, kv_indices: torch.Tensor,
-               mamba_value: int) -> Tuple[int, bool]:
+               mamba_value: int, donor: int | None = None) -> Tuple[int, bool]:
         """Insert the committed KV prefix and DONATE ``mamba_value`` at the (page-aligned) end
         boundary node. Returns (matched_prefix_len, mamba_exist). If the boundary node already
         owns a live snapshot, returns mamba_exist=True and does not attach (caller frees the
-        donated slot -- dedup)."""
+        donated slot -- dedup). ``donor`` (running request uid) marks the committed span
+        mid-flight: its KV is unfreeable until the donor leaves live_donors."""
         insert_len = align_down(len(input_ids), self.page_size)
         input_ids, kv_indices = input_ids[:insert_len], kv_indices[:insert_len]
         node, prefix_len = self._walk(input_ids)
@@ -125,6 +132,7 @@ class HybridRadixCache:
             new_node = RadixTreeNode(self.key_fn)
             new_node.set_key_value(input_ids[prefix_len:], kv_indices[prefix_len:].clone())
             new_node.set_parent(node)
+            new_node.donor = donor
             self.full_evictable += new_node.length
             new_node_len = new_node.length
             node = new_node
@@ -133,6 +141,7 @@ class HybridRadixCache:
         if node.mamba_value is not None:
             return prefix_len, True                 # dedup: caller frees its donated slot
         node.mamba_value = mamba_value              # fills a fresh node or a tombstone
+        node.donor = donor                          # newest donor governs the span
         if node.mamba_ref_count == 0:
             self.mamba_evictable += 1
         import os as _os
@@ -192,6 +201,8 @@ class HybridRadixCache:
             node = heapq.heappop(leaves)
             if node.ref_count != 0 or not node.is_leaf() or node.is_root():
                 continue
+            if node.donor in self.live_donors:
+                continue  # mid-flight donor's committed KV: its row still points here
             freed += node.length
             kv.append(node.value)
             self.full_evictable -= node.length
@@ -214,13 +225,19 @@ class HybridRadixCache:
             node = heapq.heappop(cands)
             if node.mamba_value is None or node.mamba_ref_count != 0 or node.is_root():
                 continue
-            if node.is_leaf() and node.ref_count == 0:
+            if (node.is_leaf() and node.ref_count == 0
+                    and node.donor not in self.live_donors):
                 kv.append(node.value)
                 self.full_evictable -= node.length
                 self._free_node_mamba(node, mamba)
                 freed += 1
                 self._cascade_tombstone_leaves(self._unlink(node), kv)
             else:
+                # Internal / locked-KV / donor-live leaf: free the SLOT only.
+                # A donor-live leaf's KV pages are still referenced by the
+                # running request's page_table row (no commit locks by design,
+                # 4da3ac3) -- freeing them returned live ids to the allocator
+                # (row aliasing; the [audit] dead-run double-frees).
                 self._free_node_mamba(node, mamba)  # tombstone internal (or locked-KV) node
                 freed += 1
         import os as _os
@@ -315,7 +332,8 @@ class HybridRadixCache:
         _iteratively_delete_tombstone_leaf). Returns (highest surviving ancestor, freed_tokens)."""
         freed = 0
         while (parent.mamba_value is None and parent.is_leaf()
-               and parent.ref_count == 0 and not parent.is_root()):
+               and parent.ref_count == 0 and not parent.is_root()
+               and parent.donor not in self.live_donors):
             kv_out.append(parent.value)
             self.full_evictable -= parent.length
             freed += parent.length

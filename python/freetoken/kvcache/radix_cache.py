@@ -34,6 +34,16 @@ class RadixTreeNode:
         self.mamba_value: int | None = None
         self.mamba_ref_count: int = 0
 
+        # Hybrid radix donor ownership: uid of the RUNNING request whose
+        # committed span these pages came from (set at chunk-commit insert;
+        # dropped from the tree's live_donors set when the request finishes).
+        # Eviction consults live_donors: a mid-flight donor's page_table row
+        # still points at these pages, so their KV is NOT freeable until the
+        # donor is done -- freeing them returns live ids to the allocator
+        # (row aliasing + double-free dead-runs). split_at propagates to both
+        # halves: the value span partitions, and either half is still donor-live.
+        self.donor: int | None = None
+
         # SWA second currency (SWARadixCache). Unlike the GDN snapshot above, SWA stores NO
         # separate slot: ``value`` (full-pool page indices) is canonical and the swa KV is
         # reached via the pool's full->swa mapping. ``swa_tombstone`` marks that the swa KV for
@@ -92,6 +102,9 @@ class RadixTreeNode:
         new_node.set_key_value(self._key[:pos], self._value[:pos])
         new_node.set_parent(parent)
         new_node.ref_count = self.ref_count
+        # Donor ownership covers the whole original span: both halves stay
+        # mid-flight for the donor's running page_table row.
+        new_node.donor = self.donor
         # SWA: a tombstone covers all the node's tokens, so both halves inherit it; both halves
         # stay within a locked window, so the swa lock copies; the window-boundary uuid migrates
         # to the root-side (prefix) node and is cleared on the suffix (matches sglang _split_node).
