@@ -967,6 +967,9 @@ class Scheduler(SchedulerIOMixin):
                 self._spec_t_replay = getattr(self, "_spec_t_replay", 0.0) + (_time.perf_counter() - _tr0)
         import os as _os_dump
 
+        _sf = _os_dump.environ.get("FREETOKEN_SPEC_STEPFENCE", "")
+        if _sf == "postconsume":
+            torch.cuda.synchronize()
         if (not _eager_verify
                 and _os_dump.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
                 and getattr(self, "_spec_n_dump", 0) < 12
@@ -1284,6 +1287,8 @@ class Scheduler(SchedulerIOMixin):
         if not finished:
             self.token_pool[req.table_idx, L + a + 1] = _t.tensor(
                 [bonus], dtype=_t.int32, device=self.device)
+            if _sf == "postemit":
+                torch.cuda.synchronize()
             _t3 = _time.perf_counter()
             taps_row = {d: t[a] for d, t in taps.items()}
             emb_row, mask_row = gctx.spec_embed(bonus)
@@ -1304,6 +1309,8 @@ class Scheduler(SchedulerIOMixin):
                     torch.tensor(tk_vals[a], dtype=torch.float32),
                     embed_row=emb_row, mask_row=mask_row)
             self._spec_t_prop = getattr(self, "_spec_t_prop", 0.0) + _time.perf_counter() - _t3
+            if _sf == "postpropose":
+                torch.cuda.synchronize()
             if full:
                 nxt = [bonus] + picks[1:]
             else:
