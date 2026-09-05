@@ -148,9 +148,26 @@ class Qwen3_5GatedDeltaNet(BaseOP):
         # illegal inside the verify-graph capture). Fixed-shape verify batches
         # bake the constant; prefill callers pass their known max extend.
         _mq = getattr(getattr(get_global_ctx().batch, "attn_metadata", None), "max_q_len", None)
-        out = causal_conv1d_varlen(x, self._conv_weight(), pool.conv_states[li],
-                                   cu_seqlens, cache_indices, has_initial_state,
-                                   batch=None, max_seq_len=_mq)
+
+        def _conv_call():
+            return causal_conv1d_varlen(
+                x, self._conv_weight(), pool.conv_states[li],
+                cu_seqlens, cache_indices, has_initial_state,
+                batch=None, max_seq_len=_mq)
+
+        # PIECEWISE-GDN seam (same class as the fla seam): the conv1d triton
+        # launch runs UNRECORDED between graph segments during a piecewise
+        # capture (Triton argument staging would freeze its conv-state reads
+        # — the residual after the fla seam); the replay job re-runs it.
+        from freetoken.engine.piecewise import (
+            capture_seam as _seam,
+            piecewise_capture_active as _pw_active,
+        )
+
+        if (_pw_active() and __import__("os").environ.get(
+                "FREETOKEN_SPEC_PIECEWISE_GDN", "0") in {"1", "true", "yes"}):
+            _seam(self.layer_id, (x,), job=_conv_call)
+        out = _conv_call()
         return out.transpose(0, 1)  # [total, conv_dim]
 
     def _conv_decode(self, conv_in: torch.Tensor, table_idx: torch.Tensor, pool) -> torch.Tensor:
