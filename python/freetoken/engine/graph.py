@@ -226,12 +226,38 @@ class VerifyGraphRunner:
 
                     if _moe_cache is not None:
                         _moe_cache.suppress_inline_copy = True
+                    # CAP-FP (FREETOKEN_SPEC_CAPFP=1): fingerprint the pool GDN
+                    # state across the capture walk — the unrecorded eager conv/
+                    # fla calls advance conv+recurrent states IN PLACE; if the
+                    # post-capture state != pre-capture state, every replay
+                    # starts from a shifted GDN state (the residual signature).
+                    import hashlib as _hl_fp
+
+                    import os as _os_fp
+
+                    _fp_on = _os_fp.environ.get(
+                        "FREETOKEN_SPEC_CAPFP", "0") in {"1", "true", "yes"}
+                    _pl_fp = get_global_ctx().linear_state_pool
+
+                    def _ph():
+                        return (_hl_fp.md5(
+                            _pl_fp.conv_states.detach().float().cpu()
+                            .numpy().tobytes()).hexdigest()[:8],
+                            _hl_fp.md5(
+                                _pl_fp.recurrent_states.detach().float().cpu()
+                                .numpy().tobytes()).hexdigest()[:8])
+
+                    _pre_fp = _ph() if _fp_on else None
                     try:
                         cap = PiecewiseCapture(_cs)
                         cap.capture(lambda: self._forward_ctx(gctx, batch, model))
                     finally:
                         if _moe_cache is not None:
                             _moe_cache.suppress_inline_copy = False
+                    if _fp_on:
+                        _post_fp = _ph()
+                        print(f"[CAP-FP] pre={_pre_fp} post={_post_fp} "
+                              f"changed={_pre_fp != _post_fp}", flush=True)
                     torch.cuda.synchronize()
             self.pw_graphs = cap.graphs
             self.pw_seams = cap.seams
