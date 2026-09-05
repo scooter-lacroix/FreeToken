@@ -644,13 +644,195 @@ class Scheduler(SchedulerIOMixin):
                   f"t={_time_de.perf_counter() - _t0_de:.2f}s", flush=True)
             self.decode_manager.remove_req(_vrq)
             pool.restore_slot(slot, _snap_de)
+            # DEAGER3: eager forward with EXACTLY the graph's metadata
+            # (prefix-style TritonMetadata: indptr=[0,L+kn], prefix_lens=[L],
+            # q_to_req, max_q_len=k) instead of the prefill varlen metadata
+            # DEAGER used. Garbage here => the graph's metadata contract is
+            # wrong (something the prefix-extend path needs is not staged);
+            # correct here => the corruption is capture-specific (private-pool
+            # / buffer freezing inside the graph).
+            from freetoken.attention.triton import TritonMetadata as _TM
+            from freetoken.core import Batch as _B3, Req as _R3
+
+            _vrq3 = _R3(
+                input_ids=_t.cat([req.input_ids[:L], z_dev]),
+                table_idx=req.table_idx, cached_len=L, output_len=0,
+                uid=req.uid + self.WARMUP_UID_BASE,
+                sampling_params=req.sampling_params, cache_handle=req.cache_handle)
+            _vrq3.device_len = L + kn
+            _vrq3.linear_slot_idx = slot
+            _vb3 = _B3(reqs=[_vrq3], phase="prefill")
+            _vb3.padded_reqs = _vb3.reqs
+            _vb3.is_verify = True
+            _vb3.fla_metadata = _FLA(
+                cu_seqlens=_t.tensor([0, kn], dtype=_t.int32, device=self.device),
+                cache_indices=_t.tensor([slot], dtype=_t.int32, device=self.device),
+                has_initial_state=None, fresh_state_indices=None)
+            _fi3 = self._prepare_batch(_vb3)
+            _row3 = self.cache_manager.page_table[req.table_idx]
+            # capture the varlen metadata _prepare_batch just built, for the diff
+            _mv = _vb3.attn_metadata
+            _vb3.attn_metadata = _TM(
+                cu_seqlens_q_gpu=_t.tensor([0, kn], dtype=_t.int32,
+                                           device=self.device),
+                indptr=_t.tensor([0, L + kn], dtype=_t.int32,
+                                 device=self.device),
+                indices=_row3[: L + kn].contiguous(),
+                q_to_req=_t.zeros(kn, dtype=_t.int32, device=self.device),
+                q_positions=_t.arange(L, L + kn, dtype=_t.int32,
+                                      device=self.device),
+                is_decode=False,
+                prefix_lens=_t.tensor([L], dtype=_t.int32, device=self.device),
+                max_q_len=kn,
+                swa_indices=None)
+            _mg = _vb3.attn_metadata
+            _d3 = {}
+            for _f in ("cu_seqlens_q_gpu", "indptr", "q_to_req",
+                       "q_positions", "prefix_lens"):
+                _a3, _b3 = getattr(_mv, _f, None), getattr(_mg, _f, None)
+                if _a3 is None or _b3 is None:
+                    _d3[_f] = f"{_a3}/{_b3}"
+                else:
+                    _d3[_f] = (_a3.dtype == _b3.dtype
+                               and _a3.tolist() == _b3.tolist())
+            _ia, _ib = _mv.indices, _mg.indices
+            _d3["indices"] = (_ia.dtype == _ib.dtype and _ia.shape == _ib.shape
+                              and bool(_t.equal(_ia[:min(len(_ia), len(_ib))],
+                                                _ib[:min(len(_ia), len(_ib))])))
+            _d3.update(max_q_len=f"{getattr(_mv, 'max_q_len', '?')}/"
+                       f"{getattr(_mg, 'max_q_len', '?')}",
+                       is_decode=f"{_mv.is_decode}/{_mg.is_decode}",
+                       mv_len=f"{len(_mv.indptr) - 1}q/{len(_mv.indptr)}ptr "
+                              f"indices={len(_mv.indices)} "
+                              f"pos={len(_mv.q_positions)}")
+            print(f"[DEAGER3D] field-diff varlen-vs-staged: {_d3}", flush=True)
+            _extra3 = {}
+            for _f in ("attn_logits", "attn_lse", "num_kv_splits",
+                       "swa_indices"):
+                _xa = getattr(_mv, _f, "ABSENT")
+                _xb = getattr(_mg, _f, "ABSENT")
+                _extra3[_f] = (f"{None if _xa is None else (str(getattr(_xa, 'shape', _xa)) + str(getattr(_xa, 'dtype', '')))}"
+                               f"/{None if _xb is None else (str(getattr(_xb, 'shape', _xb)) + str(getattr(_xb, 'dtype', '')))}")
+            try:
+                import dataclasses as _dc3
+
+                _fields3 = [f.name for f in _dc3.fields(_mv)]
+            except Exception:
+                _fields3 = [a for a in dir(_mv) if not a.startswith("_")]
+            _extra3["all_fields"] = _fields3
+            print(f"[DEAGER3D] scratch-fields + full field list: {_extra3}",
+                  flush=True)
+            print(f"[DEAGER3] L={L} eager with GRAPH metadata ...", flush=True)
+            _t3_de = _time_de.perf_counter()
+            _r3_list = []
+            for _rep3 in range(2):
+                pool.restore_slot(slot, _snap_de)
+                with self.engine_stream_ctx:
+                    self._restore_linear_states(_vb3)
+                    self._forward(_fi3)
+                    self.engine.stream.synchronize()
+                _elog3 = gctx.spec_logits
+                _r3_list.append(
+                    [int(v) for v in _elog3.argmax(-1).reshape(-1).tolist()[:4]])
+            print(f"[DEAGER3] L={L} graphmeta_rows x2={_r3_list} "
+                  f"nan={int(torch.isnan(_elog3).sum())} "
+                  f"t={_time_de.perf_counter() - _t3_de:.2f}s "
+                  f"(varlen_ref={_erows[:4]})", flush=True)
+            self.decode_manager.remove_req(_vrq3)
+            pool.restore_slot(slot, _snap_de)
+            # R12D2 alternation, run BEFORE the production replay: at 13k+ the
+            # production replay itself may GPU-hang (ridge498/499), which killed
+            # this probe before it could ever run when it sat post-production.
+            # vr -> vr2 (own private pool) -> vr, entry restores between, eager
+            # rows as the reference. vr2 survives where vr hangs => per-graph
+            # pool reuse is the bug; vr2 also dies => graph-external shared
+            # state (GDN pool / stream). Markers name the replay that dies.
+            self._spec_n_r12d = 1
+            if getattr(self, "_spec_graph_dirty", False):
+                # Both graphs are STALE (the deep prefill's eager traffic since
+                # their captures) -- replaying a stale graph faults for the
+                # staleness, not the depth (ridge516: the ladder's vr#1 died
+                # this way before vr2 could run). Drop and re-capture BOTH so
+                # the ladder measures depth; production inherits the fresh
+                # pair (dirty flag cleared). Mirrors _spec_recapture's proven
+                # pre-capture state: clean GDN padding slot, old pools freed.
+                print("[R12D2] stale graphs (prefill traffic) -> re-capturing "
+                      "vr + vr2", flush=True)
+                _k12 = vr.k
+                _gr12 = self.engine.graph_runner
+                _gr12.verify_runner = None
+                _gr12.verify_runner2 = None
+                del vr
+                import gc as _gc12
+
+                _gc12.collect()
+                _ps12 = pool.padding_slot
+                pool.conv_states[:, _ps12].zero_()
+                pool.recurrent_states[:, _ps12].zero_()
+                _gr12._capture_verify(_k12, self.engine.model,
+                                      stream=torch.cuda.current_stream())
+                vr = _gr12.verify_runner
+                self._spec_graph_dirty = False
+                print("[R12D2] re-capture done (vr + vr2 fresh)", flush=True)
+                # Expert-residency control: the verify graph FREEZES its MoE
+                # expert-slot reads at capture time, but the recapture's own
+                # dummy-forward warmups just reordered the LRU -- replay #1 may
+                # read evicted slots. Run one EAGER verify (re-ensures z's
+                # experts) and compare: replays turning correct after the
+                # rewarm convict the frozen-expert-read mechanism.
+                _t0_rw = _time_de.perf_counter()
+                pool.restore_slot(slot, _snap_de)
+                with self.engine_stream_ctx:
+                    self._restore_linear_states(_vb)
+                    self._forward(_fi)
+                    self.engine.stream.synchronize()
+                _rw_rows = [int(v) for v in gctx.spec_logits.argmax(-1)
+                            .reshape(-1).tolist()[:4]]
+                print(f"[R12D2] post-recapture eager rewarm rows={_rw_rows} "
+                      f"t={_time_de.perf_counter() - _t0_rw:.2f}s "
+                      f"(ref={_erows[:4]})", flush=True)
+                self.decode_manager.remove_req(_vrq)
+                pool.restore_slot(slot, _snap_de)
+            _vr2 = getattr(self.engine.graph_runner, "verify_runner2", None)
+            _pr12 = self.cache_manager.page_table[req.table_idx]
+
+            def _tap_alt(runner, tag):
+                print(f"[R12D2] L={L} firing {tag} ...", flush=True)
+                pool.restore_slot(slot, _snap_de)
+                with torch.cuda.stream(torch.cuda.current_stream()):
+                    runner.replay_step(z_ids=z_dev.to(self.device), slot=slot,
+                                       L=L, page_row=_pr12,
+                                       stream=torch.cuda.current_stream())
+                    torch.cuda.current_stream().synchronize()
+                _r = [int(v) for v in runner.logits_out.argmax(-1)
+                      .reshape(-1).tolist()[:4]]
+                print(f"[R12D2] L={L} {tag} rows={_r} "
+                      f"nan={int(runner.nan_out[0])}", flush=True)
+                return _r
+
+            if _vr2 is not None:
+                _ra = _tap_alt(vr, "vr#1")
+                _rb = _tap_alt(_vr2, "vr2")
+                _rc = _tap_alt(vr, "vr#2")
+                _rd = _tap_alt(vr, "vr#3")
+                _re = _tap_alt(vr, "vr#4")
+                print(f"[R12D2] L={L} agree vr-vs-vr2={_ra == _rb} "
+                      f"vr12={_ra == _rc} vr23={_rc == _rd} vr34={_rd == _re} "
+                      f"eager={_erows[:4]}", flush=True)
+            else:
+                _tap_alt(vr, "vr#1(no-vr2)")
+            pool.restore_slot(slot, _snap_de)
             # DEAGER2: replay the captured graph with DEEP bounds (kv_indptr=L+k,
-            # prefix_lens=L, positions L..L+k) but every gathered page aimed at the
-            # engine's GUARD page -- valid memory, garbage content. Hangs => the
-            # loop bound alone kills the captured kernel; clean => the trigger is
-            # the real indices/KV content.
-            _guard = int(self.cache_manager.page_table[
-                self.engine.dummy_req.table_idx][0].item())
+            # prefix_lens=L, positions L..L+k) but every gathered page aimed at ONE
+            # VALID page -- the dummy row's [0] is the one-past-end SENTINEL
+            # (num_pages), which faulted ridge515 before the alternation could
+            # run; clamp to the last real page (valid memory, garbage content).
+            # Hangs => the loop bound alone kills the captured kernel; clean =>
+            # the trigger is the real indices/KV content.
+            _guard = min(
+                int(self.cache_manager.page_table[
+                    self.engine.dummy_req.table_idx][0].item()),
+                int(self.cache_manager.num_pages) - 1)
             _k8 = vr.k
             vr.input_ids.copy_(z_dev.to(self.device))
             vr.positions.copy_(_t.arange(L, L + _k8, dtype=_t.int32,
@@ -661,7 +843,7 @@ class Scheduler(SchedulerIOMixin):
             vr.kv_indptr[1].fill_(L + _k8)
             vr.prefix_lens[0].fill_(L)
             vr.linear_idx[0].fill_(slot)
-            print(f"[DEAGER2] L={L} guard-page deep replay (guard={_guard}) ...",
+            print(f"[DEAGER2] L={L} valid-page deep replay (page={_guard}) ...",
                   flush=True)
             _t2_de = _time_de.perf_counter()
             with torch.cuda.stream(torch.cuda.current_stream()):
@@ -904,45 +1086,10 @@ class Scheduler(SchedulerIOMixin):
         self._spec_graph_dirty = False
         taps = vr.taps
 
-        import os as _os_r12
-
-        if (_os_r12.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
-                and getattr(self, "_spec_n_r12d", 0) < 1 and L > 8000):
-            # R12D2 alternation: restore+replay vr -> vr2 (own private pool) ->
-            # vr again, same staged z/L/slot. Prior ladder: a second replay of
-            # the SAME graph in one step faults (restored) or wedges (raw).
-            # If the alternated ladder completes and rows agree, per-graph-pool
-            # reuse is the bug; if vr2's replay also dies, the destabilizer is
-            # graph-external (shared GDN pool / stream state). Pre-replay
-            # markers name the exact replay that dies.
-            self._spec_n_r12d = 1
-            _snap12 = self._spec_entry_snap
-            _pr12 = self.cache_manager.page_table[req.table_idx]
-            _vr2 = getattr(self.engine.graph_runner, "verify_runner2", None)
-
-            def _tap_alt(runner, tag):
-                print(f"[R12D2] L={L} firing {tag} ...", flush=True)
-                pool.restore_slot(slot, _snap12)
-                with torch.cuda.stream(torch.cuda.current_stream()):
-                    runner.replay_step(z_ids=z_dev.to(self.device), slot=slot,
-                                       L=L, page_row=_pr12,
-                                       stream=torch.cuda.current_stream())
-                    torch.cuda.current_stream().synchronize()
-                _r = [int(v) for v in runner.logits_out.argmax(-1)
-                      .reshape(-1).tolist()[:4]]
-                print(f"[R12D2] L={L} {tag} rows={_r} "
-                      f"nan={int(runner.nan_out[0])}", flush=True)
-                return _r
-
-            if _vr2 is not None:
-                _ra = _tap_alt(vr, "vr#1")
-                _rb = _tap_alt(_vr2, "vr2")
-                _rc = _tap_alt(vr, "vr#2")
-                print(f"[R12D2] L={L} agree vr-vs-vr2={_ra == _rb} "
-                      f"vr-vs-vr={_ra == _rc} prod={rows[:4]}", flush=True)
-            else:
-                _ra = _tap_alt(vr, "vr#1(no-vr2)")
-            pool.restore_slot(slot, _snap12)
+        # R12D2 alternation moved BEFORE the production replay (see the DEAGER
+        # block): at 13k+ the production replay can GPU-hang, which killed this
+        # probe when it sat here. Its counter (_spec_n_r12d) is consumed by the
+        # pre-production ladder, so this site is intentionally empty now.
 
 
         # Retry-block protocol: on partial accept (a < kn-1) revert the GDN
