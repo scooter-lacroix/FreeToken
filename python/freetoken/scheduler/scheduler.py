@@ -598,6 +598,99 @@ class Scheduler(SchedulerIOMixin):
 
         if _os_ph.environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
             print(f"[phase] spec-replay uid={req.uid} L={L}", flush=True)
+        import os as _os_de
+
+        if (_os_de.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
+                and getattr(self, "_spec_n_de", 0) < 1 and L > 8000):
+            # DEAGER: eager verify forward at TRUE depth, BEFORE the production
+            # graph replay (which hangs the GPU at this depth even on a clean
+            # page ledger -- ridge498). Eager uses prefill-style varlen metadata
+            # (known-good at depth); the graph stages decode-style prefix
+            # metadata. Clean here => kernels exonerated, hang is specific to
+            # the graphed prefix-extend path; hang here too => kernel-level.
+            self._spec_n_de = 1
+            import time as _time_de
+
+            from freetoken.attention.linear import FLAMetadata as _FLA
+            from freetoken.core import Batch as _B, Req as _R
+
+            _t0_de = _time_de.perf_counter()
+            _snap_de = self._spec_entry_snap
+            pool.restore_slot(slot, _snap_de)
+            _vrq = _R(
+                input_ids=_t.cat([req.input_ids[:L], z_dev]),
+                table_idx=req.table_idx, cached_len=L, output_len=0,
+                uid=req.uid + self.WARMUP_UID_BASE,
+                sampling_params=req.sampling_params, cache_handle=req.cache_handle)
+            _vrq.device_len = L + kn
+            _vrq.linear_slot_idx = slot
+            _vb = _B(reqs=[_vrq], phase="prefill")
+            _vb.padded_reqs = _vb.reqs
+            _fi = self._prepare_batch(_vb)
+            _vb.is_verify = True
+            _vb.fla_metadata = _FLA(
+                cu_seqlens=_t.tensor([0, kn], dtype=_t.int32, device=self.device),
+                cache_indices=_t.tensor([slot], dtype=_t.int32, device=self.device),
+                has_initial_state=None, fresh_state_indices=None)
+            print(f"[DEAGER] L={L} kn={kn} firing eager verify ...", flush=True)
+            with self.engine_stream_ctx:
+                self._restore_linear_states(_vb)
+                self._forward(_fi)
+                self.engine.stream.synchronize()
+            _elog = gctx.spec_logits
+            _erows = [int(v) for v in _elog.argmax(-1).reshape(-1).tolist()[:4]]
+            print(f"[DEAGER] L={L} eager_rows={_erows} "
+                  f"nan={int(torch.isnan(_elog).sum())} "
+                  f"t={_time_de.perf_counter() - _t0_de:.2f}s", flush=True)
+            self.decode_manager.remove_req(_vrq)
+            pool.restore_slot(slot, _snap_de)
+            # DEAGER2: replay the captured graph with DEEP bounds (kv_indptr=L+k,
+            # prefix_lens=L, positions L..L+k) but every gathered page aimed at the
+            # engine's GUARD page -- valid memory, garbage content. Hangs => the
+            # loop bound alone kills the captured kernel; clean => the trigger is
+            # the real indices/KV content.
+            _guard = int(self.cache_manager.page_table[
+                self.engine.dummy_req.table_idx][0].item())
+            _k8 = vr.k
+            vr.input_ids.copy_(z_dev.to(self.device))
+            vr.positions.copy_(_t.arange(L, L + _k8, dtype=_t.int32,
+                                         device=self.device))
+            vr.out_loc.fill_(_guard)
+            vr.indices[: L + _k8].fill_(_guard)
+            vr.kv_indptr[0].zero_()
+            vr.kv_indptr[1].fill_(L + _k8)
+            vr.prefix_lens[0].fill_(L)
+            vr.linear_idx[0].fill_(slot)
+            print(f"[DEAGER2] L={L} guard-page deep replay (guard={_guard}) ...",
+                  flush=True)
+            _t2_de = _time_de.perf_counter()
+            with torch.cuda.stream(torch.cuda.current_stream()):
+                vr.graph.replay()
+                torch.cuda.current_stream().synchronize()
+            print(f"[DEAGER2] L={L} CLEAN rows="
+                  f"{[int(v) for v in vr.logits_out.argmax(-1).reshape(-1).tolist()[:4]]} "
+                  f"nan={int(vr.nan_out[0])} t={_time_de.perf_counter() - _t2_de:.2f}s "
+                  f"-> indices/content-dependent; proceeding to production replay",
+                  flush=True)
+            pool.restore_slot(slot, _snap_de)
+        if (getattr(self, "_spec_graph_dirty", False)
+                and __import__("os").environ.get(
+                    "FREETOKEN_SPEC_NORECAP", "0") not in {"1", "true", "yes"}):
+            # normal forwards ran since the last replay: re-capture BEFORE
+            # replaying (the stale graph hard-faults -- a host-page access
+            # fault the NaN heal cannot catch). Re-landed from b9edb46: the
+            # 63a890c wholesale revert kept this flag's set (post-normal-
+            # forward) and clear (post-replay) sites but LOST this consumer,
+            # so the second request's first spec replay faulted (ridge508:
+            # L=58 host-page fault after request 1's finish traffic).
+            # FREETOKEN_SPEC_NORECAP=1: A/B switch -- a mid-serving re-capture
+            # may itself bake garbage (0e7fe05: capturing verify after decode/
+            # warmup state poisoned logits), so the gate is suspect for the
+            # all-depths garbage class until exonerated.
+            print("[spec] normal traffic since last replay -> proactive re-capture",
+                  flush=True)
+            vr = self._spec_recapture(pool, vr)
+            self._spec_graph_dirty = False
         _sched_stream = torch.cuda.current_stream()
         _sub = {}
         for _attempt in range(2):
