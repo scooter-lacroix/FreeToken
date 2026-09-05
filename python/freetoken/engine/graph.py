@@ -427,6 +427,46 @@ class VerifyGraphRunner:
         gctx.spec_tap_dev = None
         gctx.spec_logits_sink = None  # eager forwards rebind as before
         gctx.spec_nan_sink = None
+        # WARMUP REPLAY (FREETOKEN_SPEC_WARMREPLAY=1): one replay with REAL
+        # page staging right after capture. Correlates 4/4 with a correct
+        # FIRST production replay (boots running the real-rows KVSPLIT probe
+        # — which does exactly this — always drew exact step-0s; without it,
+        # wrong from replay #1). The staging writes KV into scratch pages
+        # [66+k, 66+2k) and gathers [0, 66+k) — warmup-owned pages at boot;
+        # later captures leave harmless leftovers on scratch-range pages.
+        if __import__("os").environ.get(
+                "FREETOKEN_SPEC_WARMREPLAY", "0") in {"1", "true", "yes"}:
+            _k = self.k
+            _nk = 66 + _k
+            # one EAGER pass first, then the replay — mirroring the probe
+            # sequence that correlates 4/4 with exact step-0s. Hypothesis:
+            # the eager forward's prepare_metadata populates backend-shared
+            # metadata buffers that the captured graph reads (captured as
+            # views into them at capture time); cold buffers = garbage
+            # replay, warmed = exact.
+            self.input_ids.zero_()
+            with gctx.forward_batch(batch):
+                model.forward()
+            torch.cuda.synchronize()
+            self.positions.copy_(
+                torch.arange(66, 66 + _k, dtype=torch.int32,
+                             device=self.device))
+            self.out_loc.copy_(
+                torch.arange(_nk, _nk + _k, dtype=torch.int32,
+                             device=self.device))
+            self.indices[:_nk].copy_(
+                torch.arange(0, _nk, dtype=torch.int32, device=self.device))
+            self.kv_indptr[0].zero_()
+            self.kv_indptr[1].fill_(_nk)
+            self.prefix_lens[0].fill_(66)
+            self.linear_idx[0].zero_()
+            with torch.cuda.stream(self.replay_stream):
+                graph.replay()
+                self.replay_stream.synchronize()
+            if __import__("os").environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+                print(f"[vr-cap] warmup eager+replay done "
+                      f"(row0_top={int(self.logits_out[0].argmax())})",
+                      flush=True)
 
     @torch.inference_mode()
     def replay_step(self, *, z_ids, slot: int, L: int, page_row, stream):
