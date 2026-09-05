@@ -350,21 +350,28 @@ class VerifyGraphRunner:
                             _vc = _kvc.v_cache(_li)
                             _kc2 = _kc.view(-1, _kc.shape[-2], _kc.shape[-1])
                             _vc2 = _vc.view(-1, _vc.shape[-2], _vc.shape[-1])
-                            # CLEAN ROWS: out_loc -> k DISTINCT dummy-req pages
-                            # and indices -> the dummy row, so neither side
-                            # gathers a row it just wrote. All touched rows are
-                            # snapshotted and rewound between runs.
-                            _drow = get_global_ctx().page_table[
-                                dummy_req.table_idx]
+                            # REAL ROWS (artifact #3 fix): the dummy row is
+                            # SENTINEL-filled (fill_(num_tokens)) — staging
+                            # from it gathered one-past-end rows (UB, the
+                            # entire in-server control-wobble family). Stage
+                            # onto REAL warmup-allocated pages instead:
+                            # indices -> pages [0, 66+k), out_loc -> pages
+                            # [66+k, 66+2k). All touched rows snapshotted and
+                            # rewound between runs; gather and store disjoint.
+                            _nk = 66 + self.k
 
                             def _stage_clean():
                                 _stage_l66()
-                                self.out_loc.copy_(_drow[: self.k])
-                                _nk = 66 + self.k
-                                self.indices[:_nk].copy_(_drow[:_nk])
+                                self.indices[:_nk].copy_(
+                                    torch.arange(0, _nk, dtype=torch.int32,
+                                                 device=self.device))
+                                self.out_loc.copy_(
+                                    torch.arange(_nk, _nk + self.k,
+                                                 dtype=torch.int32,
+                                                 device=self.device))
 
-                            _rows = torch.unique(
-                                _drow[: 66 + self.k].to(torch.long))
+                            _rows = torch.arange(0, _nk + self.k,
+                                                 device=self.device)
 
                             def _snap_rows():
                                 return _kc2[_rows].clone(), _vc2[_rows].clone()
