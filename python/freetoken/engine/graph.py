@@ -182,6 +182,19 @@ class VerifyGraphRunner:
         # serving captures pass the scheduler's stream explicitly.
         _cs = stream if stream is not None else torch.cuda.Stream()
         self.replay_stream = _cs
+        _pace = __import__("os").environ.get("FREETOKEN_SPEC_PACE", "")
+        if _pace == "capture":
+            __import__("time").sleep(0.02)
+        elif _pace == "selftest":
+            # pace between each selftest cycle (the print-dense interval of
+            # the 5/5 passing boots)
+            class _Pacer:
+                def __init__(self):
+                    self.n = 0
+                def tick(self):
+                    self.n += 1
+                    __import__("time").sleep(0.005)
+            self._pace_ticks = _Pacer()
         _moe_cache = moe_cache
         if (_moe_cache is not None
                 and __import__("os").environ.get("FREETOKEN_SPEC_PIECEWISE", "0")
@@ -301,6 +314,7 @@ class VerifyGraphRunner:
                               f"tapdiff={_td}", flush=True)
 
                     # variant A: boot-dummy buffers
+                    self._pace_ticks.tick() if _pace == "selftest" else None
                     if "dummy" in _stv:
                         _ref, _rt = _eager_ref()
                         _replay_cmp(_ref, _rt, "dummy")
@@ -316,6 +330,7 @@ class VerifyGraphRunner:
                                                               device=self.device))
 
                     # variant B: both groups staged
+                    self._pace_ticks.tick() if _pace == "selftest" else None
                     if "l66both" in _stv:
                         _stage_l66()
                         _ref, _rt = _eager_ref()
@@ -417,12 +432,14 @@ class VerifyGraphRunner:
                         if _zi:
                             torch.empty, torch.empty_like = _e_empty, _e_el
                     # variant C: positions only (RoPE path)
+                    self._pace_ticks.tick() if _pace == "selftest" else None
                     if "pos" in _stv:
                         _pool.restore_slot(0, _snap)
                         _stage_l66(do_pos=False)
                         _ref, _rt = _eager_ref()
                         _replay_cmp(_ref, _rt, "pos_only")
                     # variant D: KV metadata only
+                    self._pace_ticks.tick() if _pace == "selftest" else None
                     if "kvmeta" in _stv:
                         _pool.restore_slot(0, _snap)
                         _stage_l66(do_kv=False)
@@ -494,6 +511,8 @@ class VerifyGraphRunner:
         self.kv_indptr[1].fill_(L + k)
         self.prefix_lens[0].fill_(L)
         self.linear_idx[0].fill_(slot)
+        if __import__("os").environ.get("FREETOKEN_SPEC_PACE", "") == "prereplay":
+            __import__("time").sleep(0.02)
         if self.pw_graphs is not None:
             self._replay_pw()
         else:

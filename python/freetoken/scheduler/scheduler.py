@@ -531,6 +531,8 @@ class Scheduler(SchedulerIOMixin):
                          sampling_params=req.sampling_params, cache_handle=req.cache_handle)
         _t_ap0 = _time.perf_counter()
         self.cache_manager.allocate_paged([_alloc_req])
+        if __import__("os").environ.get("FREETOKEN_SPEC_PACE", "") == "postalloc":
+            _time.sleep(0.02)
         self._t_pre_alloc = _time.perf_counter()
         self._spec_t_allocpg = getattr(self, "_spec_t_allocpg", 0.0) + (
             _time.perf_counter() - _t_ap0)
