@@ -1110,6 +1110,20 @@ class Scheduler(SchedulerIOMixin):
                 print(f"[RDIVE] graph-on-eager-state rows={_g2} "
                       f"eager={_erows[:4]} match={_g2 == _erows[:4]} "
                       f"prod={rows[:4]}", flush=True)
+                # first-diverging-layer: vr.taps (the DIVE replay's per-layer
+                # hidden states on the eager's own state) vs the eager's taps.
+                # Layers 1-2 are GDN; GDN divergence + stored-K exact convicts
+                # the GDN in-graph slot read.
+                _td2 = {}
+                for _d, _tg in (_etaps or {}).items():
+                    _vg = vr.taps.get(_d)
+                    if _vg is None:
+                        continue
+                    _td2[_d] = round(
+                        (_vg.float() - _tg.float().to(_vg.device))
+                        .abs().max().item(), 4)
+                print(f"[RDIVE] tapdiff graph-dive vs eager: {_td2}",
+                      flush=True)
                 # layer localization: stored-KV compare graph-vs-eager on the
                 # eager's own state, per full-attn layer — the layer whose
                 # stored rows already diverge names where the graph's compute
