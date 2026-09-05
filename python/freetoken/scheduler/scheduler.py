@@ -1110,6 +1110,32 @@ class Scheduler(SchedulerIOMixin):
                 print(f"[RDIVE] graph-on-eager-state rows={_g2} "
                       f"eager={_erows[:4]} match={_g2 == _erows[:4]} "
                       f"prod={rows[:4]}", flush=True)
+                # layer localization: stored-KV compare graph-vs-eager on the
+                # eager's own state, per full-attn layer — the layer whose
+                # stored rows already diverge names where the graph's compute
+                # first goes wrong (accumulating-intermediate class).
+                _kvc = self.engine.attn_backend.kvcache
+                for _li in (3, 7, 27):
+                    try:
+                        _kc = _kvc.k_cache(_li)
+                    except KeyError:
+                        continue
+                    _kc2 = _kc.view(-1, _kc.shape[-2], _kc.shape[-1])
+                    _r2 = vr.out_loc.to(torch.long)
+                    _gk = _kc2[_r2].clone()
+                    # eager wrote its block KV into these rows during its
+                    # forward; the graph replay overwrote them — rewind not
+                    # possible post-hoc, so compare against a FRESH eager run
+                    pool.restore_slot(slot, _esnap)
+                    _fi2 = self._prepare_batch(_vb)
+                    with self.engine_stream_ctx:
+                        self._restore_linear_states(_vb)
+                        self._forward(_fi2)
+                        self.engine.stream.synchronize()
+                    _ek = _kc2[_r2].clone()
+                    _dk = (_gk.float() - _ek.float()).abs().max().item()
+                    print(f"[RDIVE] layer={_li} stored-K after-graph vs "
+                          f"after-eager2 K maxdiff={_dk:.4f}", flush=True)
                 pool.restore_slot(slot, _esnap)
             # PROFSEQ: kernel-sequence diff REAL-staging vs DUMMY-staging eager
             # forwards. The captured verify graph freezes the walk it recorded
