@@ -98,8 +98,35 @@ class VerifyGraphRunner:
         # localizes whether the replay forward itself NaNs vs. the copy.
         self.nan_out = torch.zeros(2, dtype=torch.int32, device=device)
         self.graph = None
+        # Piecewise variant (FREETOKEN_SPEC_PIECEWISE=1): segments split at the
+        # MoE ensure/copy seams, host-driven expert fetches between replays --
+        # same contract as the decode graphs. A monolithic verify capture bakes
+        # whatever host-side miss copies fire DURING capture (suppress_inline_copy
+        # is not set there), so whether the graph is clean is a per-boot
+        # residency lottery (exact or stable-wrong + captured-copy host-page
+        # faults). Piecewise removes the lottery by construction.
+        self.pw_graphs = None
+        self.pw_seams = []
+        self.moe_cache = None
 
-    def capture(self, attn_backend, model, dummy_req, stream=None):
+    def _forward_ctx(self, gctx, batch, model):
+        with gctx.forward_batch(batch):
+            return model.forward()
+
+    def _replay_pw(self) -> None:
+        cache = self.moe_cache
+        cache.suppress_inline_copy = True
+        try:
+            self.pw_graphs[0].replay()
+            for i, layer_id in enumerate(self.pw_seams):
+                # Host-driven miss fetch for this layer, then the segment
+                # holding its expert GEMM (mirrors GraphRunner.replay).
+                cache.copy_missing_staged(layer_id)
+                self.pw_graphs[i + 1].replay()
+        finally:
+            cache.suppress_inline_copy = False
+
+    def capture(self, attn_backend, model, dummy_req, stream=None, moe_cache=None):
         import torch
 
         from freetoken.core import Batch, Context, get_global_ctx
@@ -155,6 +182,42 @@ class VerifyGraphRunner:
         # serving captures pass the scheduler's stream explicitly.
         _cs = stream if stream is not None else torch.cuda.Stream()
         self.replay_stream = _cs
+        _moe_cache = moe_cache
+        if (_moe_cache is not None
+                and __import__("os").environ.get("FREETOKEN_SPEC_PIECEWISE", "0")
+                in {"1", "true", "yes"}):
+            # PIECEWISE verify capture: warmups run eagerly (misses fetch for
+            # real, populating the cache for the capture batch's routing),
+            # then the captured walk runs with inline copies SUPPRESSED -- the
+            # MoE layer closes a segment at each ensure/copy seam and the
+            # runner replays segments with copy_missing_staged between them.
+            self.moe_cache = _moe_cache
+            with torch.cuda.device(self.device):
+                with torch.cuda.stream(_cs):
+                    for _ in range(2):
+                        with gctx.forward_batch(batch):
+                            model.forward()
+                    torch.cuda.synchronize()
+                    from freetoken.engine.piecewise import PiecewiseCapture
+
+                    _moe_cache.suppress_inline_copy = True
+                    try:
+                        cap = PiecewiseCapture(_cs)
+                        cap.capture(lambda: self._forward_ctx(gctx, batch, model))
+                    finally:
+                        _moe_cache.suppress_inline_copy = False
+                    torch.cuda.synchronize()
+            self.pw_graphs = cap.graphs
+            self.pw_seams = cap.seams
+            self.graph = None
+            if __import__("os").environ.get("FREETOKEN_SPEC_DBG", "0") == "1":
+                print(f"[vr-cap] piecewise verify captured: "
+                      f"{len(self.pw_graphs)} segments, seams={self.pw_seams}",
+                      flush=True)
+            gctx.spec_tap_dev = None
+            gctx.spec_logits_sink = None
+            gctx.spec_nan_sink = None
+            return
         with torch.cuda.device(self.device):
             with torch.cuda.stream(_cs):
                 for _ in range(2):
@@ -254,7 +317,10 @@ class VerifyGraphRunner:
         self.kv_indptr[1].fill_(L + k)
         self.prefix_lens[0].fill_(L)
         self.linear_idx[0].fill_(slot)
-        self.graph.replay()
+        if self.pw_graphs is not None:
+            self._replay_pw()
+        else:
+            self.graph.replay()
 
 
 def _determine_cuda_graph_bs(
@@ -469,7 +535,8 @@ class GraphRunner:
         hidden = int(getattr(_cfg, "hidden_size", 0) or 5120)
         vocab = int(getattr(_cfg, "vocab_size", 0) or 248320)
         vr = VerifyGraphRunner(k, self.max_seq_len, vocab, hidden, self.device, tap_layers)
-        vr.capture(self.attn_backend, model, self.dummy_req, stream=stream)
+        vr.capture(self.attn_backend, model, self.dummy_req, stream=stream,
+                   moe_cache=self.moe_offload_cache)
         self.verify_runner = vr
         logger.info_rank0(f"verify graph captured (k={k})")
 
@@ -487,7 +554,8 @@ class GraphRunner:
                 and getattr(self, "verify_runner2", None) is None):
             vr2 = VerifyGraphRunner(k, self.max_seq_len, vocab, hidden,
                                     self.device, tap_layers)
-            vr2.capture(self.attn_backend, model, self.dummy_req, stream=stream)
+            vr2.capture(self.attn_backend, model, self.dummy_req, stream=stream,
+                        moe_cache=self.moe_offload_cache)
             self.verify_runner2 = vr2
             logger.info_rank0("verify graph #2 captured (VR2 alternation probe)")
 
