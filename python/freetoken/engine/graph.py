@@ -245,6 +245,21 @@ class VerifyGraphRunner:
                     with gctx.forward_batch(batch):
                         model.forward()
                 torch.cuda.synchronize()
+                if __import__("os").environ.get(
+                        "FREETOKEN_SPEC_POOLISO", "0") in {"1", "true", "yes"}:
+                    # POOL-ISOLATION: unmap every freed warmup allocation before
+                    # the captured walk. If a captured kernel later reads a
+                    # FREED warmup address (the allocation-escape class), the
+                    # replay now FAULTS (deterministic) instead of silently
+                    # reading stale bytes — discriminates freed-read vs
+                    # live-but-wrong-read escapes.
+                    import gc as _gc_iso
+
+                    _gc_iso.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    print("[vr-cap] POOL-ISO: cache emptied pre-capture",
+                          flush=True)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=_cs):
                     with gctx.forward_batch(batch):
