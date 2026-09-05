@@ -1022,9 +1022,12 @@ class Scheduler(SchedulerIOMixin):
                 torch.cuda.current_stream().synchronize()
         import os as _os_eab
 
+        _eab_step = int(_os_eab.environ.get("FREETOKEN_SPEC_EABSTEP", "-1"))
         if (not _eager_verify
                 and _os_eab.environ.get("FREETOKEN_SPEC_AB", "0") in {"1", "true", "yes"}
-                and getattr(self, "_spec_n_eab", 0) < 5 and L < 8000):
+                and ((_eab_step >= 0 and getattr(self, "_spec_n", 0) == _eab_step)
+                     or (_eab_step < 0 and getattr(self, "_spec_n_eab", 0) < 5))
+                and L < 8000):
             # Eager-vs-graph rows probe: run the eager verify on the SAME
             # entry state and compare argmax rows. rows==erows while the
             # client stream garbles => GPU path faithful, emission/staging
@@ -1277,8 +1280,15 @@ class Scheduler(SchedulerIOMixin):
             taps_row = {d: t[a] for d, t in taps.items()}
             emb_row, mask_row = gctx.spec_embed(bonus)
             if _os_b.environ.get("FREETOKEN_SPEC_NODRAFT", "0") in {"1", "true", "yes"}:
-                # invalidator bisect: skip the DFlash propose entirely
-                picks = [bonus] * kn
+                # invalidator bisect: skip the DFlash propose. NODRAFTGREEDY=1
+                # builds z from the MODEL'S OWN top-k continuation (greedy
+                # self-consistency -> full acceptance -> no partial-accept
+                # restore between replays); the old [bonus]*k filler z was
+                # always rejected, forcing a restore EVERY step.
+                if _os_b.environ.get("FREETOKEN_SPEC_NODRAFTGREEDY", "0") in {"1", "true", "yes"}:
+                    picks = [bonus] + [int(x) for x in tk_ids[a][1:kn]]
+                else:
+                    picks = [bonus] * kn
             else:
                 picks = self._spec_svc.propose(
                     bonus, L + a, taps_row,
