@@ -108,14 +108,19 @@ class DFlashService:
                 "mask_dev": mask_row.to(dev, dtype=torch.float32).unsqueeze(0),
             }
         pin = self._pin
+        # STAGING ORDER (convicted 2026-09-06: the old staging raced — async
+        # D2D pinned fills on the trunk stream + async H2Ds issued from the
+        # cuda:0 thread into cuda:1 buffers; the encoder read torn/stale
+        # inputs, presenting as anchor-echo picks and nondeterministic h).
+        # Host fills first (tiny, KBs), then a trunk sync so the pinned
+        # bytes are complete before the device-side H2Ds reuse them; ALL
+        # device-side copies then run on the draft's OWN stream, ordered
+        # ahead of the encoder forward in the block below.
         pin["th"].copy_(torch.stack([taps[d].reshape(-1) for d in self.tap_layers]).to(torch.bfloat16))
         pin["ids"].copy_(top_ids.to("cpu", torch.int64) if top_ids.is_cuda else top_ids.to(torch.int64))
         pin["vals"].copy_(top_vals.to("cpu", torch.float32) if top_vals.is_cuda else top_vals.to(torch.float32))
         pin["emb"].copy_(embed_row.to("cpu", torch.bfloat16) if embed_row.is_cuda else embed_row.to(torch.bfloat16))
-        pin["th_dev"].copy_(pin["th"].view(1, 1, -1).to(torch.float32), non_blocking=True)
-        pin["ids_dev"].copy_(pin["ids"], non_blocking=True)
-        pin["vals_dev"].copy_(pin["vals"], non_blocking=True)
-        pin["emb_dev"].copy_(pin["emb"].to(torch.float32), non_blocking=True)
+        torch.cuda.synchronize()
         th = pin["th_dev"]
         pos = torch.arange(position - 1, position + self.k, device=dev)
         _tA = time.perf_counter()
@@ -124,7 +129,7 @@ class DFlashService:
         # process -- graph replay is ONE launch. Inputs land in persistent
         # buffers (written from the pinned staging above); pos is a buffer too.
         g = getattr(self, "_graph", None)
-        if g is None:
+        if g is None and os.environ.get("FREETOKEN_DFLASH_GRAPH", "0") in {"1", "true", "yes"}:
             with torch.cuda.device(dev):
                 noise_buf = torch.empty(1, self.k, pin["emb_dev"].shape[-1],
                                         dtype=torch.bfloat16, device=dev)
@@ -138,22 +143,59 @@ class DFlashService:
                 with torch.cuda.graph(gr, stream=side):
                     h_buf, _ = self.draft(noise_buf, th_buf, pos_buf)
                 self._graph = gr
-                self._gbuf = (noise_buf, th_buf, pos_buf, h_buf)
-            g = gr
-        noise_buf, th_buf, pos_buf, h = self._gbuf
-        noise_buf.copy_(torch.cat([pin["emb_dev"], pin["mask_dev"].expand(self.k - 1, -1)]).unsqueeze(0))
-        th_buf.copy_(th)
-        pos_buf.copy_(pos)
-        g.replay()
+                self._side = side          # capture stream: replays + input
+                self._gbuf = (noise_buf, th_buf, pos_buf, h_buf)  # staging MUST
+            g = gr                          # run on THIS stream (see below)
+        if getattr(self, "_gbuf", None) is None:
+            with torch.cuda.device(dev):
+                noise_buf = torch.empty(1, self.k, pin["emb_dev"].shape[-1],
+                                        dtype=torch.bfloat16, device=dev)
+                th_buf = torch.empty(pin["th_dev"].shape, dtype=torch.bfloat16, device=dev)
+                pos_buf = torch.empty(self.k + 1, dtype=torch.int64, device=dev)
+                self._gbuf = (noise_buf, th_buf, pos_buf, None)
+                self._side = torch.cuda.Stream()
+        noise_buf, th_buf, pos_buf, _h_graph = self._gbuf
+        # Input staging + replay on the CAPTURE stream under the device ctx.
+        # Issued from the caller's (cuda:0) context, the copies landed on a
+        # cuda:0 stream targeting cuda:1 memory and the replay ran on the
+        # WRONG stream entirely — the graph read stale/torn inputs (one-step-
+        # lagged taps) and the chain degenerated to anchor-echo picks (live
+        # acceptance 0 vs offline E=3.70). Same stream = same ordering as
+        # capture; the blocking _h_pin copy below still syncs the readback.
+        with torch.cuda.device(dev), torch.cuda.stream(self._side):
+            pin["th_dev"].copy_(pin["th"].view(1, 1, -1).to(torch.float32))
+            pin["ids_dev"].copy_(pin["ids"])
+            pin["vals_dev"].copy_(pin["vals"])
+            pin["emb_dev"].copy_(pin["emb"].to(torch.float32))
+            noise_buf.copy_(torch.cat([pin["emb_dev"],
+                                       pin["mask_dev"].expand(self.k - 1, -1)]
+                                      ).unsqueeze(0))
+            th_buf.copy_(th)
+            pos_buf.copy_(pos)
+            if os.environ.get("FREETOKEN_DFLASH_GRAPH", "0") in {"1", "true", "yes"}:
+                g.replay()
+                h = h_buf
+            else:
+                # EAGER encoder (default): the captured draft graph reads
+                # stale/torn inputs on this HIP stack — graph-vs-eager h
+                # maxdiff 52.7 @ norm 168 on IDENTICAL buffers, same-input
+                # picks nondeterministic (convicted 2026-09-06, /tmp/dflash_ab).
+                # ~30ms slower than replay, vs ~150ms verify: noise.
+                h, _ = self.draft(noise_buf, th_buf, pos_buf)
+            # Projection + blocking readback INSIDE the encoder's stream ctx:
+            # issued from the default stream it raced the side-stream compute
+            # and calls 2+ read mid-write garbage (h_norm 81741 vs 182 sane;
+            # convicted via ab2 hashes — inputs identical, readback torn).
+            proj = self.sel.hidden_projection(h[:, :]).float()                # [1,k,rank]
+            if self._h_pin is None or self._h_pin.shape != proj.shape:
+                self._h_pin = torch.empty(proj.shape, dtype=torch.float32,
+                                          pin_memory=True)
+            self._h_pin.copy_(proj, non_blocking=False)
         _tB = time.perf_counter()
-        proj = self.sel.hidden_projection(h[:, :]).float()                    # [1,k,rank]
         cbp = self.sel.predecessor_codebook.weight
         cbs = self.sel.successor_codebook.weight
         # CPU chain (see arm-time comment): h read back once via pinned buffer;
         # ids/vals/candidate scoring all host-side -- no cuda:1 submissions.
-        if self._h_pin is None or self._h_pin.shape != proj.shape:
-            self._h_pin = torch.empty(proj.shape, dtype=torch.float32, pin_memory=True)
-        self._h_pin.copy_(proj, non_blocking=False)
         proj_c = self._h_pin
         ids_c = pin["ids"]
         vals_c = pin["vals"]

@@ -1430,6 +1430,16 @@ class Scheduler(SchedulerIOMixin):
                 break
             self._spec_toolcall_anchor(req, tok)
             reply.append(self._spec_msg(req, tok, None))
+        import os as _os_acc
+        if _os_acc.environ.get("FREETOKEN_ACCLOG", "0") in {"1", "true", "yes"}:
+            _n_acc = getattr(self, "_acclog_n", 0) + 1
+            self._acclog_n = _n_acc
+            if _n_acc <= 400:
+                _ti = tk_ids[a] if tk_ids is not None else []
+                _rank = {int(t): r for r, t in enumerate(_ti)}
+                _zr = [(int(z[j]), _rank.get(int(z[j]), -1)) for j in range(1, min(len(z), kn))]
+                print(f"[acc] n={_n_acc} L={L} a={a} full={full} "
+                      f"zrank={_zr}", flush=True)
         if not finished:
             self.token_pool[req.table_idx, L + a + 1] = _t.tensor(
                 [bonus], dtype=_t.int32, device=self.device)
@@ -1445,7 +1455,9 @@ class Scheduler(SchedulerIOMixin):
                 # restore between replays); the old [bonus]*k filler z was
                 # always rejected, forcing a restore EVERY step.
                 if _os_b.environ.get("FREETOKEN_SPEC_NODRAFTGREEDY", "0") in {"1", "true", "yes"}:
-                    picks = [bonus] + [int(x) for x in tk_ids[a][1:kn]]
+                    # clean-style like the real service: picks[0] = first
+                    # continuation guess (row a's own top-k as the stand-in)
+                    picks = [int(x) for x in tk_ids[a][0:kn]]
                 else:
                     picks = [bonus] * kn
             else:
@@ -1454,14 +1466,47 @@ class Scheduler(SchedulerIOMixin):
                     torch.tensor(tk_ids[a]),
                     torch.tensor(tk_vals[a], dtype=torch.float32),
                     embed_row=emb_row, mask_row=mask_row)
+                import os as _os_tp, hashlib as _hl_tp
+                if _os_tp.environ.get("FREETOKEN_DUMPFILE", "0") in {"1", "true", "yes"}:
+                    import pickle as _pk
+                    _tail_now = req.input_ids[L:].tolist()
+                    with open("/tmp/live_dump.pkl", "ab") as _f:
+                        _pk.dump({
+                            "position": L + a,
+                            "a": int(a),
+                            "L": int(L),
+                            "z": [int(x) for x in z],
+                            "tail": [int(x) for x in _tail_now],
+                            "anchor": int(bonus),
+                            "taps": {d: t.detach().to(torch.bfloat16).cpu()
+                                     for d, t in taps_row.items()},
+                            "topk_ids": [int(x) for x in tk_ids[a][:64]],
+                            "topk_vals": [float(x) for x in tk_vals[a][:64]],
+                            "svc_picks": [int(x) for x in picks],
+                            "svc_th_hash": _hl_tp.md5(
+                                self._spec_svc._pin["th"].float().numpy().tobytes()
+                            ).hexdigest()[:8],
+                            "svc_h_norm": float(self._spec_svc._h_pin.norm()),
+                            "future": [int(x) for x in rows[a:a + kn]],
+                        }, _f)
+                if _os_tp.environ.get("FREETOKEN_PROPLOG", "0") in {"1", "true", "yes"}:
+                    _n_tp = getattr(self, "_proplog_n", 0) + 1
+                    self._proplog_n = _n_tp
+                    if _n_tp <= 30:
+                        _th = {d: (_hl_tp.md5(t.detach().float().numpy().tobytes()).hexdigest()[:6]
+                                   + f"/n{float(t.float().norm()):.1f}")
+                               for d, t in taps_row.items()}
+                        print(f"[prop] n={_n_tp} a={a} anchor={bonus} pos={L + a} "
+                              f"picks={picks[:4]} rows={rows[a:a+3]} "
+                              f"tk1={tk_ids[a][:3]} taps={_th}", flush=True)
             self._spec_t_prop = getattr(self, "_spec_t_prop", 0.0) + _time.perf_counter() - _t3
             if _sf == "postpropose":
                 torch.cuda.synchronize()
             if full:
-                nxt = [bonus] + picks[1:]
+                nxt = [bonus] + picks[0:kn - 1]
             else:
                 keep = z[: a + 1]                       # accepted prefix re-extends
-                nxt = keep + [bonus] + picks[1 : kn - a - 1]
+                nxt = keep + [bonus] + picks[0 : kn - a - 2]
             st["pending"] = {"anchor": bonus, "position": L + a, "z": nxt[:kn]}
         else:
             if not full:
@@ -1527,6 +1572,14 @@ class Scheduler(SchedulerIOMixin):
                    if r.uid >= self.WARMUP_UID_BASE]
         for _lr in _leaked:
             self.decode_manager.remove_req(_lr)
+        # Reserve the verify block's pages BEFORE the forward (graphed-path
+        # parity): _vrq.input_ids carries L+kn host ids, so allocate_paged
+        # reserves the whole block. Without this the partial-accept tail's
+        # _free(page_table[L:L+kn]) released STALE radix-prefix page ids
+        # every step (~7-24 pages/step ledger drift; drift 739->11727 killed
+        # the 71k boot in the admission spin) and could hand those pages to
+        # another request while this req's KV still lived there.
+        self.cache_manager.allocate_paged([_vrq])
         _fi = self._prepare_batch(_vb)
         _vb.fla_metadata = _FLA(
             cu_seqlens=_t.tensor([0, kn], dtype=_t.int32, device=self.device),
@@ -1638,7 +1691,13 @@ class Scheduler(SchedulerIOMixin):
         if "z" in pend:
             z = [int(x) for x in pend["z"]]
         else:
-            z = [int(pend["anchor"])] + [int(x) for x in pend["picks"][1:k]]
+            # service.propose returns CLEAN picks: picks[0] is the draft's
+            # guess for the FIRST continuation after the anchor (S3d contract;
+            # teacher-checked picked[0]==future[0] offline at E=3.70). The old
+            # picks[1:k] slice was anchor-echo-era — it discarded the draft's
+            # best pick and shifted the whole chain, so no draft token ever
+            # matched (live acceptance was 100% self-verification sawtooth).
+            z = [int(pend["anchor"])] + [int(x) for x in pend["picks"][0:k - 1]]
         # stream-ground-truth: replace the assumed z-prefix with the tokens
         # ACTUALLY appended beyond KV depth L (input_ids is ground truth)
         _tail_ids = req.input_ids[L:].tolist()
@@ -1801,6 +1860,9 @@ class Scheduler(SchedulerIOMixin):
                 _t3 = _time.perf_counter()
                 taps_row = {d: t[a] for d, t in taps.items()}
                 emb_row, mask_row = gctx.spec_embed(bonus)
+                if _os_b.environ.get("FREETOKEN_SPEC_ZEROEMB", "0") in {"1", "true", "yes"}:
+                    emb_row = torch.zeros_like(emb_row)
+                    mask_row = torch.zeros_like(mask_row)
                 st["pending"] = {
                     "anchor": bonus, "position": L + a,
                     "picks": self._spec_svc.propose(
