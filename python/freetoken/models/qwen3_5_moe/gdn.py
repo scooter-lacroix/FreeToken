@@ -359,6 +359,14 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                             _st["z"].shape[0], -1))
 
                 def _fla_job():
+                    import hashlib as _hl_fo
+
+                    if not __import__("torch").cuda.is_current_stream_capturing():
+                        _fo_h = _hl_fo.md5(
+                            _fout.detach().float().cpu().numpy().tobytes()
+                        ).hexdigest()[:8] if _fout is not None else "none"
+                        print(f"[FO] L{self.layer_id} REPLAY-IN "
+                              f"fout={_fo_h}", flush=True)
                     _r = gdn_prefill_chunk_fla(
                         _st["q"], _st["k"], _st["v"], _st["g"], _st["beta"],
                         state_source=pool.recurrent_states[li],
