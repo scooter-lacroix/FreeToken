@@ -10,6 +10,7 @@ from freetoken.kernel.triton.fp8_block_linear import Fp8BlockColMerged
 from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
 
 from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
+_STAGED: dict = {}
 from .quant_linear import make_replicated_quant
 
 
@@ -298,27 +299,55 @@ class Qwen3_5GatedDeltaNet(BaseOP):
             if _pw_gdn:
                 import os as _os_ji
 
-                _ji = _os_ji.environ.get(
-                    "FREETOKEN_SPEC_JOBINPUT", "0") in {"1", "true", "yes"}
+                # STAGED-JOB (default when the GDN seam is on): copy the job
+                # inputs into RUNNER-OWNED PERSISTENT buffers with a captured
+                # IN-GRAPH copy_ just before the seam closes — the captured
+                # segments write the graph-pool copies at replay, so eager
+                # closure references never refresh; the bufs DO (each replay
+                # re-executes the in-graph copy). The job reads the bufs.
+                _key = ("gdn", self.layer_id)
+                _st = _STAGED.get(_key)
+                if _st is None:
+                    _st = {
+                        "q": torch.empty_like(q),
+                        "k": torch.empty_like(k),
+                        "v": torch.empty_like(v),
+                        "g": torch.empty_like(g),
+                    }
+                    _STAGED[_key] = _st
+                _st["q"].copy_(q)
+                _st["k"].copy_(k)
+                _st["v"].copy_(v)
+                _st["g"].copy_(g)
+
+                # OUTPUT staging too: the captured continuation (norm/
+                # out_proj in the NEXT segment) must read a persistent buffer
+                # that the replay job rewrites — otherwise it reads the frozen
+                # capture-time output address (the constant-output root cause).
+                _ob = _STAGED.get(("out", self.layer_id))
+                _osh = (q.shape[1], v.shape[2], v.shape[3])  # [total, Hv, V]
+                if _ob is None or tuple(_ob.shape) != _osh:
+                    _ob = torch.empty(_osh, dtype=q.dtype, device=q.device)
+                    _STAGED[("out", self.layer_id)] = _ob
 
                 def _fla_job():
-                    if _ji:
-                        import hashlib as _hl_ji
-
-                        _h = lambda t: _hl_ji.md5(
-                            t.detach().float().cpu().numpy().tobytes()
-                        ).hexdigest()[:6]
-                        print(f"[JI] L={self.layer_id} "
-                              f"q={_h(q)} k={_h(k)} v={_h(v)} g={_h(g)} "
-                              f"st={_h(pool.recurrent_states[li][fla.cache_indices[0]].float())}",
-                              flush=True)
-                    return _fla_call()
+                    _r = gdn_prefill_chunk_fla(
+                        _st["q"], _st["k"], _st["v"], _st["g"], beta,
+                        state_source=pool.recurrent_states[li],
+                        indices=fla.cache_indices,
+                        cu_seqlens=fla.cu_seqlens,
+                        scale=self.head_k_dim ** -0.5,
+                        return_h=track,
+                    )
+                    _ob.copy_(_r[0] if track else _r)
+                    return _r
 
                 _seam(self.layer_id, (q, k, v, g, beta), job=_fla_job)
-                if _ji:
-                    print(f"[JI] L={self.layer_id} CAPTURE-TIME (pre-walk)",
-                          flush=True)
-            result = _fla_call()
+                _r_cap = _fla_call()
+                _ob.copy_(_r_cap[0] if track else _r_cap)
+                result = _ob  # the captured continuation reads the buffer
+            else:
+                result = _fla_call()
             if track:
                 core_out, h = result
                 self._write_track_snapshot(pool, li, conv_in, h, fla)
