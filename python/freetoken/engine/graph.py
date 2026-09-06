@@ -116,6 +116,23 @@ class VerifyGraphRunner:
     def _replay_pw(self) -> None:
         cache = self.moe_cache
         _jobs = getattr(self, "pw_jobs", {}) or {}
+        # LIVE-FP (FREETOKEN_SPEC_LIVEFP=1): liveness bisect — fingerprint the
+        # runner's own input buffer (must VARY per step; the scheduler writes
+        # it) and the runner's logits OUTPUT after each segment replay. If
+        # input_ids varies while logits_out stays constant across steps, the
+        # captured segments ignore the live inputs (the frozen-output bug);
+        # hashing the output BETWEEN segments narrows which segment dies.
+        import hashlib as _hl_lf
+
+        import os as _os_lf
+
+        _lf = _os_lf.environ.get("FREETOKEN_SPEC_LIVEFP", "0") in {
+            "1", "true", "yes"}
+        if _lf:
+            _h = lambda t: _hl_lf.md5(
+                t.detach().float().cpu().numpy().tobytes()).hexdigest()[:8]
+            print(f"[LF] in={_h(self.input_ids)} pos={_h(self.positions)}",
+                  flush=True)
         if cache is not None:
             cache.suppress_inline_copy = True
         try:
@@ -131,6 +148,10 @@ class VerifyGraphRunner:
                     # the segment holding its expert GEMM.
                     cache.copy_missing_staged(layer_id)
                 self.pw_graphs[i + 1].replay()
+                if _lf and i < 2:  # first few seams only (log volume)
+                    torch.cuda.current_stream().synchronize()
+                    print(f"[LF] after-seg{i+1} "
+                          f"logits={_h(self.logits_out[:2])}", flush=True)
         finally:
             if cache is not None:
                 cache.suppress_inline_copy = False
