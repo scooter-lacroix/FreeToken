@@ -296,7 +296,28 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                     "FREETOKEN_SPEC_PIECEWISE_GDN", "0") in {"1", "true", "yes"}
             )
             if _pw_gdn:
-                _seam(self.layer_id, (q, k, v, g, beta), job=_fla_call)
+                import os as _os_ji
+
+                _ji = _os_ji.environ.get(
+                    "FREETOKEN_SPEC_JOBINPUT", "0") in {"1", "true", "yes"}
+
+                def _fla_job():
+                    if _ji:
+                        import hashlib as _hl_ji
+
+                        _h = lambda t: _hl_ji.md5(
+                            t.detach().float().cpu().numpy().tobytes()
+                        ).hexdigest()[:6]
+                        print(f"[JI] L={self.layer_id} "
+                              f"q={_h(q)} k={_h(k)} v={_h(v)} g={_h(g)} "
+                              f"st={_h(pool.recurrent_states[li][fla.cache_indices[0]].float())}",
+                              flush=True)
+                    return _fla_call()
+
+                _seam(self.layer_id, (q, k, v, g, beta), job=_fla_job)
+                if _ji:
+                    print(f"[JI] L={self.layer_id} CAPTURE-TIME (pre-walk)",
+                          flush=True)
             result = _fla_call()
             if track:
                 core_out, h = result
