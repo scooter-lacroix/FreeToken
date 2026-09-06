@@ -258,6 +258,14 @@ class QuantGgmlLinear(BaseOP):
 _PREFILL_BF16_MIN_T = int(
     __import__("os").environ.get("FREETOKEN_PREFILL_BF16_MIN_T", "64")
 )
+# EAGERVERIFY twin lever: allow the bf16-twin cache to serve the skinny
+# T=8 verify rows (FREETOKEN_EAGV_TWIN=1 sets min-T to 8 at import if the
+# env is present before this module loads; the verify forward then hits
+# the cached dequant twins + rocBLAS instead of per-step dequant paths.
+import os as _os_twin  # noqa: E402
+
+if _os_twin.environ.get("FREETOKEN_EAGV_TWIN", "0") in {"1", "true", "yes"}:
+    _PREFILL_BF16_MIN_T = min(_PREFILL_BF16_MIN_T, 8)
 _bf16_cache: dict[int, tuple[torch.Tensor, int]] = {}
 _bf16_bytes = 0
 
