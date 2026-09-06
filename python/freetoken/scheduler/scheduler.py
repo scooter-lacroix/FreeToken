@@ -1100,7 +1100,7 @@ class Scheduler(SchedulerIOMixin):
 
                 def _sided(k, v):
                     if not (isinstance(k, tuple) and k[0] == "gdn"
-                            and k[1] in (0, 1)):
+                            and k[1] in (0, 1, 2, 3, 4, 5)):
                         return None
                     if isinstance(v, dict):  # {"q": t, "k": t, ...}
                         return (f"L{k[1]}",
@@ -1111,7 +1111,7 @@ class Scheduler(SchedulerIOMixin):
                 _gs = dict(x for x in (_sided(k, v) for k, v in _stg.items()) if x)
 
                 def _esided(k, tup):
-                    if k not in (0, 1) or not isinstance(tup, tuple):
+                    if k not in (0, 1, 2, 3, 4, 5) or not isinstance(tup, tuple):
                         return None
                     return (f"L{k}", "|".join(_h2(t) for t in tup))
 
