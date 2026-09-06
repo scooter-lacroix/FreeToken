@@ -487,6 +487,7 @@ class Scheduler(SchedulerIOMixin):
         ):
             if k > 0 and self.cache_manager.is_hybrid and not self.prefill_manager.runnable:
                 print(f"[spec-gate] decline: n_real={n_real} warmup={has_warmup} "
+                      f"uids={[getattr(r, 'uid', '?') for r in running][:6]} "
                       f"failed={getattr(self, '_spec_failed', False)}", flush=True)
             return False
         req = next(r for r in running if r.uid < self.WARMUP_UID_BASE)
@@ -1519,6 +1520,13 @@ class Scheduler(SchedulerIOMixin):
         _vb = _B(reqs=[_vrq], phase="prefill")
         _vb.padded_reqs = _vb.reqs
         _vb.is_verify = True
+        # Defensive sweep: if any earlier verify/warmup transient leaked into
+        # running_reqs (uid >= BASE), it wedges the spec gate forever (n_real=0
+        # warmup=True decline observed live). Remove them before staging.
+        _leaked = [r for r in list(self.decode_manager.running_reqs)
+                   if r.uid >= self.WARMUP_UID_BASE]
+        for _lr in _leaked:
+            self.decode_manager.remove_req(_lr)
         _fi = self._prepare_batch(_vb)
         _vb.fla_metadata = _FLA(
             cu_seqlens=_t.tensor([0, kn], dtype=_t.int32, device=self.device),
