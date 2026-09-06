@@ -11,6 +11,7 @@ from freetoken.kernel.triton.fp8_pertensor_linear import Fp8PerTensorColMerged
 
 from .gdn_kernels import gdn_decode_fla, gdn_prefill_chunk_fla
 _STAGED: dict = {}
+_LAST_EAGER: dict = {}
 from .quant_linear import make_replicated_quant
 
 
@@ -342,11 +343,17 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                     _ob.copy_(_r[0] if track else _r)
                     return _r
 
+                _LAST_EAGER[self.layer_id] = (
+                    q.detach().clone(), k.detach().clone(),
+                    v.detach().clone(), g.detach().clone())
                 _seam(self.layer_id, (q, k, v, g, beta), job=_fla_job)
                 _r_cap = _fla_call()
                 _ob.copy_(_r_cap[0] if track else _r_cap)
                 result = _ob  # the captured continuation reads the buffer
             else:
+                _LAST_EAGER[self.layer_id] = (
+                    q.detach().clone(), k.detach().clone(),
+                    v.detach().clone(), g.detach().clone())
                 result = _fla_call()
             if track:
                 core_out, h = result

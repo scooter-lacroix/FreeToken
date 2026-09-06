@@ -1084,6 +1084,29 @@ class Scheduler(SchedulerIOMixin):
             print(f"[EAB] step={getattr(self, '_spec_n', 0)} L={L} "
                   f"graph_rows={rows[:4]} eager_rows={_erows[:4]} "
                   f"match={rows[:4] == _erows[:4]} tapdiff={_tapd}", flush=True)
+            import os as _os_ji2
+
+            if (_os_ji2.environ.get("FREETOKEN_SPEC_JI2", "0")
+                    in {"1", "true", "yes"}
+                    and getattr(self, "_spec_n", 0) == 1):
+                import hashlib as _hl2
+
+                from freetoken.models.qwen3_5_moe import gdn as _gdnmod
+
+                _h2 = lambda t: _hl2.md5(
+                    t.detach().float().cpu().numpy().tobytes()).hexdigest()[:6]
+                _stg = getattr(_gdnmod, "_STAGED", {}) or {}
+                _eg = getattr(_gdnmod, "_LAST_EAGER", None) or {}
+
+                def _sided(k, v):
+                    if isinstance(k, tuple):
+                        return (f"L{k[1]}", _h2(v)) if k[0] == "gdn" and k[1] in (0, 1) else None
+                    return (f"L{k}", _h2(v)) if k in (0, 1) else None
+
+                _gs = dict(x for x in (_sided(k, v) for k, v in _stg.items()) if x)
+                _es = dict(_sided(k, v) for k, v in _eg.items() if isinstance(k, int) and k in (0, 1))
+                print(f"[JI2] graph-staged={_gs}", flush=True)
+                print(f"[JI2] eager-last  ={_es}", flush=True)
             # RESTOREDIVE (FREETOKEN_SPEC_RESTOREDIVE=1, step 1 only): the
             # step-N defect is a deterministic stale read after the partial-
             # accept restore cycle. On the EAGER REF'S OWN post-restore state,
