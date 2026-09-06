@@ -331,25 +331,61 @@ class Qwen3_5GatedDeltaNet(BaseOP):
                     _ob = torch.empty(_osh, dtype=q.dtype, device=q.device)
                     _STAGED[("out", self.layer_id)] = _ob
 
+                # FULL-TAIL JOB (JI2 verdict fix): the captured continuation
+                # (norm+out_proj segment) after the seam was convicted of the
+                # numeric divergence (L0 staged inputs bit-match eager, L1
+                # diverge). Move the WHOLE tail — fla + norm + out_proj —
+                # into the eager seam job; stage z too; the final layer
+                # output lands in a persistent buffer the next layer's
+                # captured segment reads. Captured region per GDN layer
+                # shrinks to projections-only.
+                _st["z"] = z.detach().clone()
+                _st["beta"] = beta.detach().clone()
+                _fkey = ("fout", self.layer_id)
+                _fout = _STAGED.get(_fkey)
+                _fshape = (z.shape[0], self.out_proj_weight_out_features
+                           if hasattr(self, "out_proj_weight_out_features")
+                           else None)
+
+                def _tail(_r):
+                    _co = _r[0] if track else _r
+                    if track:
+                        self._write_track_snapshot(
+                            pool, li, conv_in, _r[1], fla)
+                    _co = _co.reshape(-1, self.head_v_dim)
+                    _zz = _st["z"].reshape(-1, self.head_v_dim)
+                    return self.out_proj.forward(
+                        self.norm.forward(_co, _zz).reshape(
+                            _st["z"].shape[0], -1))
+
                 def _fla_job():
                     _r = gdn_prefill_chunk_fla(
-                        _st["q"], _st["k"], _st["v"], _st["g"], beta,
+                        _st["q"], _st["k"], _st["v"], _st["g"], _st["beta"],
                         state_source=pool.recurrent_states[li],
                         indices=fla.cache_indices,
                         cu_seqlens=fla.cu_seqlens,
                         scale=self.head_k_dim ** -0.5,
                         return_h=track,
                     )
-                    _ob.copy_(_r[0] if track else _r)
-                    return _r
+                    _o = _tail(_r)
+                    if _fout is not None and tuple(_fout.shape) == tuple(
+                            _o.shape):
+                        _fout.copy_(_o)
+                    return _o
 
                 _LAST_EAGER[self.layer_id] = (
                     q.detach().clone(), k.detach().clone(),
                     v.detach().clone(), g.detach().clone())
                 _seam(self.layer_id, (q, k, v, g, beta), job=_fla_job)
                 _r_cap = _fla_call()
-                _ob.copy_(_r_cap[0] if track else _r_cap)
-                result = _ob  # the captured continuation reads the buffer
+                _o_cap = _tail(_r_cap)
+                if _fout is None or tuple(_fout.shape) != tuple(
+                        _o_cap.shape):
+                    _fout = _o_cap.detach().clone()
+                    _STAGED[_fkey] = _fout
+                else:
+                    _fout.copy_(_o_cap)
+                return _fout  # next layer's captured segment reads the buffer
             else:
                 _LAST_EAGER[self.layer_id] = (
                     q.detach().clone(), k.detach().clone(),
