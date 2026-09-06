@@ -1099,12 +1099,23 @@ class Scheduler(SchedulerIOMixin):
                 _eg = getattr(_gdnmod, "_LAST_EAGER", None) or {}
 
                 def _sided(k, v):
-                    if isinstance(k, tuple):
-                        return (f"L{k[1]}", _h2(v)) if k[0] == "gdn" and k[1] in (0, 1) else None
-                    return (f"L{k}", _h2(v)) if k in (0, 1) else None
+                    if not (isinstance(k, tuple) and k[0] == "gdn"
+                            and k[1] in (0, 1)):
+                        return None
+                    if isinstance(v, dict):  # {"q": t, "k": t, ...}
+                        return (f"L{k[1]}",
+                                "|".join(f"{n}:{_h2(t)}"
+                                         for n, t in sorted(v.items())))
+                    return (f"L{k[1]}", _h2(v))
 
                 _gs = dict(x for x in (_sided(k, v) for k, v in _stg.items()) if x)
-                _es = dict(_sided(k, v) for k, v in _eg.items() if isinstance(k, int) and k in (0, 1))
+
+                def _esided(k, tup):
+                    if k not in (0, 1) or not isinstance(tup, tuple):
+                        return None
+                    return (f"L{k}", "|".join(_h2(t) for t in tup))
+
+                _es = dict(x for x in (_esided(k, v) for k, v in _eg.items()) if x)
                 print(f"[JI2] graph-staged={_gs}", flush=True)
                 print(f"[JI2] eager-last  ={_es}", flush=True)
             # RESTOREDIVE (FREETOKEN_SPEC_RESTOREDIVE=1, step 1 only): the
